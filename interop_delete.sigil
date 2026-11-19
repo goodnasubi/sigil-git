@@ -1,0 +1,42 @@
+module interop_delete
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat3;
+use git.refs.ExpectOld;
+use git.refs.delete_branch;
+use git.refs.delete_tag;
+use git.refs.list_branches;
+use git.repo.open_repo;
+
+fn run(path: &String) -> Result<Bool, GitError>
+  intent "実 Git が作った（packed-refs を含む）リポジトリを開き、ブランチ old とタグ v1 を削除する"
+  requires none
+  ensures none
+  effects fs
+{
+  let repo = open_repo(&path)?;
+  list_branches(&repo)?;
+  delete_branch(&repo, &"old", ExpectOld.Any)?;
+  delete_tag(&repo, &"v1", ExpectOld.Any)?;
+  return Ok(true);
+}
+
+pub fn main() -> Int
+  intent "tmp/interop/real.git（実 Git 製）から packed な old ブランチと v1 タグを削除する。成功なら 0"
+  requires none
+  ensures none
+  effects console, fs
+{
+  match run(&"tmp/interop/real.git") {
+    Ok(_) => {
+      return 0;
+    }
+    Err(e) => {
+      console.log(&cat3(&"error: ", &error_kind_name(&e), &""));
+      return 1;
+    }
+  }
+}

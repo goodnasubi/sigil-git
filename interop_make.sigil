@@ -1,0 +1,73 @@
+module interop_make
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat3;
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.odb.odb_write;
+use git.refs.ExpectOld;
+use git.refs.create_branch;
+use git.refs.create_tag;
+use git.refs.set_head_symbolic;
+use git.refs.update_ref;
+use git.repo.Repo;
+use git.repo.init_repo;
+
+fn tree_commit(repo: &Repo, blob_text: &String, msg: &String) -> Result<String, GitError>
+  intent "blob と空でない木と commit を書き、commit の識別子を返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let blob_id = odb_write(&repo, &ObjectType.Blob, &blob_text.as_bytes())?;
+  let mut tree = Bytes.new();
+  tree.extend(&"100644 file.txt".as_bytes());
+  tree.push(0);
+  tree.extend(&hex_to_bytes(&blob_id)?);
+  let tree_id = odb_write(&repo, &ObjectType.Tree, &tree)?;
+  let mut c = Bytes.new();
+  c.extend(&cat3(&"tree ", &tree_id, &"\n").as_bytes());
+  c.extend(&"author T <t@example.com> 0 +0000\n".as_bytes());
+  c.extend(&"committer T <t@example.com> 0 +0000\n\n".as_bytes());
+  c.extend(&msg.as_bytes());
+  return odb_write(&repo, &ObjectType.Commit, &c);
+}
+
+fn build(path: &String) -> Result<String, GitError>
+  intent "path に bare リポジトリを作り、commit・ブランチ・タグ・HEAD を書く。最後の commit の識別子を返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let repo = init_repo(&path, true, &"main")?;
+  let c1 = tree_commit(&repo, &"one\n", &"first\n")?;
+  let c2 = tree_commit(&repo, &"two\n", &"second\n")?;
+  create_branch(&repo, &"main", &c1)?;
+  update_ref(&repo, &"refs/heads/main", &c2, ExpectOld.Is(c1.clone()))?;
+  create_branch(&repo, &"topic/a", &c1)?;
+  create_tag(&repo, &"v1", &c1)?;
+  create_tag(&repo, &"v2", &c2)?;
+  set_head_symbolic(&repo, &"refs/heads/main")?;
+  return Ok(c2);
+}
+
+pub fn main() -> Int
+  intent "tmp/interop/made に実 Git で検証するリポジトリを作る。成功なら 0、失敗なら 1 を返し、最後の commit の識別子を出力する"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  match build(&"tmp/interop/made.git") {
+    Ok(id) => {
+      console.log(&id);
+      return 0;
+    }
+    Err(e) => {
+      console.log(&cat3(&"error: ", &error_kind_name(&e), &""));
+      return 1;
+    }
+  }
+}

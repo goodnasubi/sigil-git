@@ -1,0 +1,352 @@
+module git.repo
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.dir_exists;
+use git.fsio.file_exists;
+use git.fsio.join_path;
+use git.fsio.list_names;
+use git.fsio.make_dirs;
+use git.fsio.parent_of;
+use git.fsio.random_hex;
+use git.fsio.read_file_opt;
+use git.fsio.rename_file;
+use git.fsio.string_ends_with;
+use git.fsio.string_starts_with;
+use git.fsio.sync_dir;
+use git.validate.validate_ref_name;
+
+// ADR 0047 決定 1「対象のリポジトリ」・決定 2: init とリポジトリの検出・拒否。
+// SHA-256 形式（repositoryformatversion = 1 かつ objectformat = sha256）の通常／bare リポジトリだけを扱う。
+
+pub struct Repo {
+  git_dir: String,
+  work_dir: String,
+  bare: Bool,
+}
+
+fn max_config_size() -> Int
+  intent "設定ファイルを読む上限 (64 KiB) を返す"
+  requires none
+  ensures result == 65536
+  effects none
+{
+  return 65536;
+}
+
+fn max_listed_entries() -> Int
+  intent "拒否対象の検出のために列挙するエントリ数の上限を返す"
+  requires none
+  ensures result == 100000
+  effects none
+{
+  return 100000;
+}
+
+fn lower_byte(c: Int) -> Int
+  intent "ASCII 大文字を小文字にする"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 65 && c <= 90 {
+    return c + 32;
+  }
+  return c;
+}
+
+fn is_space(c: Int) -> Bool
+  intent "空白・タブ・CR かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c == 32 || c == 9 || c == 13;
+}
+
+fn trim_bytes(b: &Bytes) -> Bytes
+  intent "前後の空白・タブ・CR を除く"
+  requires none
+  ensures none
+  effects none
+{
+  let mut start = 0;
+  let mut end = b.len();
+  while start < end && is_space(b.get(start).unwrap_or(0)) {
+    start = start + 1;
+  }
+  while end > start && is_space(b.get(end - 1).unwrap_or(0)) {
+    end = end - 1;
+  }
+  return b.slice(start, end).unwrap_or(Bytes.new());
+}
+
+fn lower_string(b: &Bytes) -> String
+  intent "ASCII を小文字にした文字列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    out.push(lower_byte(b.get(i).unwrap_or(0)));
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn is_true_value(v: &String) -> Bool
+  intent "設定値が真（true／yes／on／1／値なし）かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return v == "" || v == "true" || v == "yes" || v == "on" || v == "1";
+}
+
+pub struct ConfigInfo {
+  version: String,
+  object_format: String,
+  ref_storage: String,
+  unsupported: String,
+}
+
+pub fn parse_config(data: &Bytes) -> ConfigInfo
+  intent "設定ファイルから、形式の判定に必要な最小のキーだけを読む。実行や読み込みを伴うキー（include、filter、hooksPath、fsmonitor 等）は解釈しない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut info = ConfigInfo { version: "", object_format: "", ref_storage: "", unsupported: "" };
+  let mut section = "";
+  let n = data.len();
+  let mut pos = 0;
+  while pos <= n {
+    let mut end = pos;
+    while end < n && data.get(end).unwrap_or(0) != 10 {
+      end = end + 1;
+    }
+    let line = trim_bytes(&data.slice(pos, end).unwrap_or(Bytes.new()));
+    pos = end + 1;
+    let comment = line.len() == 0 || line.get(0).unwrap_or(0) == 35 || line.get(0).unwrap_or(0) == 59;
+    if comment {
+      // 空行とコメントは読み飛ばす
+    } else if line.get(0).unwrap_or(0) == 91 {
+      let mut close = 1;
+      while close < line.len() && line.get(close).unwrap_or(0) != 93 {
+        close = close + 1;
+      }
+      let head = trim_bytes(&line.slice(1, close).unwrap_or(Bytes.new()));
+      let mut name_end = 0;
+      while name_end < head.len() && !is_space(head.get(name_end).unwrap_or(0)) && head.get(name_end).unwrap_or(0) != 34 && head.get(name_end).unwrap_or(0) != 46 {
+        name_end = name_end + 1;
+      }
+      section = lower_string(&head.slice(0, name_end).unwrap_or(Bytes.new()));
+    } else {
+      let mut eq = 0;
+      while eq < line.len() && line.get(eq).unwrap_or(0) != 61 {
+        eq = eq + 1;
+      }
+      let key = lower_string(&trim_bytes(&line.slice(0, eq).unwrap_or(Bytes.new())));
+      let mut value = "";
+      if eq < line.len() {
+        let mut vb = trim_bytes(&line.slice(eq + 1, line.len()).unwrap_or(Bytes.new()));
+        if vb.len() >= 2 && vb.get(0).unwrap_or(0) == 34 && vb.get(vb.len() - 1).unwrap_or(0) == 34 {
+          vb = vb.slice(1, vb.len() - 1).unwrap_or(Bytes.new());
+        }
+        value = lower_string(&vb);
+      }
+      if section == "core" {
+        if key == "repositoryformatversion" {
+          info.version = value.clone();
+        }
+        if (key == "sparsecheckout" || key == "sparsecheckoutcone") && is_true_value(&value) {
+          info.unsupported = "sparse checkout is not supported";
+        }
+        if key == "splitindex" && is_true_value(&value) {
+          info.unsupported = "split index is not supported";
+        }
+      }
+      if section == "extensions" {
+        if key == "objectformat" {
+          info.object_format = value.clone();
+        } else if key == "refstorage" {
+          info.ref_storage = value.clone();
+        } else if key == "partialclone" {
+          info.unsupported = "partial clone (promisor) is not supported";
+        } else if key == "worktreeconfig" {
+          info.unsupported = "worktrees are not supported";
+        } else {
+          info.unsupported = "unsupported repository extension";
+        }
+      }
+      if section == "remote" && (key == "promisor" || key == "partialclonefilter") {
+        info.unsupported = "partial clone (promisor) is not supported";
+      }
+    }
+  }
+  return info;
+}
+
+fn check_config(info: &ConfigInfo) -> Result<Bool, GitError>
+  intent "設定が SHA-256 形式の対応範囲かを検査する。未対応のものは黙って無視せず UnsupportedFormat で拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  if info.ref_storage != "" && info.ref_storage != "files" {
+    return Err(GitError.UnsupportedFormat("ref storage other than files (reftable) is not supported"));
+  }
+  if info.unsupported != "" {
+    return Err(GitError.UnsupportedFormat(info.unsupported.clone()));
+  }
+  if info.version != "1" {
+    return Err(GitError.UnsupportedFormat("repositoryformatversion must be 1 (SHA-1 format repositories are not supported)"));
+  }
+  if info.object_format != "sha256" {
+    return Err(GitError.UnsupportedFormat("object format must be sha256 (SHA-1 format repositories are not supported)"));
+  }
+  return Ok(true);
+}
+
+fn check_layout(git_dir: &String) -> Result<Bool, GitError>
+  intent "git ディレクトリの構成から、未対応の機能（alternates、shallow、worktrees、replace 参照、promisor、疎なチェックアウト、分割索引）を検出して拒否する"
+  requires none
+  ensures none
+  effects fs
+{
+  if !dir_exists(&join_path(&git_dir, &"objects"))? {
+    return Err(GitError.Corrupt("objects directory is missing"));
+  }
+  if file_exists(&join_path(&join_path(&git_dir, &"objects"), &"info/alternates"))? {
+    return Err(GitError.UnsupportedFormat("objects/info/alternates is not supported"));
+  }
+  if file_exists(&join_path(&git_dir, &"shallow"))? {
+    return Err(GitError.UnsupportedFormat("shallow repositories are not supported"));
+  }
+  if file_exists(&join_path(&git_dir, &"worktrees"))? {
+    return Err(GitError.UnsupportedFormat("worktrees are not supported"));
+  }
+  if file_exists(&join_path(&join_path(&git_dir, &"info"), &"sparse-checkout"))? {
+    return Err(GitError.UnsupportedFormat("sparse checkout is not supported"));
+  }
+  if file_exists(&join_path(&join_path(&git_dir, &"refs"), &"replace"))? {
+    return Err(GitError.UnsupportedFormat("replace refs are not supported"));
+  }
+  let names = list_names(&git_dir, max_listed_entries())?;
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      Some(nm) => {
+        if string_starts_with(&nm, &"sharedindex.") {
+          return Err(GitError.UnsupportedFormat("split index is not supported"));
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let pack_dir = join_path(&join_path(&git_dir, &"objects"), &"pack");
+  if dir_exists(&pack_dir)? {
+    let packs = list_names(&pack_dir, max_listed_entries())?;
+    let mut j = 0;
+    while j < packs.len() {
+      match packs.get(j) {
+        Some(pn) => {
+          if string_ends_with(&pn, &".promisor") {
+            return Err(GitError.UnsupportedFormat("partial clone (promisor) is not supported"));
+          }
+        }
+        None => {}
+      }
+      j = j + 1;
+    }
+  }
+  return Ok(true);
+}
+
+pub fn open_repo(path: &String) -> Result<Repo, GitError>
+  intent "path のリポジトリ（作業木の根または bare の git ディレクトリ）を開き、対応範囲かを検査する。SHA-1 形式・reftable・alternates・shallow・worktrees・.git ファイル・replace・promisor・疎なチェックアウト・分割索引は UnsupportedFormat"
+  requires none
+  ensures none
+  effects fs
+{
+  let dot_git = join_path(&path, &".git");
+  let mut git_dir = path.clone();
+  let mut work_dir = "";
+  let mut bare = true;
+  if dir_exists(&dot_git)? {
+    git_dir = dot_git.clone();
+    work_dir = path.clone();
+    bare = false;
+  } else if file_exists(&dot_git)? {
+    return Err(GitError.UnsupportedFormat(".git file (gitdir link) is not supported"));
+  } else if !file_exists(&join_path(&path, &"HEAD"))? {
+    return Err(GitError.NotFound("not a repository"));
+  }
+  if !file_exists(&join_path(&git_dir, &"HEAD"))? {
+    return Err(GitError.NotFound("not a repository (HEAD is missing)"));
+  }
+  match read_file_opt(&join_path(&git_dir, &"config"), max_config_size(), false)? {
+    None => {
+      return Err(GitError.UnsupportedFormat("repository config is missing (SHA-1 format repositories are not supported)"));
+    }
+    Some(cfg) => {
+      check_config(&parse_config(&cfg))?;
+    }
+  }
+  check_layout(&git_dir)?;
+  return Ok(Repo { git_dir: git_dir, work_dir: work_dir, bare: bare });
+}
+
+fn write_atomic(final_path: &String, data: &Bytes) -> Result<Bool, GitError>
+  intent "一時名に排他的に書いて同期し、final_path へ rename して親を同期する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let tmp = cat3(&final_path, &".tmp-", &random_hex(8)?);
+  create_synced_file(&tmp, &data)?;
+  rename_file(&tmp, &final_path)?;
+  sync_dir(&parent_of(&final_path))?;
+  return Ok(true);
+}
+
+pub fn init_repo(path: &String, bare: Bool, initial_branch: &String) -> Result<Repo, GitError>
+  intent "SHA-256 形式の空のリポジトリを作る（bare なら path が git ディレクトリ、通常なら path/.git）。設定は最小。既に HEAD があれば AlreadyExists。HEAD を最後に公開する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  validate_ref_name(&cat3(&"refs/heads/", &initial_branch, &""))?;
+  let mut git_dir = path.clone();
+  let mut work_dir = "";
+  if !bare {
+    git_dir = join_path(&path, &".git");
+    work_dir = path.clone();
+  }
+  if file_exists(&join_path(&git_dir, &"HEAD"))? {
+    return Err(GitError.AlreadyExists("repository already exists"));
+  }
+  make_dirs(&git_dir)?;
+  make_dirs(&join_path(&git_dir, &"objects"))?;
+  make_dirs(&join_path(&join_path(&git_dir, &"objects"), &"info"))?;
+  make_dirs(&join_path(&join_path(&git_dir, &"objects"), &"pack"))?;
+  make_dirs(&join_path(&git_dir, &"refs"))?;
+  make_dirs(&join_path(&join_path(&git_dir, &"refs"), &"heads"))?;
+  make_dirs(&join_path(&join_path(&git_dir, &"refs"), &"tags"))?;
+  let mut cfg = "[core]\n\trepositoryformatversion = 1\n\tbare = ";
+  if bare {
+    cfg = cat3(&cfg, &"true", &"\n[extensions]\n\tobjectformat = sha256\n");
+  } else {
+    cfg = cat3(&cfg, &"false", &"\n[extensions]\n\tobjectformat = sha256\n");
+  }
+  write_atomic(&join_path(&git_dir, &"config"), &cfg.as_bytes())?;
+  let head = cat3(&"ref: refs/heads/", &initial_branch, &"\n");
+  write_atomic(&join_path(&git_dir, &"HEAD"), &head.as_bytes())?;
+  return Ok(Repo { git_dir: git_dir, work_dir: work_dir, bare: bare });
+}
