@@ -189,6 +189,34 @@ test "$(tail -n1 "$W/output")" = 1
 grep -qx 'error:MultipleMergeBases' "$W/output"
 test "$(g rev-parse HEAD)" = "$cross_left"
 
+# 隣接行の変更を合成し、同じ位置に挿入した同一行は一度だけ反映する。
+g checkout -qb adjacent-left "$base"
+printf 'ONE\ntwo\nthree\nfour\ninserted\nfive\n' >"$R/merge.txt"
+g commit -qam adjacent-left
+adjacent_left=$(g rev-parse HEAD)
+g checkout -qb adjacent-right "$base"
+printf 'one\nTWO\nthree\nfour\ninserted\nfive\n' >"$R/merge.txt"
+g commit -qam adjacent-right
+adjacent_right=$(g rev-parse HEAD)
+g branch adjacent-reverse
+g checkout -q adjacent-left
+printf 'ONE\nTWO\nthree\nfour\ninserted\nfive\n' >"$W/expected-blob"
+run merge "$adjacent_right"
+cmp "$W/expected-blob" "$R/merge.txt"
+test "$(g show -s --format=%P)" = "$adjacent_left $adjacent_right"
+g checkout -q adjacent-reverse
+run merge "$adjacent_left"
+cmp "$W/expected-blob" "$R/merge.txt"
+test "$(g show -s --format=%P)" = "$adjacent_right $adjacent_left"
+
+# 同じ位置に挿入した行が異なるときは衝突する。
+g checkout -qb insert-conflict "$base"
+printf 'one\ntwo\nthree\nfour\nother\nfive\n' >"$R/merge.txt"
+g commit -qam insert-conflict
+run merge "$adjacent_right"
+printf 'Text\tmerge.txt\n' >"$W/expected"
+cmp "$W/output" "$W/expected"
+
 # 通常ファイルと symlink の種別変更は T で、パッチは削除と追加の二節になる。
 g checkout -qb type-change "$base"
 rm "$R/mode"
