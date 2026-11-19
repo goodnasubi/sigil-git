@@ -6,8 +6,8 @@ use git.error.GitError;
 
 // ADR 0047 決定 1「保存形式」: 緩い形式は zlib で圧縮する。
 // 書き込みは有効な zlib であれば Git が受理するので、初版は非圧縮 (stored) ブロックの zlib を出力する。
-// 読み取りの inflate（固定・動的 Huffman）は圧縮の契約 ADR の確定後に別の Issue で実装する。
-// ここにある復号は stored ブロックだけを扱い、Huffman ブロックに当たったら UnsupportedFormat で拒否する。
+// 読み取りの伸長（stored・固定・動的 Huffman）は git.inflate。
+// ここにある zlib_decode_stored は stored ブロックだけを扱う軽量版で、Huffman ブロックに当たったら UnsupportedFormat で拒否する。
 
 fn max_stored_block() -> Int
   intent "stored ブロック 1 つが持てる最大の長さ (65535 byte) を返す"

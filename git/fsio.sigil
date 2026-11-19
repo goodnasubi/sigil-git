@@ -542,3 +542,133 @@ pub fn parent_of(path: &String) -> String
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// 位置指定の読み取り（ADR 0049 の fs B の read_at）
+// ---------------------------------------------------------------------------
+
+pub fn open_read(path: &String) -> Result<File, GitError>
+  intent "path を読み取り専用で開く（symlink は辿らない）。無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  return match fs.open_options().open(&Path.new(&path)) {
+    Ok(f) => Ok(f),
+    Err(e) => Err(map_io(&e, &"failed to open file for reading")),
+  };
+}
+
+fn byte_exists_at(f: &File, pos: Int) -> Result<Bool, GitError>
+  intent "位置 pos に 1 byte あるか（EOF より前か）を返す"
+  requires pos >= 0
+  ensures none
+  effects fs
+{
+  let mut one = Bytes.new();
+  one.push(0);
+  return match f.read_at(&mut one, pos) {
+    Ok(n) => Ok(n > 0),
+    Err(e) => Err(map_io(&e, &"failed to read file")),
+  };
+}
+
+pub fn file_size(f: &File) -> Result<Int, GitError>
+  intent "ファイルの大きさを返す。標準ライブラリに File の大きさを得る API が無いため、位置指定の 1 byte 読み取りで EOF を二分探索する（2^40 byte 以上は LimitExceeded）。ADR 0044 決定 4 に従い、この不足は sigil 側の Issue として報告する対象"
+  requires none
+  ensures none
+  effects fs
+{
+  if !byte_exists_at(&f, 0)? {
+    return Ok(0);
+  }
+  let mut lo = 0;
+  let mut hi = 1;
+  while byte_exists_at(&f, hi)? {
+    lo = hi;
+    hi = hi * 2;
+    if hi >= 1099511627776 {
+      return Err(GitError.LimitExceeded("file is too large"));
+    }
+  }
+  while hi - lo > 1 {
+    let mid = lo + (hi - lo) / 2;
+    if byte_exists_at(&f, mid)? {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return Ok(lo + 1);
+}
+
+pub fn read_range(f: &File, offset: Int, len: Int) -> Result<Bytes, GitError>
+  intent "offset から len byte を位置指定で読む。ファイルがそこまで無ければ Corrupt。len は 64 MiB 以下（それ以上は LimitExceeded）。64 KiB ずつ読み、全体を一度に確保しない"
+  requires none
+  ensures none
+  effects fs
+{
+  if offset < 0 || len < 0 {
+    return Err(GitError.Corrupt("invalid read range"));
+  }
+  if len > 134217728 {
+    return Err(GitError.LimitExceeded("read range is too large"));
+  }
+  let mut out = Bytes.new();
+  let mut done = 0;
+  let mut chunk = Bytes.new();
+  let mut ci = 0;
+  while ci < 65536 && ci < len {
+    chunk.push(0);
+    ci = ci + 1;
+  }
+  while done < len {
+    let want = len - done;
+    if want >= chunk.len() {
+      match f.read_exact_at(&mut chunk, offset + done) {
+        Ok(_) => {}
+        Err(_) => {
+          return Err(GitError.Corrupt("unexpected end of file"));
+        }
+      }
+      out.extend(&chunk);
+      done = done + chunk.len();
+    } else {
+      let mut tail = Bytes.new();
+      let mut ti = 0;
+      while ti < want {
+        tail.push(0);
+        ti = ti + 1;
+      }
+      match f.read_exact_at(&mut tail, offset + done) {
+        Ok(_) => {}
+        Err(_) => {
+          return Err(GitError.Corrupt("unexpected end of file"));
+        }
+      }
+      out.extend(&tail);
+      done = done + want;
+    }
+  }
+  return Ok(out);
+}
+
+pub fn sha256_range(f: &File, offset: Int, len: Int) -> Result<Bytes, GitError>
+  intent "offset から len byte の SHA-256 を、64 KiB ずつ位置指定で読んで逐次に計算する。全体をメモリに載せない"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut h = Sha256.new();
+  let mut done = 0;
+  while done < len {
+    let mut n = len - done;
+    if n > 65536 {
+      n = 65536;
+    }
+    let part = read_range(&f, offset + done, n)?;
+    h.update(&part);
+    done = done + n;
+  }
+  return Ok(h.finalize());
+}

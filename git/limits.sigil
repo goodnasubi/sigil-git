@@ -138,3 +138,30 @@ pub fn max_work_memory() -> Int
 {
   return 268435456;
 }
+
+pub fn max_pack_objects() -> Int
+  intent "1 つの pack が持てるオブジェクト数の上限 (2^24 = 16777216) を返す"
+  requires none
+  ensures result == 16777216
+  effects none
+{
+  return 16777216;
+}
+
+pub fn max_pack_size() -> Int
+  intent "pack のファイルの大きさの上限 (4 GiB = 4294967296 byte) を返す"
+  requires none
+  ensures result == 4294967296
+  effects none
+{
+  return 4294967296;
+}
+
+pub fn max_delta_depth() -> Int
+  intent "差分（OFS_DELTA／REF_DELTA）の連鎖の深さの上限 (64) を返す"
+  requires none
+  ensures result == 64
+  effects none
+{
+  return 64;
+}

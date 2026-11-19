@@ -1,0 +1,660 @@
+module git.pack
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.file_size;
+use git.fsio.open_read;
+use git.fsio.read_range;
+use git.fsio.sha256_range;
+use git.fsio.string_ends_with;
+use git.fsio.string_slice;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.hash.hex_to_bytes;
+use git.hash.is_valid_hex_id;
+use git.inflate.inflate_zlib;
+use git.limits.max_delta_depth;
+use git.limits.max_object_size;
+use git.limits.max_pack_objects;
+use git.limits.max_pack_size;
+use git.limits.max_work_memory;
+use git.object.ObjectType;
+use git.object.object_type_name;
+
+// ADR 0047 決定 1「保存形式」・決定 5「上限」: pack と pack index (v2, SHA-256) の読み取り。
+// 読み取り専用。pack 全体はメモリに載せず、位置指定の読み取り（File.read_at）で必要な範囲だけを読む。
+// 開くとき、.idx の末尾の検査値と pack の末尾の検査値（pack 全体の SHA-256）を検証し、両者が同じ pack を指すことを確かめる。
+// オブジェクトを読むたびに、復元した内容から識別子を再計算して .idx の識別子と照合する。
+// .idx の crc32 欄は使わない（識別子の再計算のほうが強い検証で、純 Sigil の crc32 を足す理由が無いため。ADR 0047「前提と持ち越し」4）。
+// 未対応（SHA-1 形式の .idx、v1 の .idx）は UnsupportedFormat で明示的に拒否する。
+
+pub struct PackStore {
+  idx_path: String,
+  pack_path: String,
+  count: Int,
+  fanout: List<Int>,
+  large_count: Int,
+  idx_size: Int,
+  pack_size: Int,
+}
+
+pub struct PackedObject {
+  obj_type: ObjectType,
+  content: Bytes,
+}
+
+struct Cur {
+  pos: Int,
+}
+
+struct Entry {
+  kind: Int,
+  size: Int,
+  data_off: Int,
+  base_off: Int,
+  base_id: String,
+}
+
+fn hash_len() -> Int
+  intent "識別子（SHA-256）の長さ 32 を返す"
+  requires none
+  ensures result == 32
+  effects none
+{
+  return 32;
+}
+
+fn at(l: &List<Int>, i: Int) -> Int
+  intent "整数のリストの i 番目を返す（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+fn be32(b: &Bytes, off: Int) -> Int
+  intent "big endian の 32 bit を読む（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return b.read_u32_be(off).unwrap_or(0);
+}
+
+fn ids_base() -> Int
+  intent ".idx の中で識別子の表が始まる位置 (8 + 256 * 4) を返す"
+  requires none
+  ensures result == 1032
+  effects none
+{
+  return 1032;
+}
+
+fn idx_min_size(n: Int, hl: Int) -> Int
+  intent "大きなオフセットを持たない .idx の大きさを返す（ヘッダ 8、fanout 1024、識別子・crc32・オフセットの表、末尾の検査値 2 つ）"
+  requires none
+  ensures none
+  effects none
+{
+  return 8 + 1024 + n * (hl + 8) + hl * 2;
+}
+
+pub fn open_pack(idx_path: &String) -> Result<PackStore, GitError>
+  intent ".idx を開いて形式を検査し、.idx の末尾の検査値と pack の末尾の検査値を検証する。v1・SHA-1 形式は UnsupportedFormat、壊れていれば Corrupt、上限超過は LimitExceeded"
+  requires none
+  ensures none
+  effects fs
+{
+  if !string_ends_with(&idx_path, &".idx") {
+    return Err(GitError.InvalidPath("a pack index must end with .idx"));
+  }
+  let idx = open_read(&idx_path)?;
+  let idx_size = file_size(&idx)?;
+  if idx_size < 8 + 1024 + 40 {
+    return Err(GitError.Corrupt("pack index is too short"));
+  }
+  let head = read_range(&idx, 0, 8)?;
+  if be32(&head, 0) != 4285812579 {
+    return Err(GitError.UnsupportedFormat("pack index version 1 is not supported"));
+  }
+  if be32(&head, 4) != 2 {
+    return Err(GitError.UnsupportedFormat("unsupported pack index version"));
+  }
+  let fan = read_range(&idx, 8, 1024)?;
+  let mut fanout = List.new();
+  let mut prev = 0;
+  let mut i = 0;
+  while i < 256 {
+    let v = be32(&fan, i * 4);
+    if v < prev {
+      return Err(GitError.Corrupt("pack index fanout is not monotonic"));
+    }
+    fanout.push(v);
+    prev = v;
+    i = i + 1;
+  }
+  let n = prev;
+  if n > max_pack_objects() {
+    return Err(GitError.LimitExceeded("pack has too many objects"));
+  }
+  let hl = hash_len();
+  let base = idx_min_size(n, hl);
+  let extra = idx_size - base;
+  if extra < 0 || extra % 8 != 0 || extra / 8 > n {
+    let sha1_base = 8 + 1024 + n * 28 + 40;
+    let sha1_extra = idx_size - sha1_base;
+    if sha1_extra >= 0 && sha1_extra % 8 == 0 && sha1_extra / 8 <= n {
+      return Err(GitError.UnsupportedFormat("SHA-1 pack index is not supported"));
+    }
+    return Err(GitError.Corrupt("pack index size does not match its object count"));
+  }
+  let want_idx_sum = read_range(&idx, idx_size - hl, hl)?;
+  let got_idx_sum = sha256_range(&idx, 0, idx_size - hl)?;
+  if want_idx_sum != got_idx_sum {
+    return Err(GitError.Corrupt("pack index checksum mismatch"));
+  }
+  let pack_sum_in_idx = read_range(&idx, idx_size - hl * 2, hl)?;
+  let pack_path = cat3(&string_slice(&idx_path, 0, idx_path.len() - 4), &".pack", &"");
+  let pack = open_read(&pack_path)?;
+  let pack_size = file_size(&pack)?;
+  if pack_size > max_pack_size() {
+    return Err(GitError.LimitExceeded("pack file exceeds the 4 GiB limit"));
+  }
+  if pack_size < 12 + hl {
+    return Err(GitError.Corrupt("pack file is too short"));
+  }
+  let ph = read_range(&pack, 0, 12)?;
+  if be32(&ph, 0) != 1346454347 {
+    return Err(GitError.Corrupt("pack signature is missing"));
+  }
+  if be32(&ph, 4) != 2 {
+    return Err(GitError.UnsupportedFormat("unsupported pack version"));
+  }
+  if be32(&ph, 8) != n {
+    return Err(GitError.Corrupt("pack object count does not match the index"));
+  }
+  let pack_sum = read_range(&pack, pack_size - hl, hl)?;
+  if pack_sum != pack_sum_in_idx {
+    return Err(GitError.Corrupt("pack checksum differs between the pack and its index"));
+  }
+  let got_pack_sum = sha256_range(&pack, 0, pack_size - hl)?;
+  if got_pack_sum != pack_sum {
+    return Err(GitError.Corrupt("pack checksum mismatch"));
+  }
+  return Ok(PackStore { idx_path: idx_path.clone(), pack_path: pack_path, count: n, fanout: fanout, large_count: extra / 8, idx_size: idx_size, pack_size: pack_size });
+}
+
+pub fn pack_count(ps: &PackStore) -> Int
+  intent "pack のオブジェクト数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ps.count;
+}
+
+fn id_at(idx: &File, ps: &PackStore, i: Int) -> Result<Bytes, GitError>
+  intent ".idx の i 番目の識別子（32 byte）を読む"
+  requires none
+  ensures none
+  effects fs
+{
+  return read_range(&idx, ids_base() + i * hash_len(), hash_len());
+}
+
+pub fn pack_id_at(ps: &PackStore, i: Int) -> Result<String, GitError>
+  intent ".idx の i 番目の識別子を hex で返す（0 以上 count 未満）"
+  requires none
+  ensures none
+  effects fs
+{
+  if i < 0 || i >= ps.count {
+    return Err(GitError.NotFound("pack index entry is out of range"));
+  }
+  let idx = open_read(&ps.idx_path)?;
+  let id = id_at(&idx, &ps, i)?;
+  return Ok(bytes_to_hex(&id));
+}
+
+fn offset_at(idx: &File, ps: &PackStore, i: Int) -> Result<Int, GitError>
+  intent ".idx の i 番目のオブジェクトの pack 内の位置を読む。大きなオフセットの表への参照も解決し、pack の範囲外は Corrupt"
+  requires none
+  ensures none
+  effects fs
+{
+  let off_base = ids_base() + ps.count * (hash_len() + 4);
+  let word = read_range(&idx, off_base + i * 4, 4)?;
+  let v = be32(&word, 0);
+  let mut off = v;
+  if v >= 2147483648 {
+    let slot = v - 2147483648;
+    if slot >= ps.large_count {
+      return Err(GitError.Corrupt("pack index large offset is out of range"));
+    }
+    let large_base = off_base + ps.count * 4;
+    let big = read_range(&idx, large_base + slot * 8, 8)?;
+    let hi = be32(&big, 0);
+    if hi >= 2147483648 {
+      return Err(GitError.Corrupt("pack index offset overflows"));
+    }
+    off = hi * 4294967296 + be32(&big, 4);
+  }
+  if off < 12 || off >= ps.pack_size - hash_len() {
+    return Err(GitError.Corrupt("pack index offset is outside the pack"));
+  }
+  return Ok(off);
+}
+
+fn compare_id(a: &Bytes, b: &Bytes) -> Int
+  intent "識別子をバイト列として辞書順に比較し -1, 0, 1 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < a.len() && i < b.len() {
+    let x = a.get(i).unwrap_or(0);
+    let y = b.get(i).unwrap_or(0);
+    if x < y {
+      return -1;
+    }
+    if x > y {
+      return 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn find_index(idx: &File, ps: &PackStore, id: &Bytes) -> Result<Option<Int>, GitError>
+  intent "fanout と二分探索で id の .idx 内の番号を探す。無ければ None"
+  requires none
+  ensures none
+  effects fs
+{
+  let first = id.get(0).unwrap_or(0);
+  let mut lo = 0;
+  if first > 0 {
+    lo = at(&ps.fanout, first - 1);
+  }
+  let mut hi = at(&ps.fanout, first);
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    let got = id_at(&idx, &ps, mid)?;
+    let c = compare_id(&got, &id);
+    if c == 0 {
+      return Ok(Some(mid));
+    }
+    if c < 0 {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return Ok(None);
+}
+
+pub fn pack_has(ps: &PackStore, id_hex: &String) -> Result<Bool, GitError>
+  intent "この pack に id があるかを返す（.idx の検索だけ。内容は読まない）"
+  requires none
+  ensures none
+  effects fs
+{
+  if !is_valid_hex_id(&id_hex) {
+    return Err(GitError.Corrupt("invalid object id (expected 64 lowercase hex digits)"));
+  }
+  let want = hex_to_bytes(&id_hex)?;
+  let idx = open_read(&ps.idx_path)?;
+  return match find_index(&idx, &ps, &want)? {
+    None => Ok(false),
+    Some(_) => Ok(true),
+  };
+}
+
+fn read_entry(pack: &File, ps: &PackStore, off: Int) -> Result<Entry, GitError>
+  intent "pack の off にあるオブジェクトの見出し（型・宣言された大きさ・差分の基点）を読む。宣言された大きさは割り当ての前に上限を検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let end = ps.pack_size - hash_len();
+  let mut want = 64;
+  if off + want > end {
+    want = end - off;
+  }
+  if want < 1 {
+    return Err(GitError.Corrupt("pack entry is outside the pack"));
+  }
+  let b = read_range(&pack, off, want)?;
+  let mut pos = 0;
+  let c0 = b.get(0).unwrap_or(0);
+  let kind = c0 / 16 % 8;
+  let mut size = c0 % 16;
+  let mut shift = 4;
+  pos = 1;
+  let mut cont = c0 >= 128;
+  while cont {
+    if pos >= b.len() || pos > 9 {
+      return Err(GitError.Corrupt("pack entry header is malformed"));
+    }
+    let c = b.get(pos).unwrap_or(0);
+    size = size + c % 128 * (1 << shift);
+    if size > 1099511627776 {
+      return Err(GitError.LimitExceeded("pack entry declares an excessive size"));
+    }
+    shift = shift + 7;
+    pos = pos + 1;
+    cont = c >= 128;
+  }
+  if kind == 0 || kind == 5 {
+    return Err(GitError.Corrupt("invalid pack entry type"));
+  }
+  if size > max_object_size() {
+    return Err(GitError.LimitExceeded("pack entry exceeds the 64 MiB limit"));
+  }
+  let mut base_off = 0;
+  let mut base_id = "";
+  if kind == 6 {
+    let mut c = b.get(pos).unwrap_or(0);
+    pos = pos + 1;
+    let mut rel = c % 128;
+    while c >= 128 {
+      if pos >= b.len() || pos > 20 {
+        return Err(GitError.Corrupt("pack OFS_DELTA offset is malformed"));
+      }
+      c = b.get(pos).unwrap_or(0);
+      pos = pos + 1;
+      rel = (rel + 1) * 128 + c % 128;
+      if rel > ps.pack_size {
+        return Err(GitError.Corrupt("pack OFS_DELTA offset is out of range"));
+      }
+    }
+    if rel <= 0 || rel > off - 12 {
+      return Err(GitError.Corrupt("pack OFS_DELTA base is outside the pack"));
+    }
+    base_off = off - rel;
+  } else if kind == 7 {
+    if pos + hash_len() > b.len() {
+      return Err(GitError.Corrupt("pack REF_DELTA header is truncated"));
+    }
+    let idbytes = b.slice(pos, pos + hash_len()).unwrap_or(Bytes.new());
+    base_id = bytes_to_hex(&idbytes);
+    pos = pos + hash_len();
+  }
+  return Ok(Entry { kind: kind, size: size, data_off: off + pos, base_off: base_off, base_id: base_id });
+}
+
+fn inflate_entry(pack: &File, ps: &PackStore, e: &Entry) -> Result<Bytes, GitError>
+  intent "見出しの後ろの zlib ストリームを伸長して返す。宣言された大きさと一致しなければ Corrupt。読む範囲は宣言された大きさから決まる上限までに限る"
+  requires none
+  ensures none
+  effects fs
+{
+  let end = ps.pack_size - hash_len();
+  let mut window = e.size + e.size / 8 + 256;
+  if e.data_off + window > end {
+    window = end - e.data_off;
+  }
+  if window < 6 {
+    return Err(GitError.Corrupt("pack entry data is truncated"));
+  }
+  let z = read_range(&pack, e.data_off, window)?;
+  let r = inflate_zlib(&z, 0, e.size)?;
+  if r.data.len() != e.size {
+    return Err(GitError.Corrupt("pack entry size does not match its data"));
+  }
+  return Ok(r.data);
+}
+
+fn read_varint(d: &Bytes, cur: &mut Cur) -> Result<Int, GitError>
+  intent "差分の大きさ（7 bit ずつの little endian の可変長整数）を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let mut v = 0;
+  let mut shift = 0;
+  let mut cont = true;
+  while cont {
+    if cur.pos >= d.len() || shift > 56 {
+      return Err(GitError.Corrupt("delta size is malformed"));
+    }
+    let c = d.get(cur.pos).unwrap_or(0);
+    cur.pos = cur.pos + 1;
+    v = v + c % 128 * (1 << shift);
+    shift = shift + 7;
+    cont = c >= 128;
+  }
+  return Ok(v);
+}
+
+fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
+  intent "差分 delta を base に適用して復元後の内容を返す。base の大きさの不一致、範囲外の copy、復元後の大きさ（上限 64 MiB と宣言値）の超過・不足は Corrupt／LimitExceeded"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cur = Cur { pos: 0 };
+  let src_size = read_varint(&delta, &mut cur)?;
+  let dst_size = read_varint(&delta, &mut cur)?;
+  let mut pos = cur.pos;
+  if src_size != base.len() {
+    return Err(GitError.Corrupt("delta base size does not match"));
+  }
+  if dst_size > max_object_size() {
+    return Err(GitError.LimitExceeded("delta result exceeds the 64 MiB limit"));
+  }
+  let mut out = Bytes.new();
+  while pos < delta.len() {
+    let op = delta.get(pos).unwrap_or(0);
+    pos = pos + 1;
+    if op >= 128 {
+      let mut off = 0;
+      let mut size = 0;
+      let mut k = 0;
+      while k < 4 {
+        if op / (1 << k) % 2 == 1 {
+          if pos >= delta.len() {
+            return Err(GitError.Corrupt("delta copy is truncated"));
+          }
+          off = off + delta.get(pos).unwrap_or(0) * (1 << k * 8);
+          pos = pos + 1;
+        }
+        k = k + 1;
+      }
+      let mut j = 0;
+      while j < 3 {
+        if op / (1 << j + 4) % 2 == 1 {
+          if pos >= delta.len() {
+            return Err(GitError.Corrupt("delta copy is truncated"));
+          }
+          size = size + delta.get(pos).unwrap_or(0) * (1 << j * 8);
+          pos = pos + 1;
+        }
+        j = j + 1;
+      }
+      if size == 0 {
+        size = 65536;
+      }
+      if off + size > base.len() {
+        return Err(GitError.Corrupt("delta copy is outside the base"));
+      }
+      if out.len() + size > dst_size {
+        return Err(GitError.Corrupt("delta produces more data than declared"));
+      }
+      out.extend(&base.slice(off, off + size).unwrap_or(Bytes.new()));
+    } else if op > 0 {
+      if pos + op > delta.len() {
+        return Err(GitError.Corrupt("delta insert is truncated"));
+      }
+      if out.len() + op > dst_size {
+        return Err(GitError.Corrupt("delta produces more data than declared"));
+      }
+      out.extend(&delta.slice(pos, pos + op).unwrap_or(Bytes.new()));
+      pos = pos + op;
+    } else {
+      return Err(GitError.Corrupt("delta contains a reserved opcode"));
+    }
+  }
+  if out.len() != dst_size {
+    return Err(GitError.Corrupt("delta produces less data than declared"));
+  }
+  return Ok(out);
+}
+
+fn kind_type(kind: Int) -> ObjectType
+  intent "pack の型番号 (1 commit, 2 tree, 3 blob, 4 tag) をオブジェクト型にする"
+  requires kind >= 1 && kind <= 4
+  ensures none
+  effects none
+{
+  if kind == 1 {
+    return ObjectType.Commit;
+  }
+  if kind == 2 {
+    return ObjectType.Tree;
+  }
+  if kind == 3 {
+    return ObjectType.Blob;
+  }
+  return ObjectType.Tag;
+}
+
+fn seen(visited: &List<Int>, off: Int) -> Bool
+  intent "off が既に辿った位置かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < visited.len() {
+    if at(&visited, i) == off {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn resolve_at(pack: &File, idx: &File, ps: &PackStore, off: Int) -> Result<PackedObject, GitError>
+  intent "off のオブジェクトを復元する。差分は基点まで辿って（深さ 64 まで、循環は Corrupt、メモリは 256 MiB まで）から適用する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut deltas = List.new();
+  let mut visited = List.new();
+  let mut cur = off;
+  let mut memory = 0;
+  let mut base_kind = 0;
+  let mut base = Bytes.new();
+  let mut found = false;
+  while !found {
+    if seen(&visited, cur) {
+      return Err(GitError.Corrupt("delta chain contains a cycle"));
+    }
+    if visited.len() > max_delta_depth() {
+      return Err(GitError.LimitExceeded("delta chain is too deep"));
+    }
+    visited.push(cur);
+    let e = read_entry(&pack, &ps, cur)?;
+    memory = memory + e.size;
+    if memory > max_work_memory() {
+      return Err(GitError.LimitExceeded("work memory limit exceeded while resolving a delta chain"));
+    }
+    let data = inflate_entry(&pack, &ps, &e)?;
+    if e.kind >= 1 && e.kind <= 4 {
+      base_kind = e.kind;
+      base = data;
+      found = true;
+    } else {
+      deltas.push(data);
+      if e.kind == 6 {
+        cur = e.base_off;
+      } else {
+        let want = hex_to_bytes(&e.base_id)?;
+        match find_index(&idx, &ps, &want)? {
+          None => {
+            return Err(GitError.NotFound("delta base is not in this pack"));
+          }
+          Some(i) => {
+            cur = offset_at(&idx, &ps, i)?;
+          }
+        }
+      }
+    }
+  }
+  let mut k = deltas.len();
+  while k > 0 {
+    k = k - 1;
+    match deltas.get(k) {
+      None => {}
+      Some(d) => {
+        base = apply_delta(&base, &d)?;
+      }
+    }
+  }
+  return Ok(PackedObject { obj_type: kind_type(base_kind), content: base });
+}
+
+fn check_id(o: &PackedObject, id: &Bytes) -> Result<Bool, GitError>
+  intent "復元した内容から識別子を再計算し、.idx の識別子と一致するかを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let got = compute_object_id(&object_type_name(&o.obj_type), &o.content);
+  if got != id {
+    return Err(GitError.Corrupt("object id does not match its content in the pack"));
+  }
+  return Ok(true);
+}
+
+pub fn pack_read_index(ps: &PackStore, i: Int) -> Result<PackedObject, GitError>
+  intent ".idx の i 番目のオブジェクトを読み、型と内容を返す。識別子を再計算して検証する"
+  requires none
+  ensures none
+  effects fs
+{
+  if i < 0 || i >= ps.count {
+    return Err(GitError.NotFound("pack index entry is out of range"));
+  }
+  let idx = open_read(&ps.idx_path)?;
+  let pack = open_read(&ps.pack_path)?;
+  let id = id_at(&idx, &ps, i)?;
+  let off = offset_at(&idx, &ps, i)?;
+  let o = resolve_at(&pack, &idx, &ps, off)?;
+  check_id(&o, &id)?;
+  return Ok(o);
+}
+
+pub fn pack_read(ps: &PackStore, id_hex: &String) -> Result<Option<PackedObject>, GitError>
+  intent "id のオブジェクトを pack から読む。この pack に無ければ None。識別子を再計算して検証する"
+  requires none
+  ensures none
+  effects fs
+{
+  if !is_valid_hex_id(&id_hex) {
+    return Err(GitError.Corrupt("invalid object id (expected 64 lowercase hex digits)"));
+  }
+  let want = hex_to_bytes(&id_hex)?;
+  let idx = open_read(&ps.idx_path)?;
+  match find_index(&idx, &ps, &want)? {
+    None => {
+      return Ok(None);
+    }
+    Some(i) => {
+      let pack = open_read(&ps.pack_path)?;
+      let off = offset_at(&idx, &ps, i)?;
+      let o = resolve_at(&pack, &idx, &ps, off)?;
+      check_id(&o, &want)?;
+      return Ok(Some(o));
+    }
+  }
+}

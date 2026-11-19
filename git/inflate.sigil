@@ -1,0 +1,421 @@
+module git.inflate
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.zlib.adler32;
+
+// ADR 0047 決定 1「保存形式」: zlib の伸長（inflate）。stored・固定 Huffman・動的 Huffman の 3 種のブロックを扱う。
+// RFC 1950（zlib）と RFC 1951（deflate）に従う純 Sigil の実装で、符号の復号は puff.c と同じ「長さごとの個数表」方式。
+// 出力は limit byte を超えない。超えたら LimitExceeded（黙って切り詰めない）。入力の末尾を越えて読むときは Corrupt。
+// zlib の preset dictionary は UnsupportedFormat。末尾の Adler-32 は必ず検証する。
+// 圧縮の契約 ADR（ADR 0047「前提と持ち越し」2）は未確定。確定後に同契約への適合を確認する。
+
+pub struct InflateResult {
+  data: Bytes,
+  consumed: Int,
+}
+
+struct Bits {
+  pos: Int,
+  buf: Int,
+  cnt: Int,
+}
+
+struct Huff {
+  count: List<Int>,
+  symbol: List<Int>,
+}
+
+fn take_bits(data: &Bytes, st: &mut Bits, n: Int) -> Result<Int, GitError>
+  intent "LSB 側から n bit (0 以上 16 以下) を読む。入力が尽きたら Corrupt"
+  requires n >= 0
+  ensures none
+  effects none
+{
+  while st.cnt < n {
+    match data.get(st.pos) {
+      None => {
+        return Err(GitError.Corrupt("deflate stream is truncated"));
+      }
+      Some(b) => {
+        st.buf = st.buf | b << st.cnt;
+        st.cnt = st.cnt + 8;
+        st.pos = st.pos + 1;
+      }
+    }
+  }
+  let modulus = 1 << n;
+  let v = st.buf % modulus;
+  st.buf = st.buf >> n;
+  st.cnt = st.cnt - n;
+  return Ok(v);
+}
+
+fn at(l: &List<Int>, i: Int) -> Int
+  intent "整数のリストの i 番目を返す（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+fn ints(csv: &String) -> List<Int>
+  intent "カンマ区切りの 10 進数の文字列を整数のリストにする（表を短く書くため。入力はこのファイル内の定数だけ）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = csv.as_bytes();
+  let mut out = List.new();
+  let mut cur = 0;
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 44 {
+      out.push(cur);
+      cur = 0;
+    } else {
+      cur = cur * 10 + (c - 48);
+    }
+    i = i + 1;
+  }
+  out.push(cur);
+  return out;
+}
+
+fn build_huff(lengths: &List<Int>) -> Result<Huff, GitError>
+  intent "符号長の並びから復号表を作る。過剰に割り当てられた符号は Corrupt。不完全な符号は許し、使われたときに復号側が Corrupt にする"
+  requires none
+  ensures none
+  effects none
+{
+  let n = lengths.len();
+  let mut tally = List.new();
+  let mut z = 0;
+  while z <= 15 {
+    let mut c = 0;
+    let mut s = 0;
+    while s < n {
+      if at(&lengths, s) == z {
+        c = c + 1;
+      }
+      s = s + 1;
+    }
+    tally.push(c);
+    z = z + 1;
+  }
+  let mut left = 1;
+  let mut len = 1;
+  while len <= 15 {
+    left = left * 2 - at(&tally, len);
+    if left < 0 {
+      return Err(GitError.Corrupt("over-subscribed Huffman code"));
+    }
+    len = len + 1;
+  }
+  let mut symbol = List.new();
+  let mut ln = 1;
+  while ln <= 15 {
+    let mut s2 = 0;
+    while s2 < n {
+      if at(&lengths, s2) == ln {
+        symbol.push(s2);
+      }
+      s2 = s2 + 1;
+    }
+    ln = ln + 1;
+  }
+  return Ok(Huff { count: tally, symbol: symbol });
+}
+
+fn decode_sym(data: &Bytes, st: &mut Bits, h: &Huff) -> Result<Int, GitError>
+  intent "復号表に従って符号 1 つを読み、記号を返す。表にない符号は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  let mut code = 0;
+  let mut first = 0;
+  let mut index = 0;
+  let mut len = 1;
+  while len <= 15 {
+    code = code | take_bits(&data, &mut st, 1)?;
+    let c = at(&h.count, len);
+    if code - c < first {
+      return Ok(at(&h.symbol, index + (code - first)));
+    }
+    index = index + c;
+    first = first + c << 1;
+    code = code << 1;
+    len = len + 1;
+  }
+  return Err(GitError.Corrupt("invalid Huffman code"));
+}
+
+fn push_out(out: &mut Bytes, b: Int, limit: Int) -> Result<Bool, GitError>
+  intent "出力に 1 byte 追記する。limit を超えるなら LimitExceeded"
+  requires none
+  ensures none
+  effects none
+{
+  if out.len() >= limit {
+    return Err(GitError.LimitExceeded("inflated data exceeds the limit"));
+  }
+  out.push(b);
+  return Ok(true);
+}
+
+fn inflate_codes(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int, lit: &Huff, dist: &Huff) -> Result<Bool, GitError>
+  intent "1 つの Huffman ブロックの本体（リテラルと長さ・距離の組）を終端符号まで復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let lbase = ints(&"3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258");
+  let lext = ints(&"0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0");
+  let dbase = ints(&"1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577");
+  let dext = ints(&"0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13");
+  let mut done = false;
+  while !done {
+    let sym = decode_sym(&data, &mut st, &lit)?;
+    if sym < 256 {
+      push_out(&mut out, sym, limit)?;
+    } else if sym == 256 {
+      done = true;
+    } else {
+      let li = sym - 257;
+      if li >= 29 {
+        return Err(GitError.Corrupt("invalid length symbol"));
+      }
+      let len = at(&lbase, li) + take_bits(&data, &mut st, at(&lext, li))?;
+      let ds = decode_sym(&data, &mut st, &dist)?;
+      if ds >= 30 {
+        return Err(GitError.Corrupt("invalid distance symbol"));
+      }
+      let d = at(&dbase, ds) + take_bits(&data, &mut st, at(&dext, ds))?;
+      if d > out.len() {
+        return Err(GitError.Corrupt("distance is too far back"));
+      }
+      let mut k = 0;
+      while k < len {
+        let b = out.get(out.len() - d).unwrap_or(0);
+        push_out(&mut out, b, limit)?;
+        k = k + 1;
+      }
+    }
+  }
+  return Ok(true);
+}
+
+fn inflate_fixed(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> Result<Bool, GitError>
+  intent "固定 Huffman ブロックを復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut ll = List.new();
+  let mut i = 0;
+  while i < 288 {
+    if i < 144 {
+      ll.push(8);
+    } else if i < 256 {
+      ll.push(9);
+    } else if i < 280 {
+      ll.push(7);
+    } else {
+      ll.push(8);
+    }
+    i = i + 1;
+  }
+  let mut dl = List.new();
+  let mut j = 0;
+  while j < 30 {
+    dl.push(5);
+    j = j + 1;
+  }
+  let lit = build_huff(&ll)?;
+  let dist = build_huff(&dl)?;
+  return inflate_codes(&data, &mut st, &mut out, limit, &lit, &dist);
+}
+
+fn inflate_dynamic(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> Result<Bool, GitError>
+  intent "動的 Huffman ブロックを復号する（符号長の符号→リテラル/長さ・距離の符号長→本体）"
+  requires none
+  ensures none
+  effects none
+{
+  let nlen = take_bits(&data, &mut st, 5)? + 257;
+  let ndist = take_bits(&data, &mut st, 5)? + 1;
+  let ncode = take_bits(&data, &mut st, 4)? + 4;
+  if nlen > 286 || ndist > 30 {
+    return Err(GitError.Corrupt("too many length or distance codes"));
+  }
+  let order = ints(&"16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15");
+  let mut cl = List.new();
+  let mut a = 0;
+  while a < 19 {
+    cl.push(0);
+    a = a + 1;
+  }
+  let mut cl2 = List.new();
+  let mut idx = 0;
+  while idx < 19 {
+    let mut v = 0;
+    if idx < ncode {
+      v = take_bits(&data, &mut st, 3)?;
+    }
+    cl2.push(v);
+    idx = idx + 1;
+  }
+  // cl2 は読んだ順（order の順）。符号の番号の順に並べ替える。
+  let mut k = 0;
+  while k < 19 {
+    let mut found = 0;
+    let mut m = 0;
+    while m < 19 {
+      if at(&order, m) == k {
+        found = at(&cl2, m);
+      }
+      m = m + 1;
+    }
+    cl.push(found);
+    k = k + 1;
+  }
+  let mut clens = List.new();
+  let mut q = 19;
+  while q < cl.len() {
+    clens.push(at(&cl, q));
+    q = q + 1;
+  }
+  let lencode = build_huff(&clens)?;
+  let mut lengths = List.new();
+  while lengths.len() < nlen + ndist {
+    let sym = decode_sym(&data, &mut st, &lencode)?;
+    if sym < 16 {
+      lengths.push(sym);
+    } else {
+      let mut prev = 0;
+      let mut rep = 0;
+      if sym == 16 {
+        if lengths.len() == 0 {
+          return Err(GitError.Corrupt("repeat code without a previous length"));
+        }
+        prev = at(&lengths, lengths.len() - 1);
+        rep = 3 + take_bits(&data, &mut st, 2)?;
+      } else if sym == 17 {
+        rep = 3 + take_bits(&data, &mut st, 3)?;
+      } else {
+        rep = 11 + take_bits(&data, &mut st, 7)?;
+      }
+      if lengths.len() + rep > nlen + ndist {
+        return Err(GitError.Corrupt("code length repeat overflows"));
+      }
+      let mut r = 0;
+      while r < rep {
+        lengths.push(prev);
+        r = r + 1;
+      }
+    }
+  }
+  let mut ll = List.new();
+  let mut dl = List.new();
+  let mut t = 0;
+  while t < lengths.len() {
+    if t < nlen {
+      ll.push(at(&lengths, t));
+    } else {
+      dl.push(at(&lengths, t));
+    }
+    t = t + 1;
+  }
+  let lit = build_huff(&ll)?;
+  let dist = build_huff(&dl)?;
+  return inflate_codes(&data, &mut st, &mut out, limit, &lit, &dist);
+}
+
+fn inflate_stored(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> Result<Bool, GitError>
+  intent "stored ブロックを復号する（バイト境界に揃えてから LEN・NLEN・本体）"
+  requires none
+  ensures none
+  effects none
+{
+  st.buf = 0;
+  st.cnt = 0;
+  let p = st.pos;
+  if p + 4 > data.len() {
+    return Err(GitError.Corrupt("truncated stored block header"));
+  }
+  let len = data.get(p).unwrap_or(0) + data.get(p + 1).unwrap_or(0) * 256;
+  let nlen = data.get(p + 2).unwrap_or(0) + data.get(p + 3).unwrap_or(0) * 256;
+  if len + nlen != 65535 {
+    return Err(GitError.Corrupt("stored block length check failed"));
+  }
+  if p + 4 + len > data.len() {
+    return Err(GitError.Corrupt("truncated stored block"));
+  }
+  if out.len() + len > limit {
+    return Err(GitError.LimitExceeded("inflated data exceeds the limit"));
+  }
+  let mut i = 0;
+  while i < len {
+    out.push(data.get(p + 4 + i).unwrap_or(0));
+    i = i + 1;
+  }
+  st.pos = p + 4 + len;
+  return Ok(true);
+}
+
+pub fn inflate_zlib(z: &Bytes, start: Int, limit: Int) -> Result<InflateResult, GitError>
+  intent "z の start 位置から始まる zlib ストリームを伸長する。出力が limit byte を超えたら LimitExceeded。Adler-32 を検証し、ストリームが使った byte 数（start から末尾の検査値まで）を consumed に入れる。ストリームの後ろに続く byte は読まない"
+  requires limit >= 0
+  ensures none
+  effects none
+{
+  if start < 0 || start + 2 > z.len() {
+    return Err(GitError.Corrupt("zlib stream too short"));
+  }
+  let cmf = z.get(start).unwrap_or(0);
+  let flg = z.get(start + 1).unwrap_or(0);
+  if cmf % 16 != 8 || cmf / 16 > 7 {
+    return Err(GitError.Corrupt("invalid zlib header (not deflate)"));
+  }
+  if (cmf * 256 + flg) % 31 != 0 {
+    return Err(GitError.Corrupt("invalid zlib header check"));
+  }
+  if flg / 32 % 2 == 1 {
+    return Err(GitError.UnsupportedFormat("zlib preset dictionary is not supported"));
+  }
+  let mut st = Bits { pos: start + 2, buf: 0, cnt: 0 };
+  let mut out = Bytes.new();
+  let mut last = false;
+  while !last {
+    let fin = take_bits(&z, &mut st, 1)?;
+    let kind = take_bits(&z, &mut st, 2)?;
+    if fin == 1 {
+      last = true;
+    }
+    if kind == 0 {
+      inflate_stored(&z, &mut st, &mut out, limit)?;
+    } else if kind == 1 {
+      inflate_fixed(&z, &mut st, &mut out, limit)?;
+    } else if kind == 2 {
+      inflate_dynamic(&z, &mut st, &mut out, limit)?;
+    } else {
+      return Err(GitError.Corrupt("invalid deflate block type"));
+    }
+  }
+  let p = st.pos;
+  if p + 4 > z.len() {
+    return Err(GitError.Corrupt("zlib stream is missing the Adler-32 check"));
+  }
+  let want = z.get(p).unwrap_or(0) * 16777216 + z.get(p + 1).unwrap_or(0) * 65536 + z.get(p + 2).unwrap_or(0) * 256 + z.get(p + 3).unwrap_or(0);
+  if adler32(&out) != want {
+    return Err(GitError.Corrupt("zlib Adler-32 mismatch"));
+  }
+  return Ok(InflateResult { data: out, consumed: p + 4 - start });
+}

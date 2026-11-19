@@ -214,7 +214,7 @@ fn check_config(info: &ConfigInfo) -> Result<Bool, GitError>
 }
 
 fn check_layout(git_dir: &String) -> Result<Bool, GitError>
-  intent "git ディレクトリの構成から、未対応の機能（alternates、shallow、worktrees、replace 参照、promisor、疎なチェックアウト、分割索引）を検出して拒否する"
+  intent "git ディレクトリの構成から、未対応の機能（alternates、shallow、worktrees、replace 参照、promisor、疎なチェックアウト、分割索引、multi-pack-index、ビットマップ、commit-graph）を検出して拒否する"
   requires none
   ensures none
   effects fs
@@ -250,6 +250,10 @@ fn check_layout(git_dir: &String) -> Result<Bool, GitError>
     }
     i = i + 1;
   }
+  let info_dir = join_path(&join_path(&git_dir, &"objects"), &"info");
+  if file_exists(&join_path(&info_dir, &"commit-graph"))? || dir_exists(&join_path(&info_dir, &"commit-graphs"))? {
+    return Err(GitError.UnsupportedFormat("commit-graph is not supported"));
+  }
   let pack_dir = join_path(&join_path(&git_dir, &"objects"), &"pack");
   if dir_exists(&pack_dir)? {
     let packs = list_names(&pack_dir, max_listed_entries())?;
@@ -259,6 +263,12 @@ fn check_layout(git_dir: &String) -> Result<Bool, GitError>
         Some(pn) => {
           if string_ends_with(&pn, &".promisor") {
             return Err(GitError.UnsupportedFormat("partial clone (promisor) is not supported"));
+          }
+          if pn == "multi-pack-index" || string_starts_with(&pn, &"multi-pack-index.") {
+            return Err(GitError.UnsupportedFormat("multi-pack-index is not supported"));
+          }
+          if string_ends_with(&pn, &".bitmap") {
+            return Err(GitError.UnsupportedFormat("reachability bitmaps are not supported"));
           }
         }
         None => {}
