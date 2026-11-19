@@ -1,0 +1,455 @@
+module tests.test_validate
+  targets server
+  trust none
+
+use git.error.is_invalid_path;
+use git.error.is_invalid_ref_name;
+use git.error.is_limit_exceeded;
+use git.validate.validate_path;
+use git.validate.validate_ref_name;
+
+pub fn run_validate_tests() -> Bool
+  intent "git.validate の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. パス検査: 正常系
+  if !validate_path(&"src/git/core.sigil").unwrap_or(false) {
+    return false;
+  }
+  if !validate_path(&"README.md").unwrap_or(false) {
+    return false;
+  }
+  if !validate_path(&"a/b/c/d/e/f.txt").unwrap_or(false) {
+    return false;
+  }
+
+  // パス検査: 異常系 (InvalidPath)
+  // 空
+  match validate_path(&"") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 絶対パス
+  match validate_path(&"/etc/passwd") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // バックスラッシュ
+  let mut backslash_path = "a".as_bytes();
+  backslash_path.push(92);  // '\\'
+  backslash_path.push(98);  // 'b'
+  let bs_str = backslash_path.to_string_utf8().unwrap_or("");
+  match validate_path(&bs_str) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 連続スラッシュ
+  match validate_path(&"a//b") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 末尾スラッシュ
+  match validate_path(&"a/b/") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // . または .. 構成要素
+  match validate_path(&"a/./b") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"a/../b") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // .git およびその変種
+  match validate_path(&".git") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/.Git/config") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/.GIT/config") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/git~1/foo") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/.git./foo") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // NTFS Alternate Data Streams (.git:foo, .git::$INDEX_ALLOCATION)
+  match validate_path(&"src/.git:foo") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/.git::$INDEX_ALLOCATION") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/git~1:stream") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // HFS+ 無視文字 (U+200C) を含む .git 変種 (.g<U+200C>it)
+  let mut hfs_git = "src/.g".as_bytes();
+  hfs_git.push(226);  // 0xE2
+  hfs_git.push(128);  // 0x80
+  hfs_git.push(140);  // 0x8C (U+200C)
+  hfs_git.extend(&"it/config".as_bytes());
+  let hfs_str = hfs_git.to_string_utf8().unwrap_or("");
+  match validate_path(&hfs_str) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // .git.bak や .gitignore は正常なファイル名として受理されること
+  if !validate_path(&"src/.git.bak").unwrap_or(false) {
+    return false;
+  }
+  if !validate_path(&".gitignore").unwrap_or(false) {
+    return false;
+  }
+
+  // パス検査: 異常系 (階層深度 128 超過)
+  let mut deep_bytes = Bytes.new();
+  let mut d = 0;
+  while d < 130 {
+    deep_bytes.push(97);  // 'a'
+    if d < 129 {
+      deep_bytes.push(47);  // '/'
+    }
+    d = d + 1;
+  }
+  let deep_str = deep_bytes.to_string_utf8().unwrap_or("");
+  match validate_path(&deep_str) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_limit_exceeded(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 2. 参照名検査: 正常系
+  if !validate_ref_name(&"refs/heads/main").unwrap_or(false) {
+    return false;
+  }
+  if !validate_ref_name(&"refs/tags/v1.0.0").unwrap_or(false) {
+    return false;
+  }
+  if !validate_ref_name(&"HEAD").unwrap_or(false) {
+    return false;
+  }
+
+  // 参照名検査: 異常系 (InvalidRefName)
+  // 空
+  match validate_ref_name(&"") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 先頭スラッシュ / 末尾スラッシュ
+  match validate_ref_name(&"/refs/heads/main") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_ref_name(&"refs/heads/main/") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 連続スラッシュ
+  match validate_ref_name(&"refs//heads/main") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // ..
+  match validate_ref_name(&"refs/heads/..") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // @{
+  match validate_ref_name(&"refs/heads/foo@{bar") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // . で始まる構成要素
+  match validate_ref_name(&"refs/heads/.feature") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // .lock で終わる構成要素
+  match validate_ref_name(&"refs/heads/main.lock") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // . で終わる構成要素禁止
+  match validate_ref_name(&"refs/heads/foo.") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 名前全体が @ 単体は禁止
+  match validate_ref_name(&"@") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 構成要素が @ のみの名前 (refs/heads/@) は Git check-ref-format で有効
+  if !validate_ref_name(&"refs/heads/@").unwrap_or(false) {
+    return false;
+  }
+
+  // 不正文字 (空白, ~, ^, :, ?, *, [, \)
+  match validate_ref_name(&"refs/heads/my branch") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_ref_name(&"refs/heads/foo~1") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_ref_name(&"refs/heads/foo^bar") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_ref_name(&"refs/heads/foo:bar") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_ref_name(&"refs/heads/foo?bar") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_ref_name(&"refs/heads/foo*bar") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_ref_name(&"refs/heads/foo[bar") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

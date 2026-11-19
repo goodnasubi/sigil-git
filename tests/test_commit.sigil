@@ -1,0 +1,276 @@
+module tests.test_commit
+  targets server
+  trust none
+
+use git.commit.commit_author;
+use git.commit.commit_committer;
+use git.commit.commit_headers;
+use git.commit.commit_message;
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.commit.encode_commit;
+use git.commit.header_key;
+use git.commit.header_value;
+use git.commit.new_commit_header;
+use git.commit.new_commit_header_str;
+use git.commit.new_commit_object;
+use git.commit.new_commit_object_str;
+use git.error.is_corrupt;
+use git.error.is_limit_exceeded;
+
+pub fn run_commit_tests() -> Bool
+  intent "git.commit の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let tree_hex = "24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731";
+  let parent1_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+  let parent2_hex = "2222222222222222222222222222222222222222222222222222222222222222";
+
+  // 1. 正常系: マージコミット（2つの親）と追加ヘッダ（gpgsig 複数行）
+  let mut parents = List.new();
+  parents.push(parent1_hex.clone());
+  parents.push(parent2_hex.clone());
+
+  let mut extra_headers = List.new();
+  let gpg_sig = "-----BEGIN PGP SIGNATURE-----\n iQIzBAABCAAdFiEE...\n -----END PGP SIGNATURE-----";
+  extra_headers.push(new_commit_header_str("gpgsig", gpg_sig.clone()));
+
+  let orig_commit = new_commit_object_str(tree_hex.clone(), parents, "Author Name <author@example.com> 1700000000 +0000", "Committer Name <committer@example.com> 1700000000 +0000", extra_headers, "Merge branch 'feature'\n\nDetailed merge description.\n");
+
+  let encoded = match encode_commit(&orig_commit) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if encoded.len() == 0 {
+    return false;
+  }
+
+  match decode_commit(&encoded) {
+    Ok(decoded) => {
+      if commit_tree_id(&decoded) != tree_hex {
+        return false;
+      }
+      let dec_parents = commit_parents(&decoded);
+      if dec_parents.len() != 2 {
+        return false;
+      }
+      if !ct_eq(&commit_author(&decoded), &"Author Name <author@example.com> 1700000000 +0000".as_bytes()) {
+        return false;
+      }
+      if !ct_eq(&commit_committer(&decoded), &"Committer Name <committer@example.com> 1700000000 +0000".as_bytes()) {
+        return false;
+      }
+      if !ct_eq(&commit_message(&decoded), &"Merge branch 'feature'\n\nDetailed merge description.\n".as_bytes()) {
+        return false;
+      }
+
+      let dec_headers = commit_headers(&decoded);
+      if dec_headers.len() != 1 {
+        return false;
+      }
+      match dec_headers.get(0) {
+        Some(hdr) => {
+          if header_key(&hdr) != "gpgsig" || !ct_eq(&header_value(&hdr), &gpg_sig.as_bytes()) {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 正常系: ルートコミット（親なし）
+  let empty_parents = List.new();
+  let empty_headers = List.new();
+  let root_commit = new_commit_object_str(tree_hex.clone(), empty_parents, "Author <a@b.c> 1000 +0000", "Committer <a@b.c> 1000 +0000", empty_headers, "Initial commit\n");
+  let root_encoded = match encode_commit(&root_commit) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if root_encoded.len() == 0 {
+    return false;
+  }
+  match decode_commit(&root_encoded) {
+    Ok(root_decoded) => {
+      if commit_parents(&root_decoded).len() != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 正常系境界値: 親 16 個
+  let mut p16 = List.new();
+  let mut i = 0;
+  while i < 16 {
+    p16.push(parent1_hex.clone());
+    i = i + 1;
+  }
+  let c16 = new_commit_object_str(tree_hex.clone(), p16, "A <a@b.c> 0 +0000", "C <a@b.c> 0 +0000", List.new(), "16 parents\n");
+  let enc16 = match encode_commit(&c16) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if enc16.len() == 0 {
+    return false;
+  }
+  match decode_commit(&enc16) {
+    Ok(dec16) => {
+      if commit_parents(&dec16).len() != 16 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. 異常系: 親 17 個で上限超過 (max_commit_parents = 16)
+  let mut p17 = List.new();
+  i = 0;
+  while i < 17 {
+    p17.push(parent1_hex.clone());
+    i = i + 1;
+  }
+  let c17 = new_commit_object_str(tree_hex.clone(), p17, "A <a@b.c> 0 +0000", "C <a@b.c> 0 +0000", List.new(), "17 parents\n");
+  match encode_commit(&c17) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_limit_exceeded(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 5. 異常系: tree なし
+  let mut bad_content = "author Author <a@b.c> 0 +0000\ncommitter Committer <a@b.c> 0 +0000\n\nno tree\n".as_bytes();
+  match decode_commit(&bad_content) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 6. 正常系: 非 UTF-8 メッセージ（Shift_JIS 等）が壊れずバイト列のまま往復すること
+  let mut sjis_msg = Bytes.new();
+  sjis_msg.push(130);  // 0x82
+  sjis_msg.push(160);  // 0xA0 ('あ' in Shift_JIS)
+  sjis_msg.push(10);  // '\n'
+
+  let non_utf8_commit = new_commit_object(tree_hex.clone(), List.new(), "Author <a@b.c> 0 +0000".as_bytes(), "Committer <a@b.c> 0 +0000".as_bytes(), List.new(), sjis_msg.clone());
+  let non_utf8_enc = match encode_commit(&non_utf8_commit) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if non_utf8_enc.len() == 0 {
+    return false;
+  }
+  match decode_commit(&non_utf8_enc) {
+    Ok(dec) => {
+      if !ct_eq(&commit_message(&dec), &sjis_msg) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 7. 異常系: 大文字 16 進の tree id は拒否
+  let upper_tree_commit = "tree 24E507F796CA749EC90765F4A9675AA932AD7AA7EF83662E65C24F10F07FF731\nauthor A <a@b.c> 0 +0000\ncommitter C <a@b.c> 0 +0000\n\ntest\n".as_bytes();
+  match decode_commit(&upper_tree_commit) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 8. 異常系: 重複 tree
+  let dup_tree = "tree 24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731\ntree 24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731\nauthor A <a@b.c> 0 +0000\ncommitter C <a@b.c> 0 +0000\n\ntest\n".as_bytes();
+  match decode_commit(&dup_tree) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 9. 異常系: 重複 author
+  let dup_author = "tree 24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731\nauthor A <a@b.c> 0 +0000\nauthor B <b@b.c> 0 +0000\ncommitter C <a@b.c> 0 +0000\n\ntest\n".as_bytes();
+  match decode_commit(&dup_author) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 10. 異常系: 順序不整合（author が parent より前）
+  let out_of_order = "tree 24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731\nauthor A <a@b.c> 0 +0000\nparent 1111111111111111111111111111111111111111111111111111111111111111\ncommitter C <a@b.c> 0 +0000\n\ntest\n".as_bytes();
+  match decode_commit(&out_of_order) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 11. 異常系: 改行注入の拒否 (author に改行)
+  let inject_author = new_commit_object_str(tree_hex.clone(), List.new(), "Author\ncommitter Injected <bad@evil.com> 0 +0000", "C <a@b.c> 0 +0000", List.new(), "test\n");
+  match encode_commit(&inject_author) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 12. 異常系: ヘッダ値内の改行注入（継続行でない単独改行）
+  let mut bad_hdr_list = List.new();
+  bad_hdr_list.push(new_commit_header("testkey", "val1\nval2".as_bytes()));
+  let inject_hdr = new_commit_object_str(tree_hex.clone(), List.new(), "A <a@b.c> 0 +0000", "C <a@b.c> 0 +0000", bad_hdr_list, "test\n");
+  match encode_commit(&inject_hdr) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

@@ -1,0 +1,63 @@
+module test_runner
+  targets server
+  trust none
+
+use tests.test_commit.run_commit_tests;
+use tests.test_fixture.run_fixture_tests;
+use tests.test_limits.run_limits_tests;
+use tests.test_object.run_object_tests;
+use tests.test_tag.run_tag_tests;
+use tests.test_tree.run_tree_tests;
+use tests.test_validate.run_validate_tests;
+
+pub fn main() -> Int
+  intent "すべてのテストを実行し、全合格なら 0、不合格なら 1 以上のコードを返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&"Running tests: limits");
+  if !run_limits_tests() {
+    console.log(&"FAIL: limits tests");
+    return 1;
+  }
+
+  console.log(&"Running tests: object & hash");
+  if !run_object_tests() {
+    console.log(&"FAIL: object tests");
+    return 2;
+  }
+
+  console.log(&"Running tests: tree");
+  if !run_tree_tests() {
+    console.log(&"FAIL: tree tests");
+    return 3;
+  }
+
+  console.log(&"Running tests: commit");
+  if !run_commit_tests() {
+    console.log(&"FAIL: commit tests");
+    return 4;
+  }
+
+  console.log(&"Running tests: tag");
+  if !run_tag_tests() {
+    console.log(&"FAIL: tag tests");
+    return 5;
+  }
+
+  console.log(&"Running tests: validate (path & ref name)");
+  if !run_validate_tests() {
+    console.log(&"FAIL: validate tests");
+    return 6;
+  }
+
+  console.log(&"Running tests: Git SHA-256 fixture verification");
+  if !run_fixture_tests() {
+    console.log(&"FAIL: fixture tests");
+    return 7;
+  }
+
+  console.log(&"ALL TESTS PASSED SUCCESSFULLY");
+  return 0;
+}

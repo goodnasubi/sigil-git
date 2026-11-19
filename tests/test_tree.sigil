@@ -1,0 +1,262 @@
+module tests.test_tree
+  targets server
+  trust none
+
+use git.error.is_corrupt;
+use git.hash.hex_to_bytes;
+use git.tree.compare_tree_entries;
+use git.tree.decode_tree;
+use git.tree.encode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.tree.entry_name;
+use git.tree.new_tree_entry;
+
+pub fn run_tree_tests() -> Bool
+  intent "git.tree の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let dummy_id1 = hex_to_bytes(&"1111111111111111111111111111111111111111111111111111111111111111").unwrap_or(Bytes.new());
+  let dummy_id2 = hex_to_bytes(&"2222222222222222222222222222222222222222222222222222222222222222").unwrap_or(Bytes.new());
+  let dummy_id3 = hex_to_bytes(&"3333333333333333333333333333333333333333333333333333333333333333").unwrap_or(Bytes.new());
+
+  // 1. 並び順比較規則（ディレクトリ末尾スラッシュ比較）
+  // 'a' (dir) vs 'a.txt' (file) -> 'a/' (0x2F=47) vs 'a.' (0x2E=46) -> a.txt が先 (-1)
+  let a_dir = "a".as_bytes();
+  let a_file = "a.txt".as_bytes();
+  let cmp_file_dir = compare_tree_entries(&a_file, 100644, &a_dir, 40000);
+  if cmp_file_dir != 0 - 1 {
+    return false;
+  }
+  let cmp_dir_file = compare_tree_entries(&a_dir, 40000, &a_file, 100644);
+  if cmp_dir_file != 1 {
+    return false;
+  }
+  let cmp_same = compare_tree_entries(&a_dir, 40000, &a_dir, 40000);
+  if cmp_same != 0 {
+    return false;
+  }
+
+  // 2. 正常系: tree のエンコードとデコードの往復
+  let mut entries = List.new();
+  entries.push(new_tree_entry(100644, "a.txt".as_bytes(), dummy_id1.clone()));
+  entries.push(new_tree_entry(40000, "a".as_bytes(), dummy_id2.clone()));
+  entries.push(new_tree_entry(100755, "run.sh".as_bytes(), dummy_id3.clone()));
+
+  let mut encoded = Bytes.new();
+  match encode_tree(&entries) {
+    Ok(b) => {
+      encoded = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut decoded = List.new();
+  match decode_tree(&encoded) {
+    Ok(list) => {
+      decoded = list;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if decoded.len() != 3 {
+    return false;
+  }
+
+  match decoded.get(0) {
+    Some(e) => {
+      let eid = entry_id(&e);
+      if entry_mode(&e) != 100644 || !ct_eq(&entry_name(&e), &"a.txt".as_bytes()) || !ct_eq(&eid, &dummy_id1) {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  match decoded.get(1) {
+    Some(e) => {
+      let eid = entry_id(&e);
+      if entry_mode(&e) != 40000 || !ct_eq(&entry_name(&e), &"a".as_bytes()) || !ct_eq(&eid, &dummy_id2) {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  match decoded.get(2) {
+    Some(e) => {
+      let eid = entry_id(&e);
+      if entry_mode(&e) != 100755 || !ct_eq(&entry_name(&e), &"run.sh".as_bytes()) || !ct_eq(&eid, &dummy_id3) {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // 3. 異常系: 重複エントリ
+  let mut dup_entries = List.new();
+  dup_entries.push(new_tree_entry(100644, "foo.txt".as_bytes(), dummy_id1.clone()));
+  dup_entries.push(new_tree_entry(100644, "foo.txt".as_bytes(), dummy_id2.clone()));
+  match encode_tree(&dup_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 4. 異常系: 順序不整合（ソートされていない）
+  let mut unsorted_entries = List.new();
+  unsorted_entries.push(new_tree_entry(100755, "z.sh".as_bytes(), dummy_id1.clone()));
+  unsorted_entries.push(new_tree_entry(100644, "a.txt".as_bytes(), dummy_id2.clone()));
+  match encode_tree(&unsorted_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 5. 異常系: 不正な名前 (スラッシュを含む名前)
+  let mut slash_entries = List.new();
+  slash_entries.push(new_tree_entry(100644, "dir/file.txt".as_bytes(), dummy_id1.clone()));
+  match encode_tree(&slash_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 6. 異常系: 不正な名前 (空の名前)
+  let mut empty_name_entries = List.new();
+  empty_name_entries.push(new_tree_entry(100644, Bytes.new(), dummy_id1.clone()));
+  match encode_tree(&empty_name_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 7. 異常系: 不正なモード (100666)
+  let mut bad_mode_entries = List.new();
+  bad_mode_entries.push(new_tree_entry(100666, "file.txt".as_bytes(), dummy_id1.clone()));
+  match encode_tree(&bad_mode_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 8. 異常系: モードの整数オーバーフロー防止（19桁以上の8進数）
+  let mut overflow_tree = "77777777777777777777 file.txt".as_bytes();
+  overflow_tree.push(0);
+  overflow_tree.extend(&dummy_id1);
+  match decode_tree(&overflow_tree) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 9. 異常系: 先頭 0 の非正規形モード (0100644, 040000)
+  let mut leading_zero_mode1 = "0100644 file.txt".as_bytes();
+  leading_zero_mode1.push(0);
+  leading_zero_mode1.extend(&dummy_id1);
+  match decode_tree(&leading_zero_mode1) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  let mut leading_zero_mode2 = "040000 dir".as_bytes();
+  leading_zero_mode2.push(0);
+  leading_zero_mode2.extend(&dummy_id1);
+  match decode_tree(&leading_zero_mode2) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 10. 正常系: 非 UTF-8 バイト列（Latin-1 ファイル名など）を壊さず保持して往復できること
+  let mut latin1_name = Bytes.new();
+  latin1_name.push(233);  // 'é' in Latin-1 (0xE9, invalid standalone UTF-8)
+  latin1_name.push(46);  // '.'
+  latin1_name.push(116);  // 't'
+  latin1_name.push(120);  // 'x'
+  latin1_name.push(116);  // 't'
+
+  let mut raw_entries = List.new();
+  raw_entries.push(new_tree_entry(100644, latin1_name.clone(), dummy_id1.clone()));
+  let raw_encoded = match encode_tree(&raw_entries) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if raw_encoded.len() == 0 {
+    return false;
+  }
+  match decode_tree(&raw_encoded) {
+    Ok(dec_list) => {
+      if dec_list.len() != 1 {
+        return false;
+      }
+      match dec_list.get(0) {
+        Some(e) => {
+          if !ct_eq(&entry_name(&e), &latin1_name) {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}

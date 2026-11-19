@@ -1,0 +1,204 @@
+module git.object
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.hash.compute_raw_object_id;
+use git.hash.format_object_header;
+use git.limits.max_object_size;
+
+pub enum ObjectType {
+  Blob,
+  Tree,
+  Commit,
+  Tag,
+}
+
+pub fn object_type_name(t: &ObjectType) -> String
+  intent "オブジェクト型の文字列表現を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match t {
+    ObjectType.Blob => "blob",
+    ObjectType.Tree => "tree",
+    ObjectType.Commit => "commit",
+    ObjectType.Tag => "tag",
+  };
+}
+
+pub fn parse_object_type(name: &String) -> Result<ObjectType, GitError>
+  intent "文字列からオブジェクト型を解析する"
+  requires none
+  ensures none
+  effects none
+{
+  if name == "blob" {
+    return Ok(ObjectType.Blob);
+  }
+  if name == "tree" {
+    return Ok(ObjectType.Tree);
+  }
+  if name == "commit" {
+    return Ok(ObjectType.Commit);
+  }
+  if name == "tag" {
+    return Ok(ObjectType.Tag);
+  }
+  return Err(GitError.Corrupt("unknown object type"));
+}
+
+pub struct ObjectHeader {
+  obj_type: ObjectType,
+  size: Int,
+  header_len: Int,
+}
+
+pub fn new_object_header(obj_type: ObjectType, size: Int, header_len: Int) -> ObjectHeader
+  intent "ObjectHeader を構築する"
+  requires size >= 0 && header_len > 0
+  ensures none
+  effects none
+{
+  return ObjectHeader { obj_type: obj_type, size: size, header_len: header_len };
+}
+
+pub fn header_obj_type(h: &ObjectHeader) -> ObjectType
+  intent "ObjectHeader の型を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match h.obj_type {
+    ObjectType.Blob => ObjectType.Blob,
+    ObjectType.Tree => ObjectType.Tree,
+    ObjectType.Commit => ObjectType.Commit,
+    ObjectType.Tag => ObjectType.Tag,
+  };
+}
+
+pub fn header_size(h: &ObjectHeader) -> Int
+  intent "ObjectHeader のサイズを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return h.size;
+}
+
+pub fn header_len(h: &ObjectHeader) -> Int
+  intent "ObjectHeader のヘッダ長を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return h.header_len;
+}
+
+pub fn parse_object_header(data: &Bytes) -> Result<ObjectHeader, GitError>
+  intent "オブジェクトバイト列からヘッダ (<型> <長さ>\\0) を解析・検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = data.len();
+  if len < 3 {
+    return Err(GitError.Corrupt("object data too short for header"));
+  }
+
+  // 1. スペースを探す
+  let mut sp_pos = 0 - 1;
+  let mut i = 0;
+  while i < len && sp_pos < 0 {
+    if data.get(i).unwrap_or(0) == 32 {
+      sp_pos = i;
+    }
+    i = i + 1;
+  }
+  if sp_pos <= 0 {
+    return Err(GitError.Corrupt("missing space in object header"));
+  }
+
+  // 2. 型名を解析
+  let type_bytes = data.slice(0, sp_pos).unwrap_or(Bytes.new());
+  let type_str = type_bytes.to_string_utf8().unwrap_or("");
+  if type_str == "" {
+    return Err(GitError.Corrupt("invalid utf-8 or empty object type"));
+  }
+  let obj_type = parse_object_type(&type_str)?;
+
+  // 3. NUL バイトを探す
+  let mut null_pos = 0 - 1;
+  i = sp_pos + 1;
+  while i < len && null_pos < 0 {
+    if data.get(i).unwrap_or(0) == 0 {
+      null_pos = i;
+    }
+    i = i + 1;
+  }
+  if null_pos <= sp_pos + 1 {
+    return Err(GitError.Corrupt("missing null terminator or empty size in object header"));
+  }
+
+  // 先頭 0 のサイズは非正規形のため拒否 (0 単体は許容)
+  if null_pos - (sp_pos + 1) > 1 && data.get(sp_pos + 1).unwrap_or(0) == 48 {
+    return Err(GitError.Corrupt("object size cannot have leading zero"));
+  }
+
+  // 4. サイズ数値を解析
+  let mut size = 0;
+  let mut p = sp_pos + 1;
+  while p < null_pos {
+    let b = data.get(p).unwrap_or(0);
+    if b < 48 || b > 57 {
+      return Err(GitError.Corrupt("non-digit character in object size"));
+    }
+    let digit = b - 48;
+    // 64 MiB 超過またはオーバーフロー検査
+    if size > 67108864 / 10 {
+      return Err(GitError.LimitExceeded("declared object size exceeds 64 MiB limit"));
+    }
+    size = size * 10 + digit;
+    if size > max_object_size() {
+      return Err(GitError.LimitExceeded("declared object size exceeds 64 MiB limit"));
+    }
+    p = p + 1;
+  }
+
+  let total_header_len = null_pos + 1;
+  let actual_content_len = len - total_header_len;
+
+  // 5. 宣言されたサイズと実際のデータ長の一致を検証
+  if actual_content_len != size {
+    return Err(GitError.Corrupt("declared size does not match actual content length"));
+  }
+
+  return Ok(new_object_header(obj_type, size, total_header_len));
+}
+
+pub fn verify_object_bytes(data: &Bytes, expected_id: &Bytes) -> Result<ObjectHeader, GitError>
+  intent "オブジェクトのヘッダを検証し、全体の SHA-256 識別子が expected_id と一致することを検証する"
+  requires expected_id.len() == 32
+  ensures none
+  effects none
+{
+  let hdr = parse_object_header(&data)?;
+  let actual_id = compute_raw_object_id(&data);
+  if !ct_eq(&actual_id, &expected_id) {
+    return Err(GitError.Corrupt("object id verification failed: computed id does not match expected id"));
+  }
+  return Ok(hdr);
+}
+
+pub fn encode_raw_object(obj_type: &ObjectType, content: &Bytes) -> Bytes
+  intent "型と内容からヘッダ付き生オブジェクトバイト列を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let type_name = object_type_name(&obj_type);
+  let mut out = format_object_header(&type_name, content.len());
+  out.extend(&content);
+  return out;
+}

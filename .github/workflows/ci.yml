@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
+  SIGIL_REF: a2ccf0e086b4d7043ba89a740c840c550a4616fb
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Sigil コンパイラ（固定版）の取得
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil
+          ref: ${{ env.SIGIL_REF }}
+          path: sigil-compiler
+
+      - name: Rust stable
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          echo "rustc=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      - name: ネイティブ出力の前提
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      - name: キャッシュの復元
+        id: cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-
+
+      - name: Sigil コンパイラのビルド
+        run: cargo build --locked --release --bin sigil
+        working-directory: sigil-compiler
+
+      - name: test（test.sh、全量）
+        run: ./test.sh
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+          SIGIL_REF: ${{ env.SIGIL_REF }}
+
+      - name: キャッシュの保存
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
