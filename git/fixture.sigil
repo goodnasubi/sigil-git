@@ -63,7 +63,7 @@ pub fn fixture_tree_entries() -> List<TreeEntry>
   let hex_id = fixture_blob_id_hex();
   let id = hex_to_bytes(&hex_id).unwrap_or(Bytes.new());
   let mut list = List.new();
-  list.push(new_tree_entry(100644, "test.txt", id));
+  list.push(new_tree_entry(100644, "test.txt".as_bytes(), id));
   return list;
 }
 

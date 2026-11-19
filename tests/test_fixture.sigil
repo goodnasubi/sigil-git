@@ -99,7 +99,7 @@ pub fn run_fixture_tests() -> Bool
           match entries.get(0) {
             Some(e) => {
               let eid = entry_id(&e);
-              if entry_mode(&e) != 100644 || entry_name(&e) != "test.txt" || !ct_eq(&eid, &expected_blob_id) {
+              if entry_mode(&e) != 100644 || !ct_eq(&entry_name(&e), &"test.txt".as_bytes()) || !ct_eq(&eid, &expected_blob_id) {
                 return false;
               }
             }
@@ -157,13 +157,13 @@ pub fn run_fixture_tests() -> Bool
           if commit_parents(&commit).len() != 0 {
             return false;
           }
-          if commit_author(&commit) != "Author <author@example.com> 1700000000 +0000" {
+          if !ct_eq(&commit_author(&commit), &"Author <author@example.com> 1700000000 +0000".as_bytes()) {
             return false;
           }
-          if commit_committer(&commit) != "Committer <committer@example.com> 1700000000 +0000" {
+          if !ct_eq(&commit_committer(&commit), &"Committer <committer@example.com> 1700000000 +0000".as_bytes()) {
             return false;
           }
-          if commit_message(&commit) != "test commit\n" {
+          if !ct_eq(&commit_message(&commit), &"test commit\n".as_bytes()) {
             return false;
           }
 
@@ -220,10 +220,10 @@ pub fn run_fixture_tests() -> Bool
           if tag_name(&tag) != "v1.0" {
             return false;
           }
-          if tag_tagger(&tag) != "Tagger <tagger@example.com> 1700000000 +0000" {
+          if !ct_eq(&tag_tagger(&tag), &"Tagger <tagger@example.com> 1700000000 +0000".as_bytes()) {
             return false;
           }
-          if tag_message(&tag) != "test tag\n" {
+          if !ct_eq(&tag_message(&tag), &"test tag\n".as_bytes()) {
             return false;
           }
 

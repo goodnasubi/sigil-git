@@ -8,17 +8,26 @@ use git.limits.max_tree_size;
 
 pub struct TreeEntry {
   mode: Int,
-  name: String,
+  name: Bytes,
   id: Bytes,
 }
 
-pub fn new_tree_entry(mode: Int, name: String, id: Bytes) -> TreeEntry
+pub fn new_tree_entry(mode: Int, name: Bytes, id: Bytes) -> TreeEntry
   intent "TreeEntry を構築する"
   requires id.len() == 32
   ensures none
   effects none
 {
   return TreeEntry { mode: mode, name: name, id: id };
+}
+
+pub fn new_tree_entry_str(mode: Int, name: String, id: Bytes) -> TreeEntry
+  intent "文字列の名前から TreeEntry を構築する"
+  requires id.len() == 32
+  ensures none
+  effects none
+{
+  return TreeEntry { mode: mode, name: name.as_bytes(), id: id };
 }
 
 pub fn entry_mode(e: &TreeEntry) -> Int
@@ -30,13 +39,22 @@ pub fn entry_mode(e: &TreeEntry) -> Int
   return e.mode;
 }
 
-pub fn entry_name(e: &TreeEntry) -> String
-  intent "TreeEntry の名前を返す"
+pub fn entry_name(e: &TreeEntry) -> Bytes
+  intent "TreeEntry の名前（バイト列）を返す"
   requires none
   ensures none
   effects none
 {
   return e.name.clone();
+}
+
+pub fn entry_name_str(e: &TreeEntry) -> String
+  intent "TreeEntry の名前を UTF-8 文字列として返す (非 UTF-8 時は空文字)"
+  requires none
+  ensures none
+  effects none
+{
+  return e.name.to_string_utf8().unwrap_or("");
 }
 
 pub fn entry_id(e: &TreeEntry) -> Bytes
@@ -66,66 +84,19 @@ pub fn is_dir_mode(mode: Int) -> Bool
   return mode == 40000;
 }
 
-fn to_lower_byte(c: Int) -> Int
-  intent "ASCII 文字を小文字にする"
-  requires none
-  ensures none
-  effects none
-{
-  if c >= 65 && c <= 90 {
-    return c + 32;
-  }
-  return c;
-}
-
-pub fn is_git_dir_name(name_bytes: &Bytes) -> Bool
-  intent "名前が大文字小文字を問わず .git またはその変種かどうか検査する"
+pub fn validate_tree_name(name_bytes: &Bytes) -> Result<Bool, GitError>
+  intent "ADR 0047 決定 1 に従い tree エントリの名前（空でないこと、/ や NUL を含まないこと）を検査する"
   requires none
   ensures none
   effects none
 {
   let len = name_bytes.len();
-  if len < 4 {
-    return false;
-  }
-  // .git の4文字検査
-  let c0 = name_bytes.get(0).unwrap_or(0);
-  let c1 = to_lower_byte(name_bytes.get(1).unwrap_or(0));
-  let c2 = to_lower_byte(name_bytes.get(2).unwrap_or(0));
-  let c3 = to_lower_byte(name_bytes.get(3).unwrap_or(0));
-  if c0 == 46 && c1 == 103 && c2 == 105 && c3 == 116 {
-    if len == 4 {
-      return true;
-    }
-    // .git. や .git (末尾スペース等) の変種
-    let c4 = name_bytes.get(4).unwrap_or(0);
-    if c4 == 46 || c4 == 32 {
-      return true;
-    }
-  }
-  return false;
-}
-
-pub fn validate_entry_name(name: &String) -> Result<Bool, GitError>
-  intent "tree エントリの名前の妥当性を検査する"
-  requires none
-  ensures none
-  effects none
-{
-  let nb = name.as_bytes();
-  let len = nb.len();
   if len == 0 {
     return Err(GitError.Corrupt("tree entry name cannot be empty"));
   }
-  if name == "." || name == ".." {
-    return Err(GitError.Corrupt("tree entry name cannot be . or .."));
-  }
-  if is_git_dir_name(&nb) {
-    return Err(GitError.Corrupt("tree entry name cannot be .git or variant"));
-  }
   let mut i = 0;
   while i < len {
-    let b = nb.get(i).unwrap_or(0);
+    let b = name_bytes.get(i).unwrap_or(0);
     if b == 47 {
       return Err(GitError.Corrupt("tree entry name cannot contain slash"));
     }
@@ -137,17 +108,17 @@ pub fn validate_entry_name(name: &String) -> Result<Bool, GitError>
   return Ok(true);
 }
 
-pub fn compare_tree_entries(name_a: &String, mode_a: Int, name_b: &String, mode_b: Int) -> Int
+pub fn compare_tree_entries(name_a: &Bytes, mode_a: Int, name_b: &Bytes, mode_b: Int) -> Int
   intent "tree エントリの並び順を比較する（ディレクトリは末尾に / があるものとして比較）"
   requires none
   ensures none
   effects none
 {
-  let mut ba = name_a.as_bytes();
+  let mut ba = name_a.clone();
   if mode_a == 40000 {
     ba.push(47);  // '/'
   }
-  let mut bb = name_b.as_bytes();
+  let mut bb = name_b.clone();
   if mode_b == 40000 {
     bb.push(47);  // '/'
   }
@@ -195,7 +166,7 @@ pub fn decode_tree(content: &Bytes) -> Result<List<TreeEntry>, GitError>
   let mut entries = List.new();
   let mut pos = 0;
   let mut has_prev = false;
-  let mut prev_name = "";
+  let mut prev_name = Bytes.new();
   let mut prev_mode = 0;
 
   while pos < total_len {
@@ -212,6 +183,17 @@ pub fn decode_tree(content: &Bytes) -> Result<List<TreeEntry>, GitError>
       return Err(GitError.Corrupt("invalid tree entry: missing space after mode"));
     }
 
+    let mode_len = sp_pos - pos;
+    // 桁数制限: 正規形は 5 桁 (40000) または 6 桁 (100644, 100755, 120000, 160000) のみ
+    if mode_len < 5 || mode_len > 6 {
+      return Err(GitError.Corrupt("invalid tree entry mode: length must be 5 or 6 digits"));
+    }
+
+    // 先頭 0 のモードは非正規形のため拒否 (040000, 0100644 等)
+    if content.get(pos).unwrap_or(0) == 48 {
+      return Err(GitError.Corrupt("invalid tree entry mode: leading zero is not allowed"));
+    }
+
     let mut mode = 0;
     let mut p = pos;
     while p < sp_pos {
@@ -225,6 +207,13 @@ pub fn decode_tree(content: &Bytes) -> Result<List<TreeEntry>, GitError>
 
     if !is_valid_mode(mode) {
       return Err(GitError.Corrupt("unsupported or invalid tree entry mode"));
+    }
+    // 正規形桁数との整合検査
+    if mode == 40000 && mode_len != 5 {
+      return Err(GitError.Corrupt("invalid tree entry mode: directory mode must be 5 digits (40000)"));
+    }
+    if mode != 40000 && mode_len != 6 {
+      return Err(GitError.Corrupt("invalid tree entry mode: non-directory mode must be 6 digits"));
     }
 
     // 2. NUL バイトを探して名前を取得
@@ -241,11 +230,7 @@ pub fn decode_tree(content: &Bytes) -> Result<List<TreeEntry>, GitError>
     }
 
     let name_bytes = content.slice(sp_pos + 1, null_pos).unwrap_or(Bytes.new());
-    let name = name_bytes.to_string_utf8().unwrap_or("");
-    if name == "" {
-      return Err(GitError.Corrupt("tree entry name is not valid utf-8 or empty"));
-    }
-    validate_entry_name(&name)?;
+    validate_tree_name(&name_bytes)?;
 
     // 3. 識別子 (SHA-256: 32 バイト) を取得
     let id_start = null_pos + 1;
@@ -256,7 +241,7 @@ pub fn decode_tree(content: &Bytes) -> Result<List<TreeEntry>, GitError>
 
     // 4. ソート順序と重複の検証
     if has_prev {
-      let cmp = compare_tree_entries(&prev_name, prev_mode, &name, mode);
+      let cmp = compare_tree_entries(&prev_name, prev_mode, &name_bytes, mode);
       if cmp == 0 {
         return Err(GitError.Corrupt("duplicate entry in tree"));
       }
@@ -266,10 +251,10 @@ pub fn decode_tree(content: &Bytes) -> Result<List<TreeEntry>, GitError>
     }
 
     has_prev = true;
-    prev_name = name.clone();
+    prev_name = name_bytes.clone();
     prev_mode = mode;
 
-    entries.push(new_tree_entry(mode, name, id));
+    entries.push(new_tree_entry(mode, name_bytes, id));
     if entries.len() > max_tree_entries() {
       return Err(GitError.LimitExceeded("tree entry count exceeds 100000 limit"));
     }
@@ -314,7 +299,7 @@ pub fn encode_tree(entries: &List<TreeEntry>) -> Result<Bytes, GitError>
 
   let mut buf = Bytes.new();
   let mut has_prev = false;
-  let mut prev_name = "";
+  let mut prev_name = Bytes.new();
   let mut prev_mode = 0;
 
   let mut i = 0;
@@ -328,7 +313,7 @@ pub fn encode_tree(entries: &List<TreeEntry>) -> Result<Bytes, GitError>
         if !is_valid_mode(mode) {
           return Err(GitError.Corrupt("invalid mode in tree entry"));
         }
-        validate_entry_name(&name)?;
+        validate_tree_name(&name)?;
         if id.len() != 32 {
           return Err(GitError.Corrupt("tree entry id must be 32 bytes"));
         }
@@ -350,7 +335,7 @@ pub fn encode_tree(entries: &List<TreeEntry>) -> Result<Bytes, GitError>
         let mode_bytes = mode_to_octal_bytes(mode);
         buf.extend(&mode_bytes);
         buf.push(32);  // ' '
-        buf.extend(&name.as_bytes());
+        buf.extend(&name);
         buf.push(0);  // '\0'
         buf.extend(&id);
 

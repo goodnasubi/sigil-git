@@ -7,6 +7,7 @@ use git.error.is_limit_exceeded;
 use git.hash.bytes_to_hex;
 use git.hash.compute_object_id;
 use git.hash.hex_to_bytes;
+use git.hash.is_valid_hex_id;
 use git.object.ObjectType;
 use git.object.encode_raw_object;
 use git.object.header_len;
@@ -170,9 +171,9 @@ pub fn run_object_tests() -> Bool
     }
   }
 
-  // 不正な hex（非 hex 文字）
-  let bad_hex = "8aec4z";
-  match hex_to_bytes(&bad_hex) {
+  // 不正な hex（大文字 hex は拒否）
+  let upper_hex = "8AEC4E4876F854F688D0EBFC8F37598F38E5FD6903CCCC850CA36591175AEB60";
+  match hex_to_bytes(&upper_hex) {
     Ok(_) => {
       return false;
     }
@@ -181,6 +182,67 @@ pub fn run_object_tests() -> Bool
         return false;
       }
     }
+  }
+
+  // 8. オブジェクトヘッダのサイズ先頭 0 検査
+  let mut leading_zero_size = "blob 05".as_bytes();
+  leading_zero_size.push(0);
+  leading_zero_size.extend(&"hello".as_bytes());
+  match parse_object_header(&leading_zero_size) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  let mut double_zero_size = "blob 00".as_bytes();
+  double_zero_size.push(0);
+  match parse_object_header(&double_zero_size) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  let mut single_zero_size = "blob 0".as_bytes();
+  single_zero_size.push(0);
+  match parse_object_header(&single_zero_size) {
+    Ok(h) => {
+      if header_size(&h) != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 9. is_valid_hex_id の検査
+  if !is_valid_hex_id(&"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60") {
+    return false;
+  }
+  if is_valid_hex_id(&"8AEC4E4876F854F688D0EBFC8F37598F38E5FD6903CCCC850CA36591175AEB60") {
+    return false;
+  }
+  if is_valid_hex_id(&"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb6") {
+    // 63 桁
+    return false;
+  }
+  if is_valid_hex_id(&"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb600") {
+    // 65 桁
+    return false;
+  }
+  if is_valid_hex_id(&"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb6g") {
+    // 'g' は非 hex
+    return false;
   }
 
   return true;

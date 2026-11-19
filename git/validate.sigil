@@ -20,42 +20,125 @@ fn to_lower_byte(c: Int) -> Int
   return c;
 }
 
-pub fn is_git_dir_or_variant(bytes: &Bytes) -> Bool
-  intent "パス構成要素が大文字小文字を問わず .git またはその変種（末尾ドット・空白、NTFS 短い名前 git~1 等）か検査する"
+fn strip_hfs_ignored_chars(bytes: &Bytes) -> Bytes
+  intent "HFS+ で無視される Unicode 制御文字 (U+200C-U+200F, U+202A-U+202E, U+206A-U+206F, U+FEFF) を除去する"
   requires none
   ensures none
   effects none
 {
   let len = bytes.len();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < len {
+    let b0 = bytes.get(i).unwrap_or(0);
+    let mut skip = 0;
+    if b0 == 239 && i + 2 < len {
+      // 0xEF 0xBB 0xBF (U+FEFF)
+      let b1 = bytes.get(i + 1).unwrap_or(0);
+      let b2 = bytes.get(i + 2).unwrap_or(0);
+      if b1 == 187 && b2 == 191 {
+        skip = 3;
+      }
+    } else if b0 == 226 && i + 2 < len {
+      // 0xE2
+      let b1 = bytes.get(i + 1).unwrap_or(0);
+      let b2 = bytes.get(i + 2).unwrap_or(0);
+      if b1 == 128 {
+        // 0xE2 0x80 ...
+        // 0x8C..0x8F (140..143): U+200C - U+200F
+        // 0xAA..0xAE (170..174): U+202A - U+202E
+        let is_range1 = b2 >= 140 && b2 <= 143;
+        let is_range2 = b2 >= 170 && b2 <= 174;
+        if is_range1 || is_range2 {
+          skip = 3;
+        }
+      } else if b1 == 129 {
+        // 0xE2 0x81 ...
+        // 0xAA..0xAF (170..175): U+206A - U+206F
+        if b2 >= 170 && b2 <= 175 {
+          skip = 3;
+        }
+      }
+    }
+
+    if skip > 0 {
+      i = i + skip;
+    } else {
+      out.push(b0);
+      i = i + 1;
+    }
+  }
+  return out;
+}
+
+pub fn is_git_dir_or_variant(bytes: &Bytes) -> Bool
+  intent "パス構成要素が大文字小文字を問わず .git またはその変種（末尾ドット・空白、NTFS 代替ストリーム、NTFS 短い名前、HFS+ 無視文字等）か検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let stripped = strip_hfs_ignored_chars(&bytes);
+  let len = stripped.len();
   if len < 4 {
     return false;
   }
 
-  // 1. .git (4文字)
-  let c0 = bytes.get(0).unwrap_or(0);
-  let c1 = to_lower_byte(bytes.get(1).unwrap_or(0));
-  let c2 = to_lower_byte(bytes.get(2).unwrap_or(0));
-  let c3 = to_lower_byte(bytes.get(3).unwrap_or(0));
+  // 1. .git (4文字以上)
+  let c0 = stripped.get(0).unwrap_or(0);
+  let c1 = to_lower_byte(stripped.get(1).unwrap_or(0));
+  let c2 = to_lower_byte(stripped.get(2).unwrap_or(0));
+  let c3 = to_lower_byte(stripped.get(3).unwrap_or(0));
 
   if c0 == 46 && c1 == 103 && c2 == 105 && c3 == 116 {
     if len == 4 {
       return true;
     }
-    // 末尾のドットや空白 (.git., .git )
-    let c4 = bytes.get(4).unwrap_or(0);
-    if c4 == 46 || c4 == 32 {
+    // NTFS Alternate Data Streams (.git:foo, .git::$INDEX_ALLOCATION) または末尾ドット・空白 (.git., .git )
+    let mut has_colon = false;
+    let mut all_dot_or_space = true;
+    let mut j = 4;
+    while j < len {
+      let b = stripped.get(j).unwrap_or(0);
+      if b == 58 {
+        has_colon = true;
+      }
+      if b != 46 && b != 32 {
+        all_dot_or_space = false;
+      }
+      j = j + 1;
+    }
+    if has_colon || all_dot_or_space {
       return true;
     }
   }
 
   // 2. NTFS 短い名前: git~1, git~2 など (5文字以上)
   if len >= 5 {
-    let g0 = to_lower_byte(bytes.get(0).unwrap_or(0));
-    let g1 = to_lower_byte(bytes.get(1).unwrap_or(0));
-    let g2 = to_lower_byte(bytes.get(2).unwrap_or(0));
-    let g3 = bytes.get(3).unwrap_or(0);
-    if g0 == 103 && g1 == 105 && g2 == 116 && g3 == 126 {
-      return true;
+    let g0 = to_lower_byte(stripped.get(0).unwrap_or(0));
+    let g1 = to_lower_byte(stripped.get(1).unwrap_or(0));
+    let g2 = to_lower_byte(stripped.get(2).unwrap_or(0));
+    let g3 = stripped.get(3).unwrap_or(0);
+    let g4 = stripped.get(4).unwrap_or(0);
+    if g0 == 103 && g1 == 105 && g2 == 116 && g3 == 126 && (g4 >= 49 && g4 <= 57) {
+      if len == 5 {
+        return true;
+      }
+      let mut has_colon = false;
+      let mut all_dot_or_space = true;
+      let mut j = 5;
+      while j < len {
+        let b = stripped.get(j).unwrap_or(0);
+        if b == 58 {
+          has_colon = true;
+        }
+        if b != 46 && b != 32 {
+          all_dot_or_space = false;
+        }
+        j = j + 1;
+      }
+      if has_colon || all_dot_or_space {
+        return true;
+      }
     }
   }
 
@@ -155,6 +238,11 @@ pub fn validate_ref_name(ref_name: &String) -> Result<Bool, GitError>
     return Err(GitError.LimitExceeded("ref name length exceeds 1024 limit"));
   }
 
+  // 名前全体が @ 単体は禁止
+  if ref_name == "@" {
+    return Err(GitError.InvalidRefName("ref name cannot be single @"));
+  }
+
   // 先頭または末尾が / 禁止
   if rb.get(0).unwrap_or(0) == 47 || rb.get(len - 1).unwrap_or(0) == 47 {
     return Err(GitError.InvalidRefName("ref name cannot begin or end with slash"));
@@ -205,6 +293,11 @@ pub fn validate_ref_name(ref_name: &String) -> Result<Bool, GitError>
         return Err(GitError.InvalidRefName("ref name component cannot begin with dot"));
       }
 
+      // . で終わる構成要素禁止
+      if comp_bytes.get(comp_len - 1).unwrap_or(0) == 46 {
+        return Err(GitError.InvalidRefName("ref name component cannot end with dot"));
+      }
+
       // 末尾が .lock で終わる構成要素禁止
       if comp_len >= 5 {
         let l0 = comp_bytes.get(comp_len - 5).unwrap_or(0);
@@ -215,11 +308,6 @@ pub fn validate_ref_name(ref_name: &String) -> Result<Bool, GitError>
         if l0 == 46 && l1 == 108 && l2 == 111 && l3 == 99 && l4 == 107 {
           return Err(GitError.InvalidRefName("ref name component cannot end with .lock"));
         }
-      }
-
-      // @ 単体の構成要素禁止
-      if comp_len == 1 && comp_bytes.get(0).unwrap_or(0) == 64 {
-        return Err(GitError.InvalidRefName("ref name component cannot be @ alone"));
       }
 
       comp_start = i + 1;

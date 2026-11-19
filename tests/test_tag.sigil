@@ -6,11 +6,14 @@ use git.error.is_corrupt;
 use git.tag.decode_tag;
 use git.tag.encode_tag;
 use git.tag.new_tag_object;
+use git.tag.new_tag_object_str;
 use git.tag.tag_message;
+use git.tag.tag_message_str;
 use git.tag.tag_name;
 use git.tag.tag_object_id;
 use git.tag.tag_object_type;
 use git.tag.tag_tagger;
+use git.tag.tag_tagger_str;
 
 pub fn run_tag_tests() -> Bool
   intent "git.tag の全テストを実行し全合格なら true を返す"
@@ -21,7 +24,7 @@ pub fn run_tag_tests() -> Bool
   let target_id = "448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b";
 
   // 1. 正常系: tagger ありの tag
-  let tag1 = new_tag_object(target_id.clone(), "commit", "v1.0", "Tagger Name <tagger@example.com> 1700000000 +0000", "Release version 1.0\n");
+  let tag1 = new_tag_object_str(target_id.clone(), "commit", "v1.0", "Tagger Name <tagger@example.com> 1700000000 +0000", "Release version 1.0\n");
 
   let enc1 = match encode_tag(&tag1) {
     Ok(b) => b,
@@ -42,10 +45,10 @@ pub fn run_tag_tests() -> Bool
       if tag_name(&dec1) != "v1.0" {
         return false;
       }
-      if tag_tagger(&dec1) != "Tagger Name <tagger@example.com> 1700000000 +0000" {
+      if tag_tagger_str(&dec1) != "Tagger Name <tagger@example.com> 1700000000 +0000" {
         return false;
       }
-      if tag_message(&dec1) != "Release version 1.0\n" {
+      if tag_message_str(&dec1) != "Release version 1.0\n" {
         return false;
       }
     }
@@ -55,7 +58,7 @@ pub fn run_tag_tests() -> Bool
   }
 
   // 2. 正常系: tagger なしの tag
-  let tag2 = new_tag_object(target_id.clone(), "commit", "v0.1-light", "", "Lightweight annotated tag\n");
+  let tag2 = new_tag_object_str(target_id.clone(), "commit", "v0.1-light", "", "Lightweight annotated tag\n");
   let enc2 = match encode_tag(&tag2) {
     Ok(b) => b,
     Err(_) => Bytes.new(),
@@ -65,7 +68,7 @@ pub fn run_tag_tests() -> Bool
   }
   match decode_tag(&enc2) {
     Ok(dec2) => {
-      if tag_name(&dec2) != "v0.1-light" || tag_tagger(&dec2) != "" {
+      if tag_name(&dec2) != "v0.1-light" || tag_tagger_str(&dec2) != "" {
         return false;
       }
     }
@@ -77,6 +80,104 @@ pub fn run_tag_tests() -> Bool
   // 3. 異常系: object 欠落
   let bad_tag = "type commit\ntag v1.0\n\nmessage\n".as_bytes();
   match decode_tag(&bad_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 4. 正常系: 非 UTF-8 メッセージ・tagger のバイト列往復
+  let mut non_utf8_msg = Bytes.new();
+  non_utf8_msg.push(254);  // 0xFE
+  non_utf8_msg.push(255);  // 0xFF
+  non_utf8_msg.push(10);  // '\n'
+
+  let mut non_utf8_tagger = Bytes.new();
+  non_utf8_tagger.push(84);  // 'T'
+  non_utf8_tagger.push(233);  // 0xE9 (Latin-1 'é')
+  non_utf8_tagger.push(103);  // 'g'
+
+  let raw_tag = new_tag_object(target_id.clone(), "commit", "v2.0", non_utf8_tagger.clone(), non_utf8_msg.clone());
+  let raw_enc = match encode_tag(&raw_tag) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if raw_enc.len() == 0 {
+    return false;
+  }
+  match decode_tag(&raw_enc) {
+    Ok(dec_raw) => {
+      if !ct_eq(&tag_tagger(&dec_raw), &non_utf8_tagger) {
+        return false;
+      }
+      if !ct_eq(&tag_message(&dec_raw), &non_utf8_msg) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 5. 異常系: 大文字 hex の object id 拒否
+  let upper_obj_tag = "object 448BF96A514B23D784025ACDA317AA47D7563C3EEA79DC68D11DB1097E4A758B\ntype commit\ntag v1.0\n\nmsg\n".as_bytes();
+  match decode_tag(&upper_obj_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 6. 異常系: 未知のオブジェクト型 (tree/blob/commit/tag 以外)
+  let invalid_type_tag = "object 448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b\ntype unknown_type\ntag v1.0\n\nmsg\n".as_bytes();
+  match decode_tag(&invalid_type_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 7. 異常系: 未知のヘッダキー
+  let unknown_key_tag = "object 448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b\ntype commit\ntag v1.0\nextrakey foo\n\nmsg\n".as_bytes();
+  match decode_tag(&unknown_key_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 8. 異常系: ヘッダ行にスペースがない
+  let no_space_tag = "object 448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b\ntypecommit\ntag v1.0\n\nmsg\n".as_bytes();
+  match decode_tag(&no_space_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 9. 異常系: 重複 object ヘッダ
+  let dup_obj_tag = "object 448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b\nobject 448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b\ntype commit\ntag v1.0\n\nmsg\n".as_bytes();
+  match decode_tag(&dup_obj_tag) {
     Ok(_) => {
       return false;
     }

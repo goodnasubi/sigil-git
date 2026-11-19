@@ -164,6 +164,64 @@ pub fn run_validate_tests() -> Bool
     }
   }
 
+  // NTFS Alternate Data Streams (.git:foo, .git::$INDEX_ALLOCATION)
+  match validate_path(&"src/.git:foo") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/.git::$INDEX_ALLOCATION") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+  match validate_path(&"src/git~1:stream") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // HFS+ 無視文字 (U+200C) を含む .git 変種 (.g<U+200C>it)
+  let mut hfs_git = "src/.g".as_bytes();
+  hfs_git.push(226);  // 0xE2
+  hfs_git.push(128);  // 0x80
+  hfs_git.push(140);  // 0x8C (U+200C)
+  hfs_git.extend(&"it/config".as_bytes());
+  let hfs_str = hfs_git.to_string_utf8().unwrap_or("");
+  match validate_path(&hfs_str) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_path(&err) {
+        return false;
+      }
+    }
+  }
+
+  // .git.bak や .gitignore は正常なファイル名として受理されること
+  if !validate_path(&"src/.git.bak").unwrap_or(false) {
+    return false;
+  }
+  if !validate_path(&".gitignore").unwrap_or(false) {
+    return false;
+  }
+
   // パス検査: 異常系 (階層深度 128 超過)
   let mut deep_bytes = Bytes.new();
   let mut d = 0;
@@ -292,8 +350,8 @@ pub fn run_validate_tests() -> Bool
     }
   }
 
-  // @ 単体の構成要素
-  match validate_ref_name(&"refs/heads/@") {
+  // . で終わる構成要素禁止
+  match validate_ref_name(&"refs/heads/foo.") {
     Ok(_) => {
       return false;
     }
@@ -302,6 +360,23 @@ pub fn run_validate_tests() -> Bool
         return false;
       }
     }
+  }
+
+  // 名前全体が @ 単体は禁止
+  match validate_ref_name(&"@") {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_invalid_ref_name(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 構成要素が @ のみの名前 (refs/heads/@) は Git check-ref-format で有効
+  if !validate_ref_name(&"refs/heads/@").unwrap_or(false) {
+    return false;
   }
 
   // 不正文字 (空白, ~, ^, :, ?, *, [, \)

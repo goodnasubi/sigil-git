@@ -43,7 +43,7 @@ fn hex_char(v: Int) -> Int
 }
 
 fn parse_hex_digit(c: Int) -> Result<Int, GitError>
-  intent "ASCII hex 文字を数値 (0..15) に変換する"
+  intent "小文字 ASCII hex 文字を数値 (0..15) に変換する（大文字は拒否）"
   requires none
   ensures none
   effects none
@@ -54,10 +54,30 @@ fn parse_hex_digit(c: Int) -> Result<Int, GitError>
   if c >= 97 && c <= 102 {
     return Ok(c - 87);
   }
-  if c >= 65 && c <= 70 {
-    return Ok(c - 55);
+  return Err(GitError.Corrupt("invalid hex digit (must be lowercase 0-9, a-f)"));
+}
+
+pub fn is_valid_hex_id(id: &String) -> Bool
+  intent "文字列が 64 桁の小文字 16 進数 (SHA-256 識別子) か検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let b = id.as_bytes();
+  if b.len() != 64 {
+    return false;
   }
-  return Err(GitError.Corrupt("invalid hex digit"));
+  let mut i = 0;
+  while i < 64 {
+    let c = b.get(i).unwrap_or(0);
+    let is_digit = c >= 48 && c <= 57;
+    let is_lower_hex = c >= 97 && c <= 102;
+    if !is_digit && !is_lower_hex {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
 }
 
 pub fn bytes_to_hex(b: &Bytes) -> String

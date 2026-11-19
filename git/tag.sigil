@@ -3,23 +3,33 @@ module git.tag
   trust none
 
 use git.error.GitError;
+use git.hash.is_valid_hex_id;
 use git.limits.max_tag_message_size;
 
 pub struct TagObject {
   object_id: String,
   object_type: String,
   tag_name: String,
-  tagger: String,
-  message: String,
+  tagger: Bytes,
+  message: Bytes,
 }
 
-pub fn new_tag_object(object_id: String, object_type: String, tag_name: String, tagger: String, message: String) -> TagObject
+pub fn new_tag_object(object_id: String, object_type: String, tag_name: String, tagger: Bytes, message: Bytes) -> TagObject
   intent "TagObject を構築する"
   requires none
   ensures none
   effects none
 {
   return TagObject { object_id: object_id, object_type: object_type, tag_name: tag_name, tagger: tagger, message: message };
+}
+
+pub fn new_tag_object_str(object_id: String, object_type: String, tag_name: String, tagger: String, message: String) -> TagObject
+  intent "文字列フィールドから TagObject を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return TagObject { object_id: object_id, object_type: object_type, tag_name: tag_name, tagger: tagger.as_bytes(), message: message.as_bytes() };
 }
 
 pub fn tag_object_id(t: &TagObject) -> String
@@ -49,8 +59,8 @@ pub fn tag_name(t: &TagObject) -> String
   return t.tag_name.clone();
 }
 
-pub fn tag_tagger(t: &TagObject) -> String
-  intent "TagObject の作成者情報を返す"
+pub fn tag_tagger(t: &TagObject) -> Bytes
+  intent "TagObject の作成者情報（バイト列）を返す"
   requires none
   ensures none
   effects none
@@ -58,8 +68,17 @@ pub fn tag_tagger(t: &TagObject) -> String
   return t.tagger.clone();
 }
 
-pub fn tag_message(t: &TagObject) -> String
-  intent "TagObject のメッセージを返す"
+pub fn tag_tagger_str(t: &TagObject) -> String
+  intent "TagObject の作成者情報を UTF-8 文字列として返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.tagger.to_string_utf8().unwrap_or("");
+}
+
+pub fn tag_message(t: &TagObject) -> Bytes
+  intent "TagObject のメッセージ（バイト列）を返す"
   requires none
   ensures none
   effects none
@@ -67,8 +86,44 @@ pub fn tag_message(t: &TagObject) -> String
   return t.message.clone();
 }
 
+pub fn tag_message_str(t: &TagObject) -> String
+  intent "TagObject のメッセージを UTF-8 文字列として返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.message.to_string_utf8().unwrap_or("");
+}
+
+fn validate_tag_field_no_newline_or_null(b: &Bytes, field_name: &String) -> Result<Bool, GitError>
+  intent "tag フィールドに改行または NUL バイトが含まれていないか検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = b.len();
+  let mut i = 0;
+  while i < len {
+    let c = b.get(i).unwrap_or(0);
+    if c == 10 || c == 0 {
+      return Err(GitError.Corrupt("tag field cannot contain newline or null byte"));
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn is_valid_tag_object_type(t: &String) -> Bool
+  intent "tag の対象オブジェクト型が blob, tree, commit, tag のいずれかか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return t == "blob" || t == "tree" || t == "commit" || t == "tag";
+}
+
 pub fn decode_tag(content: &Bytes) -> Result<TagObject, GitError>
-  intent "tag オブジェクトの内容バイト列を解析する"
+  intent "tag オブジェクトの内容バイト列を解析する（重複・未知キー・不正型を拒否）"
   requires none
   ensures none
   effects none
@@ -77,7 +132,8 @@ pub fn decode_tag(content: &Bytes) -> Result<TagObject, GitError>
   let mut object_id = "";
   let mut object_type = "";
   let mut name = "";
-  let mut tagger = "";
+  let mut tagger = Bytes.new();
+  let mut has_tagger = false;
 
   let mut pos = 0;
   let mut in_header = true;
@@ -111,21 +167,47 @@ pub fn decode_tag(content: &Bytes) -> Result<TagObject, GitError>
         j = j + 1;
       }
 
-      if sp_pos > pos {
-        let key_bytes = content.slice(pos, sp_pos).unwrap_or(Bytes.new());
-        let val_bytes = content.slice(sp_pos + 1, line_end).unwrap_or(Bytes.new());
-        let key = key_bytes.to_string_utf8().unwrap_or("");
-        let val = val_bytes.to_string_utf8().unwrap_or("");
+      if sp_pos <= pos {
+        return Err(GitError.Corrupt("malformed tag header: missing space between key and value"));
+      }
 
-        if key == "object" {
-          object_id = val;
-        } else if key == "type" {
-          object_type = val;
-        } else if key == "tag" {
-          name = val;
-        } else if key == "tagger" {
-          tagger = val;
+      let key_bytes = content.slice(pos, sp_pos).unwrap_or(Bytes.new());
+      let val_bytes = content.slice(sp_pos + 1, line_end).unwrap_or(Bytes.new());
+      let key = key_bytes.to_string_utf8().unwrap_or("");
+      let val_str = val_bytes.to_string_utf8().unwrap_or("");
+
+      if key == "object" {
+        if object_id != "" {
+          return Err(GitError.Corrupt("duplicate object header in tag"));
         }
+        if !is_valid_hex_id(&val_str) {
+          return Err(GitError.Corrupt("tag object id must be 64-character lowercase hex"));
+        }
+        object_id = val_str;
+      } else if key == "type" {
+        if object_type != "" {
+          return Err(GitError.Corrupt("duplicate type header in tag"));
+        }
+        if !is_valid_tag_object_type(&val_str) {
+          return Err(GitError.Corrupt("unsupported object type in tag (must be blob, tree, commit, or tag)"));
+        }
+        object_type = val_str;
+      } else if key == "tag" {
+        if name != "" {
+          return Err(GitError.Corrupt("duplicate tag header in tag"));
+        }
+        if val_str == "" {
+          return Err(GitError.Corrupt("tag name cannot be empty"));
+        }
+        name = val_str;
+      } else if key == "tagger" {
+        if has_tagger {
+          return Err(GitError.Corrupt("duplicate tagger header in tag"));
+        }
+        tagger = val_bytes;
+        has_tagger = true;
+      } else {
+        return Err(GitError.Corrupt("unknown header key in tag object"));
       }
 
       if nl_pos >= 0 {
@@ -150,14 +232,15 @@ pub fn decode_tag(content: &Bytes) -> Result<TagObject, GitError>
   if msg_len > max_tag_message_size() {
     return Err(GitError.LimitExceeded("tag message size exceeds 1 MiB limit"));
   }
-  let msg_bytes = content.slice(pos, total_len).unwrap_or(Bytes.new());
-  let message = msg_bytes.to_string_utf8().unwrap_or("");
+  let message = content.slice(pos, total_len).unwrap_or(Bytes.new());
 
   return Ok(new_tag_object(object_id, object_type, name, tagger, message));
 }
 
+// 注意: ADR 0047 決定 1 では注釈付きタグの作成 API（外部向け）は初版に含めず後続の単位へ送る方針ですが、
+// encode_tag は decode_tag と対になる内部符号化・往復検証・fixture テスト用部品として提供しています。
 pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
-  intent "TagObject をバイト列に符号化する"
+  intent "TagObject をバイト列に符号化する（内部符号化・往復検証用）"
   requires none
   ensures none
   effects none
@@ -168,8 +251,18 @@ pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
   let tagger = tag_tagger(&tag);
   let msg = tag_message(&tag);
 
-  if obj == "" || obj_type == "" || name == "" {
-    return Err(GitError.Corrupt("tag object must have object, type, and tag"));
+  if !is_valid_hex_id(&obj) {
+    return Err(GitError.Corrupt("tag object id must be 64-character lowercase hex"));
+  }
+  if !is_valid_tag_object_type(&obj_type) {
+    return Err(GitError.Corrupt("tag object type must be blob, tree, commit, or tag"));
+  }
+  if name == "" {
+    return Err(GitError.Corrupt("tag name cannot be empty"));
+  }
+  validate_tag_field_no_newline_or_null(&name.as_bytes(), &"tag")?;
+  if tagger.len() > 0 {
+    validate_tag_field_no_newline_or_null(&tagger, &"tagger")?;
   }
 
   let mut buf = Bytes.new();
@@ -190,9 +283,9 @@ pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
   buf.push(10);  // '\n'
 
   // tagger <tagger>\n
-  if tagger != "" {
+  if tagger.len() > 0 {
     buf.extend(&"tagger ".as_bytes());
-    buf.extend(&tagger.as_bytes());
+    buf.extend(&tagger);
     buf.push(10);  // '\n'
   }
 
@@ -200,11 +293,10 @@ pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
   buf.push(10);  // '\n'
 
   // message
-  let msg_bytes = msg.as_bytes();
-  if msg_bytes.len() > max_tag_message_size() {
+  if msg.len() > max_tag_message_size() {
     return Err(GitError.LimitExceeded("tag message size exceeds 1 MiB limit"));
   }
-  buf.extend(&msg_bytes);
+  buf.extend(&msg);
 
   return Ok(buf);
 }

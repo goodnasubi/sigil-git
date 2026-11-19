@@ -141,6 +141,11 @@ pub fn parse_object_header(data: &Bytes) -> Result<ObjectHeader, GitError>
     return Err(GitError.Corrupt("missing null terminator or empty size in object header"));
   }
 
+  // 先頭 0 のサイズは非正規形のため拒否 (0 単体は許容)
+  if null_pos - (sp_pos + 1) > 1 && data.get(sp_pos + 1).unwrap_or(0) == 48 {
+    return Err(GitError.Corrupt("object size cannot have leading zero"));
+  }
+
   // 4. サイズ数値を解析
   let mut size = 0;
   let mut p = sp_pos + 1;

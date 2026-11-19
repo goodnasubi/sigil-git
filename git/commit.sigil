@@ -3,6 +3,7 @@ module git.commit
   trust none
 
 use git.error.GitError;
+use git.hash.is_valid_hex_id;
 use git.limits.max_commit_header_total_size;
 use git.limits.max_commit_headers;
 use git.limits.max_commit_message_size;
@@ -10,16 +11,25 @@ use git.limits.max_commit_parents;
 
 pub struct CommitHeader {
   key: String,
-  value: String,
+  value: Bytes,
 }
 
-pub fn new_commit_header(key: String, value: String) -> CommitHeader
+pub fn new_commit_header(key: String, value: Bytes) -> CommitHeader
   intent "CommitHeader を構築する"
   requires none
   ensures none
   effects none
 {
   return CommitHeader { key: key, value: value };
+}
+
+pub fn new_commit_header_str(key: String, value: String) -> CommitHeader
+  intent "文字列値から CommitHeader を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return CommitHeader { key: key, value: value.as_bytes() };
 }
 
 pub fn header_key(h: &CommitHeader) -> String
@@ -31,8 +41,8 @@ pub fn header_key(h: &CommitHeader) -> String
   return h.key.clone();
 }
 
-pub fn header_value(h: &CommitHeader) -> String
-  intent "CommitHeader の値を返す"
+pub fn header_value(h: &CommitHeader) -> Bytes
+  intent "CommitHeader の値（バイト列）を返す"
   requires none
   ensures none
   effects none
@@ -40,22 +50,40 @@ pub fn header_value(h: &CommitHeader) -> String
   return h.value.clone();
 }
 
+pub fn header_value_str(h: &CommitHeader) -> String
+  intent "CommitHeader の値を UTF-8 文字列として返す"
+  requires none
+  ensures none
+  effects none
+{
+  return h.value.to_string_utf8().unwrap_or("");
+}
+
 pub struct CommitObject {
   tree_id: String,
   parents: List<String>,
-  author: String,
-  committer: String,
+  author: Bytes,
+  committer: Bytes,
   headers: List<CommitHeader>,
-  message: String,
+  message: Bytes,
 }
 
-pub fn new_commit_object(tree_id: String, parents: List<String>, author: String, committer: String, headers: List<CommitHeader>, message: String) -> CommitObject
+pub fn new_commit_object(tree_id: String, parents: List<String>, author: Bytes, committer: Bytes, headers: List<CommitHeader>, message: Bytes) -> CommitObject
   intent "CommitObject を構築する"
   requires none
   ensures none
   effects none
 {
   return CommitObject { tree_id: tree_id, parents: parents, author: author, committer: committer, headers: headers, message: message };
+}
+
+pub fn new_commit_object_str(tree_id: String, parents: List<String>, author: String, committer: String, headers: List<CommitHeader>, message: String) -> CommitObject
+  intent "文字列フィールドから CommitObject を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return CommitObject { tree_id: tree_id, parents: parents, author: author.as_bytes(), committer: committer.as_bytes(), headers: headers, message: message.as_bytes() };
 }
 
 pub fn commit_tree_id(c: &CommitObject) -> String
@@ -76,8 +104,8 @@ pub fn commit_parents(c: &CommitObject) -> List<String>
   return c.parents.clone();
 }
 
-pub fn commit_author(c: &CommitObject) -> String
-  intent "CommitObject の author を返す"
+pub fn commit_author(c: &CommitObject) -> Bytes
+  intent "CommitObject の author（バイト列）を返す"
   requires none
   ensures none
   effects none
@@ -85,13 +113,31 @@ pub fn commit_author(c: &CommitObject) -> String
   return c.author.clone();
 }
 
-pub fn commit_committer(c: &CommitObject) -> String
-  intent "CommitObject の committer を返す"
+pub fn commit_author_str(c: &CommitObject) -> String
+  intent "CommitObject の author を UTF-8 文字列として返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.author.to_string_utf8().unwrap_or("");
+}
+
+pub fn commit_committer(c: &CommitObject) -> Bytes
+  intent "CommitObject の committer（バイト列）を返す"
   requires none
   ensures none
   effects none
 {
   return c.committer.clone();
+}
+
+pub fn commit_committer_str(c: &CommitObject) -> String
+  intent "CommitObject の committer を UTF-8 文字列として返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.committer.to_string_utf8().unwrap_or("");
 }
 
 pub fn commit_headers(c: &CommitObject) -> List<CommitHeader>
@@ -103,8 +149,8 @@ pub fn commit_headers(c: &CommitObject) -> List<CommitHeader>
   return c.headers.clone();
 }
 
-pub fn commit_message(c: &CommitObject) -> String
-  intent "CommitObject のメッセージを返す"
+pub fn commit_message(c: &CommitObject) -> Bytes
+  intent "CommitObject のメッセージ（バイト列）を返す"
   requires none
   ensures none
   effects none
@@ -112,30 +158,84 @@ pub fn commit_message(c: &CommitObject) -> String
   return c.message.clone();
 }
 
-fn str_concat(a: &String, b: &String) -> String
-  intent "2つの文字列を連結する"
+pub fn commit_message_str(c: &CommitObject) -> String
+  intent "CommitObject のメッセージを UTF-8 文字列として返す"
   requires none
   ensures none
   effects none
 {
-  let mut bytes = Bytes.new();
-  let ba = a.as_bytes();
-  let bb = b.as_bytes();
+  return c.message.to_string_utf8().unwrap_or("");
+}
+
+fn validate_no_newline_or_null(b: &Bytes, field_name: &String) -> Result<Bool, GitError>
+  intent "フィールドに改行または NUL バイトが含まれていないか検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = b.len();
   let mut i = 0;
-  while i < ba.len() {
-    bytes.push(ba.get(i).unwrap_or(0));
+  while i < len {
+    let c = b.get(i).unwrap_or(0);
+    if c == 10 || c == 0 {
+      return Err(GitError.Corrupt("commit field cannot contain newline or null byte"));
+    }
     i = i + 1;
   }
-  let mut j = 0;
-  while j < bb.len() {
-    bytes.push(bb.get(j).unwrap_or(0));
-    j = j + 1;
+  return Ok(true);
+}
+
+fn validate_header_key(k: &String) -> Result<Bool, GitError>
+  intent "ヘッダキーが妥当な ASCII 文字列（空白・コロン・制御文字なし）か検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let kb = k.as_bytes();
+  let len = kb.len();
+  if len == 0 {
+    return Err(GitError.Corrupt("commit header key cannot be empty"));
   }
-  return bytes.to_string_utf8().unwrap_or(a.clone());
+  let mut i = 0;
+  while i < len {
+    let c = kb.get(i).unwrap_or(0);
+    if c <= 32 || c >= 127 || c == 58 {
+      return Err(GitError.Corrupt("commit header key contains invalid character"));
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn validate_header_value(v: &Bytes) -> Result<Bool, GitError>
+  intent "ヘッダ値内の改行が継続行規則（改行の直後がスペース）に従っているか検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = v.len();
+  let mut i = 0;
+  while i < len {
+    let c = v.get(i).unwrap_or(0);
+    if c == 0 {
+      return Err(GitError.Corrupt("commit header value cannot contain null byte"));
+    }
+    if c == 10 {
+      if i + 1 >= len {
+        return Err(GitError.Corrupt("commit header value cannot end with newline"));
+      }
+      let next_c = v.get(i + 1).unwrap_or(0);
+      if next_c != 32 {
+        return Err(GitError.Corrupt("commit header newline must be followed by space (continuation line)"));
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
 }
 
 pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
-  intent "commit オブジェクトの内容バイト列を解析する"
+  intent "commit オブジェクトの内容バイト列を解析する（正規形順序を強制しバイト往復を保証）"
   requires none
   ensures none
   effects none
@@ -143,8 +243,8 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
   let total_len = content.len();
   let mut tree_id = "";
   let mut parents = List.new();
-  let mut author = "";
-  let mut committer = "";
+  let mut author = Bytes.new();
+  let mut committer = Bytes.new();
   let mut headers = List.new();
 
   let mut pos = 0;
@@ -154,10 +254,16 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
 
   let mut has_cur = false;
   let mut cur_key = "";
-  let mut cur_val = "";
+  let mut cur_val = Bytes.new();
+
+  // phase:
+  // 0: tree 未読 (tree 必須)
+  // 1: tree 読了、parent または author 待ち
+  // 2: author 読了、committer 待ち
+  // 3: committer 読了、追加ヘッダ受付可能
+  let mut phase = 0;
 
   while pos < total_len && in_header {
-    // 次の改行を探す
     let mut nl_pos = 0 - 1;
     let mut i = pos;
     while i < total_len && nl_pos < 0 {
@@ -173,8 +279,8 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
     };
     let line_len = line_end - pos;
 
-    // 空行ならヘッダ部終了
     if line_len == 0 {
+      // 空行: ヘッダ部終了
       in_header = false;
       pos = line_end + 1;
     } else {
@@ -185,15 +291,13 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
 
       let first_byte = content.get(pos).unwrap_or(0);
       if first_byte == 32 {
-        // 先頭スペース: 前のヘッダの継続行
+        // 継続行: 前のヘッダ値へ O(N) 追記
         if !has_cur {
-          return Err(GitError.Corrupt("invalid continuation line in commit headers"));
+          return Err(GitError.Corrupt("invalid continuation line in commit headers: no preceding header"));
         }
         let cont_slice = content.slice(pos, line_end).unwrap_or(Bytes.new());
-        let cont_str = cont_slice.to_string_utf8().unwrap_or("");
-        let nl = "\n";
-        let with_nl = str_concat(&cur_val, &nl);
-        cur_val = str_concat(&with_nl, &cont_str);
+        cur_val.push(10);  // '\n'
+        cur_val.extend(&cont_slice);
       } else {
         // 前のヘッダを確定
         if has_cur {
@@ -202,17 +306,50 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
             return Err(GitError.LimitExceeded("commit header count exceeds 1024 limit"));
           }
           if cur_key == "tree" {
-            tree_id = cur_val;
+            if phase != 0 {
+              return Err(GitError.Corrupt("duplicate or out-of-order tree header in commit"));
+            }
+            let tree_str = cur_val.to_string_utf8().unwrap_or("");
+            if !is_valid_hex_id(&tree_str) {
+              return Err(GitError.Corrupt("commit tree id must be 64-character lowercase hex"));
+            }
+            tree_id = tree_str;
+            phase = 1;
           } else if cur_key == "parent" {
-            parents.push(cur_val);
+            if phase != 1 {
+              return Err(GitError.Corrupt("commit parent header out of order: must follow tree and precede author"));
+            }
+            let parent_str = cur_val.to_string_utf8().unwrap_or("");
+            if !is_valid_hex_id(&parent_str) {
+              return Err(GitError.Corrupt("commit parent id must be 64-character lowercase hex"));
+            }
+            parents.push(parent_str);
             if parents.len() > max_commit_parents() {
               return Err(GitError.LimitExceeded("commit parent count exceeds 16 limit"));
             }
           } else if cur_key == "author" {
+            if phase != 1 {
+              return Err(GitError.Corrupt("commit author header out of order or duplicate"));
+            }
+            if cur_val.len() == 0 {
+              return Err(GitError.Corrupt("commit author header cannot be empty"));
+            }
             author = cur_val;
+            phase = 2;
           } else if cur_key == "committer" {
+            if phase != 2 {
+              return Err(GitError.Corrupt("commit committer header out of order or duplicate"));
+            }
+            if cur_val.len() == 0 {
+              return Err(GitError.Corrupt("commit committer header cannot be empty"));
+            }
             committer = cur_val;
+            phase = 3;
           } else {
+            if phase < 3 {
+              return Err(GitError.Corrupt("commit additional headers must follow committer"));
+            }
+            validate_header_key(&cur_key)?;
             headers.push(new_commit_header(cur_key, cur_val));
           }
         }
@@ -231,9 +368,11 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
         }
 
         let key_bytes = content.slice(pos, sp_pos).unwrap_or(Bytes.new());
-        let val_bytes = content.slice(sp_pos + 1, line_end).unwrap_or(Bytes.new());
         cur_key = key_bytes.to_string_utf8().unwrap_or("");
-        cur_val = val_bytes.to_string_utf8().unwrap_or("");
+        if cur_key == "" {
+          return Err(GitError.Corrupt("invalid commit header key: empty or non-utf8"));
+        }
+        cur_val = content.slice(sp_pos + 1, line_end).unwrap_or(Bytes.new());
         has_cur = true;
       }
 
@@ -252,55 +391,87 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
       return Err(GitError.LimitExceeded("commit header count exceeds 1024 limit"));
     }
     if cur_key == "tree" {
-      tree_id = cur_val;
+      if phase != 0 {
+        return Err(GitError.Corrupt("duplicate or out-of-order tree header in commit"));
+      }
+      let tree_str = cur_val.to_string_utf8().unwrap_or("");
+      if !is_valid_hex_id(&tree_str) {
+        return Err(GitError.Corrupt("commit tree id must be 64-character lowercase hex"));
+      }
+      tree_id = tree_str;
+      phase = 1;
     } else if cur_key == "parent" {
-      parents.push(cur_val);
+      if phase != 1 {
+        return Err(GitError.Corrupt("commit parent header out of order: must follow tree and precede author"));
+      }
+      let parent_str = cur_val.to_string_utf8().unwrap_or("");
+      if !is_valid_hex_id(&parent_str) {
+        return Err(GitError.Corrupt("commit parent id must be 64-character lowercase hex"));
+      }
+      parents.push(parent_str);
       if parents.len() > max_commit_parents() {
         return Err(GitError.LimitExceeded("commit parent count exceeds 16 limit"));
       }
     } else if cur_key == "author" {
+      if phase != 1 {
+        return Err(GitError.Corrupt("commit author header out of order or duplicate"));
+      }
+      if cur_val.len() == 0 {
+        return Err(GitError.Corrupt("commit author header cannot be empty"));
+      }
       author = cur_val;
+      phase = 2;
     } else if cur_key == "committer" {
+      if phase != 2 {
+        return Err(GitError.Corrupt("commit committer header out of order or duplicate"));
+      }
+      if cur_val.len() == 0 {
+        return Err(GitError.Corrupt("commit committer header cannot be empty"));
+      }
       committer = cur_val;
+      phase = 3;
     } else {
+      if phase < 3 {
+        return Err(GitError.Corrupt("commit additional headers must follow committer"));
+      }
+      validate_header_key(&cur_key)?;
       headers.push(new_commit_header(cur_key, cur_val));
     }
   }
 
-  if tree_id == "" {
-    return Err(GitError.Corrupt("missing tree in commit object"));
+  if phase < 3 {
+    return Err(GitError.Corrupt("missing required commit headers (tree, author, or committer)"));
   }
 
-  // メッセージ部
+  // メッセージ部（非 UTF-8 もそのままバイト列として保持）
   let msg_len = total_len - pos;
   if msg_len > max_commit_message_size() {
     return Err(GitError.LimitExceeded("commit message size exceeds 1 MiB limit"));
   }
-  let msg_bytes = content.slice(pos, total_len).unwrap_or(Bytes.new());
-  let message = msg_bytes.to_string_utf8().unwrap_or("");
+  let message = content.slice(pos, total_len).unwrap_or(Bytes.new());
 
   return Ok(new_commit_object(tree_id, parents, author, committer, headers, message));
 }
 
 pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
-  intent "CommitObject をバイト列に符号化する"
+  intent "CommitObject をバイト列に符号化する（注入を拒否し正規形順序で出力）"
   requires none
   ensures none
   effects none
 {
   let tree = commit_tree_id(&commit);
-  if tree == "" {
-    return Err(GitError.Corrupt("commit object must have tree"));
+  if !is_valid_hex_id(&tree) {
+    return Err(GitError.Corrupt("commit object tree must be 64-character lowercase hex"));
   }
 
   let mut buf = Bytes.new();
 
-  // tree
+  // 1. tree
   buf.extend(&"tree ".as_bytes());
   buf.extend(&tree.as_bytes());
   buf.push(10);  // '\n'
 
-  // parents
+  // 2. parents
   let parents = commit_parents(&commit);
   if parents.len() > max_commit_parents() {
     return Err(GitError.LimitExceeded("commit parent count exceeds 16 limit"));
@@ -309,6 +480,9 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
   while i < parents.len() {
     match parents.get(i) {
       Some(p) => {
+        if !is_valid_hex_id(&p) {
+          return Err(GitError.Corrupt("commit parent id must be 64-character lowercase hex"));
+        }
         buf.extend(&"parent ".as_bytes());
         buf.extend(&p.as_bytes());
         buf.push(10);  // '\n'
@@ -318,19 +492,27 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
     i = i + 1;
   }
 
-  // author
+  // 3. author
   let author = commit_author(&commit);
+  if author.len() == 0 {
+    return Err(GitError.Corrupt("commit author cannot be empty"));
+  }
+  validate_no_newline_or_null(&author, &"author")?;
   buf.extend(&"author ".as_bytes());
-  buf.extend(&author.as_bytes());
+  buf.extend(&author);
   buf.push(10);  // '\n'
 
-  // committer
+  // 4. committer
   let committer = commit_committer(&commit);
+  if committer.len() == 0 {
+    return Err(GitError.Corrupt("commit committer cannot be empty"));
+  }
+  validate_no_newline_or_null(&committer, &"committer")?;
   buf.extend(&"committer ".as_bytes());
-  buf.extend(&committer.as_bytes());
+  buf.extend(&committer);
   buf.push(10);  // '\n'
 
-  // headers
+  // 5. headers
   let headers = commit_headers(&commit);
   if headers.len() > max_commit_headers() {
     return Err(GitError.LimitExceeded("commit header count exceeds 1024 limit"));
@@ -341,9 +523,11 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
       Some(hdr) => {
         let k = header_key(&hdr);
         let v = header_value(&hdr);
+        validate_header_key(&k)?;
+        validate_header_value(&v)?;
         buf.extend(&k.as_bytes());
         buf.push(32);  // ' '
-        buf.extend(&v.as_bytes());
+        buf.extend(&v);
         buf.push(10);  // '\n'
       }
       None => {}
@@ -351,7 +535,7 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
     i = i + 1;
   }
 
-  // ヘッダサイズ検査
+  // ヘッダ合計サイズ検査
   if buf.len() > max_commit_header_total_size() {
     return Err(GitError.LimitExceeded("commit header total size exceeds 64 KiB limit"));
   }
@@ -359,13 +543,12 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
   // 空行
   buf.push(10);  // '\n'
 
-  // message
+  // 6. message
   let msg = commit_message(&commit);
-  let msg_bytes = msg.as_bytes();
-  if msg_bytes.len() > max_commit_message_size() {
+  if msg.len() > max_commit_message_size() {
     return Err(GitError.LimitExceeded("commit message size exceeds 1 MiB limit"));
   }
-  buf.extend(&msg_bytes);
+  buf.extend(&msg);
 
   return Ok(buf);
 }
