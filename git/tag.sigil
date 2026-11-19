@@ -1,0 +1,210 @@
+module git.tag
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.limits.max_tag_message_size;
+
+pub struct TagObject {
+  object_id: String,
+  object_type: String,
+  tag_name: String,
+  tagger: String,
+  message: String,
+}
+
+pub fn new_tag_object(object_id: String, object_type: String, tag_name: String, tagger: String, message: String) -> TagObject
+  intent "TagObject を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return TagObject { object_id: object_id, object_type: object_type, tag_name: tag_name, tagger: tagger, message: message };
+}
+
+pub fn tag_object_id(t: &TagObject) -> String
+  intent "TagObject の指す object_id を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.object_id.clone();
+}
+
+pub fn tag_object_type(t: &TagObject) -> String
+  intent "TagObject の指す object_type を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.object_type.clone();
+}
+
+pub fn tag_name(t: &TagObject) -> String
+  intent "TagObject のタグ名を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.tag_name.clone();
+}
+
+pub fn tag_tagger(t: &TagObject) -> String
+  intent "TagObject の作成者情報を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.tagger.clone();
+}
+
+pub fn tag_message(t: &TagObject) -> String
+  intent "TagObject のメッセージを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.message.clone();
+}
+
+pub fn decode_tag(content: &Bytes) -> Result<TagObject, GitError>
+  intent "tag オブジェクトの内容バイト列を解析する"
+  requires none
+  ensures none
+  effects none
+{
+  let total_len = content.len();
+  let mut object_id = "";
+  let mut object_type = "";
+  let mut name = "";
+  let mut tagger = "";
+
+  let mut pos = 0;
+  let mut in_header = true;
+
+  while pos < total_len && in_header {
+    let mut nl_pos = 0 - 1;
+    let mut i = pos;
+    while i < total_len && nl_pos < 0 {
+      if content.get(i).unwrap_or(0) == 10 {
+        nl_pos = i;
+      }
+      i = i + 1;
+    }
+
+    let line_end = match nl_pos >= 0 {
+      true => nl_pos,
+      false => total_len,
+    };
+    let line_len = line_end - pos;
+
+    if line_len == 0 {
+      in_header = false;
+      pos = line_end + 1;
+    } else {
+      let mut sp_pos = 0 - 1;
+      let mut j = pos;
+      while j < line_end && sp_pos < 0 {
+        if content.get(j).unwrap_or(0) == 32 {
+          sp_pos = j;
+        }
+        j = j + 1;
+      }
+
+      if sp_pos > pos {
+        let key_bytes = content.slice(pos, sp_pos).unwrap_or(Bytes.new());
+        let val_bytes = content.slice(sp_pos + 1, line_end).unwrap_or(Bytes.new());
+        let key = key_bytes.to_string_utf8().unwrap_or("");
+        let val = val_bytes.to_string_utf8().unwrap_or("");
+
+        if key == "object" {
+          object_id = val;
+        } else if key == "type" {
+          object_type = val;
+        } else if key == "tag" {
+          name = val;
+        } else if key == "tagger" {
+          tagger = val;
+        }
+      }
+
+      if nl_pos >= 0 {
+        pos = nl_pos + 1;
+      } else {
+        pos = total_len;
+      }
+    }
+  }
+
+  if object_id == "" {
+    return Err(GitError.Corrupt("missing object in tag object"));
+  }
+  if object_type == "" {
+    return Err(GitError.Corrupt("missing type in tag object"));
+  }
+  if name == "" {
+    return Err(GitError.Corrupt("missing tag name in tag object"));
+  }
+
+  let msg_len = total_len - pos;
+  if msg_len > max_tag_message_size() {
+    return Err(GitError.LimitExceeded("tag message size exceeds 1 MiB limit"));
+  }
+  let msg_bytes = content.slice(pos, total_len).unwrap_or(Bytes.new());
+  let message = msg_bytes.to_string_utf8().unwrap_or("");
+
+  return Ok(new_tag_object(object_id, object_type, name, tagger, message));
+}
+
+pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
+  intent "TagObject をバイト列に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let obj = tag_object_id(&tag);
+  let obj_type = tag_object_type(&tag);
+  let name = tag_name(&tag);
+  let tagger = tag_tagger(&tag);
+  let msg = tag_message(&tag);
+
+  if obj == "" || obj_type == "" || name == "" {
+    return Err(GitError.Corrupt("tag object must have object, type, and tag"));
+  }
+
+  let mut buf = Bytes.new();
+
+  // object <id>\n
+  buf.extend(&"object ".as_bytes());
+  buf.extend(&obj.as_bytes());
+  buf.push(10);  // '\n'
+
+  // type <type>\n
+  buf.extend(&"type ".as_bytes());
+  buf.extend(&obj_type.as_bytes());
+  buf.push(10);  // '\n'
+
+  // tag <name>\n
+  buf.extend(&"tag ".as_bytes());
+  buf.extend(&name.as_bytes());
+  buf.push(10);  // '\n'
+
+  // tagger <tagger>\n
+  if tagger != "" {
+    buf.extend(&"tagger ".as_bytes());
+    buf.extend(&tagger.as_bytes());
+    buf.push(10);  // '\n'
+  }
+
+  // 空行
+  buf.push(10);  // '\n'
+
+  // message
+  let msg_bytes = msg.as_bytes();
+  if msg_bytes.len() > max_tag_message_size() {
+    return Err(GitError.LimitExceeded("tag message size exceeds 1 MiB limit"));
+  }
+  buf.extend(&msg_bytes);
+
+  return Ok(buf);
+}

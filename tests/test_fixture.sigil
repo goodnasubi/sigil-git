@@ -1,0 +1,250 @@
+module tests.test_fixture
+  targets server
+  trust none
+
+use git.commit.commit_author;
+use git.commit.commit_committer;
+use git.commit.commit_message;
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.commit.encode_commit;
+use git.fixture.fixture_blob_content;
+use git.fixture.fixture_blob_id_hex;
+use git.fixture.fixture_blob_raw;
+use git.fixture.fixture_commit_content;
+use git.fixture.fixture_commit_id_hex;
+use git.fixture.fixture_commit_raw;
+use git.fixture.fixture_tag_content;
+use git.fixture.fixture_tag_id_hex;
+use git.fixture.fixture_tag_raw;
+use git.fixture.fixture_tree_id_hex;
+use git.fixture.fixture_tree_raw;
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.object.header_len;
+use git.object.header_obj_type;
+use git.object.header_size;
+use git.object.verify_object_bytes;
+use git.tag.decode_tag;
+use git.tag.encode_tag;
+use git.tag.tag_message;
+use git.tag.tag_name;
+use git.tag.tag_object_id;
+use git.tag.tag_object_type;
+use git.tag.tag_tagger;
+use git.tree.decode_tree;
+use git.tree.encode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.tree.entry_name;
+
+pub fn run_fixture_tests() -> Bool
+  intent "本物の Git が生成した fixture（blob・tree・commit・tag）を読み取り、型・長さ・内容・SHA-256 識別子の一致を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // =========================================================================
+  // 1. Git fixture: blob の読み取りと SHA-256 識別子の一致検証
+  // =========================================================================
+  let blob_raw = fixture_blob_raw();
+  let expected_blob_id = hex_to_bytes(&fixture_blob_id_hex()).unwrap_or(Bytes.new());
+
+  match verify_object_bytes(&blob_raw, &expected_blob_id) {
+    Ok(hdr) => {
+      if header_size(&hdr) != 5 {
+        return false;
+      }
+      match header_obj_type(&hdr) {
+        ObjectType.Blob => {}
+        _ => {
+          return false;
+        }
+      }
+      let content = blob_raw.slice(header_len(&hdr), header_len(&hdr) + header_size(&hdr)).unwrap_or(Bytes.new());
+      let expected_content = fixture_blob_content();
+      if !ct_eq(&content, &expected_content) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // =========================================================================
+  // 2. Git fixture: tree の読み取りと SHA-256 識別子の一致検証
+  // =========================================================================
+  let tree_raw = fixture_tree_raw();
+  let expected_tree_id = hex_to_bytes(&fixture_tree_id_hex()).unwrap_or(Bytes.new());
+
+  match verify_object_bytes(&tree_raw, &expected_tree_id) {
+    Ok(hdr) => {
+      if header_size(&hdr) != 48 {
+        return false;
+      }
+      match header_obj_type(&hdr) {
+        ObjectType.Tree => {}
+        _ => {
+          return false;
+        }
+      }
+      let content = tree_raw.slice(header_len(&hdr), header_len(&hdr) + header_size(&hdr)).unwrap_or(Bytes.new());
+      match decode_tree(&content) {
+        Ok(entries) => {
+          if entries.len() != 1 {
+            return false;
+          }
+          match entries.get(0) {
+            Some(e) => {
+              let eid = entry_id(&e);
+              if entry_mode(&e) != 100644 || entry_name(&e) != "test.txt" || !ct_eq(&eid, &expected_blob_id) {
+                return false;
+              }
+            }
+            None => {
+              return false;
+            }
+          }
+          // 符号化の往復検証
+          let re_encoded = match encode_tree(&entries) {
+            Ok(b) => b,
+            Err(_) => Bytes.new(),
+          };
+          if !ct_eq(&re_encoded, &content) {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // =========================================================================
+  // 3. Git fixture: commit の読み取りと SHA-256 識別子の一致検証
+  // =========================================================================
+  let commit_raw = fixture_commit_raw();
+  let expected_commit_id = hex_to_bytes(&fixture_commit_id_hex()).unwrap_or(Bytes.new());
+
+  match verify_object_bytes(&commit_raw, &expected_commit_id) {
+    Ok(hdr) => {
+      if header_size(&hdr) != 196 {
+        return false;
+      }
+      match header_obj_type(&hdr) {
+        ObjectType.Commit => {}
+        _ => {
+          return false;
+        }
+      }
+      let content = commit_raw.slice(header_len(&hdr), header_len(&hdr) + header_size(&hdr)).unwrap_or(Bytes.new());
+      let expected_commit_content = fixture_commit_content();
+      if !ct_eq(&content, &expected_commit_content) {
+        return false;
+      }
+
+      match decode_commit(&content) {
+        Ok(commit) => {
+          if commit_tree_id(&commit) != fixture_tree_id_hex() {
+            return false;
+          }
+          if commit_parents(&commit).len() != 0 {
+            return false;
+          }
+          if commit_author(&commit) != "Author <author@example.com> 1700000000 +0000" {
+            return false;
+          }
+          if commit_committer(&commit) != "Committer <committer@example.com> 1700000000 +0000" {
+            return false;
+          }
+          if commit_message(&commit) != "test commit\n" {
+            return false;
+          }
+
+          // 符号化の往復検証
+          let re_encoded = match encode_commit(&commit) {
+            Ok(b) => b,
+            Err(_) => Bytes.new(),
+          };
+          if !ct_eq(&re_encoded, &content) {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // =========================================================================
+  // 4. Git fixture: tag の読み取りと SHA-256 識別子の一致検証
+  // =========================================================================
+  let tag_raw = fixture_tag_raw();
+  let expected_tag_id = hex_to_bytes(&fixture_tag_id_hex()).unwrap_or(Bytes.new());
+
+  match verify_object_bytes(&tag_raw, &expected_tag_id) {
+    Ok(hdr) => {
+      if header_size(&hdr) != 155 {
+        return false;
+      }
+      match header_obj_type(&hdr) {
+        ObjectType.Tag => {}
+        _ => {
+          return false;
+        }
+      }
+      let content = tag_raw.slice(header_len(&hdr), header_len(&hdr) + header_size(&hdr)).unwrap_or(Bytes.new());
+      let expected_tag_content = fixture_tag_content();
+      if !ct_eq(&content, &expected_tag_content) {
+        return false;
+      }
+
+      match decode_tag(&content) {
+        Ok(tag) => {
+          if tag_object_id(&tag) != fixture_commit_id_hex() {
+            return false;
+          }
+          if tag_object_type(&tag) != "commit" {
+            return false;
+          }
+          if tag_name(&tag) != "v1.0" {
+            return false;
+          }
+          if tag_tagger(&tag) != "Tagger <tagger@example.com> 1700000000 +0000" {
+            return false;
+          }
+          if tag_message(&tag) != "test tag\n" {
+            return false;
+          }
+
+          // 符号化の往復検証
+          let re_encoded = match encode_tag(&tag) {
+            Ok(b) => b,
+            Err(_) => Bytes.new(),
+          };
+          if !ct_eq(&re_encoded, &content) {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}

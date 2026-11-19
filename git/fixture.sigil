@@ -1,0 +1,155 @@
+module git.fixture
+  targets server
+  trust none
+
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.object.encode_raw_object;
+use git.tree.TreeEntry;
+use git.tree.new_tree_entry;
+
+// 本物の Git 2.43.0 (--object-format=sha256) が生成した blob fixture
+pub fn fixture_blob_content() -> Bytes
+  intent "Git が生成した fixture blob の内容 ('hello') を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(104);  // 'h'
+  b.push(101);  // 'e'
+  b.push(108);  // 'l'
+  b.push(108);  // 'l'
+  b.push(111);  // 'o'
+  return b;
+}
+
+pub fn fixture_blob_id_hex() -> String
+  intent "fixture blob の SHA-256 識別子 hex を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60";
+}
+
+pub fn fixture_blob_raw() -> Bytes
+  intent "fixture blob のヘッダ付き生バイト列 ('blob 5\\0hello') を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let content = fixture_blob_content();
+  let t = ObjectType.Blob;
+  return encode_raw_object(&t, &content);
+}
+
+// 本物の Git 2.43.0 が生成した tree fixture
+pub fn fixture_tree_id_hex() -> String
+  intent "fixture tree の SHA-256 識別子 hex を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731";
+}
+
+pub fn fixture_tree_entries() -> List<TreeEntry>
+  intent "fixture tree のエントリ一覧を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let hex_id = fixture_blob_id_hex();
+  let id = hex_to_bytes(&hex_id).unwrap_or(Bytes.new());
+  let mut list = List.new();
+  list.push(new_tree_entry(100644, "test.txt", id));
+  return list;
+}
+
+pub fn fixture_tree_raw() -> Bytes
+  intent "fixture tree のヘッダ付き生バイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut content = "100644 test.txt".as_bytes();
+  content.push(0);  // '\0'
+  let hex_id = fixture_blob_id_hex();
+  let id = hex_to_bytes(&hex_id).unwrap_or(Bytes.new());
+  content.extend(&id);
+
+  let t = ObjectType.Tree;
+  return encode_raw_object(&t, &content);
+}
+
+// 本物の Git 2.43.0 が生成した commit fixture
+pub fn fixture_commit_id_hex() -> String
+  intent "fixture commit の SHA-256 識別子 hex を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b";
+}
+
+pub fn fixture_commit_content() -> Bytes
+  intent "fixture commit の内容バイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.extend(&"tree 24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731\n".as_bytes());
+  b.extend(&"author Author <author@example.com> 1700000000 +0000\n".as_bytes());
+  b.extend(&"committer Committer <committer@example.com> 1700000000 +0000\n\n".as_bytes());
+  b.extend(&"test commit\n".as_bytes());
+  return b;
+}
+
+pub fn fixture_commit_raw() -> Bytes
+  intent "fixture commit のヘッダ付き生バイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let content = fixture_commit_content();
+  let t = ObjectType.Commit;
+  return encode_raw_object(&t, &content);
+}
+
+// 本物の Git 2.43.0 が生成した tag fixture
+pub fn fixture_tag_id_hex() -> String
+  intent "fixture tag の SHA-256 識別子 hex を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "ffad3deb10a3a52e399b61d4baa6f085a1e32643b9997f3bc66a8def0d2e4d06";
+}
+
+pub fn fixture_tag_content() -> Bytes
+  intent "fixture tag の内容バイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.extend(&"object 448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b\n".as_bytes());
+  b.extend(&"type commit\n".as_bytes());
+  b.extend(&"tag v1.0\n".as_bytes());
+  b.extend(&"tagger Tagger <tagger@example.com> 1700000000 +0000\n\n".as_bytes());
+  b.extend(&"test tag\n".as_bytes());
+  return b;
+}
+
+pub fn fixture_tag_raw() -> Bytes
+  intent "fixture tag のヘッダ付き生バイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let content = fixture_tag_content();
+  let t = ObjectType.Tag;
+  return encode_raw_object(&t, &content);
+}

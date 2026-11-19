@@ -1,0 +1,187 @@
+module tests.test_object
+  targets server
+  trust none
+
+use git.error.is_corrupt;
+use git.error.is_limit_exceeded;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.object.encode_raw_object;
+use git.object.header_len;
+use git.object.header_obj_type;
+use git.object.header_size;
+use git.object.parse_object_header;
+use git.object.verify_object_bytes;
+
+pub fn run_object_tests() -> Bool
+  intent "git.object および git.hash の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 正常系: blob のヘッダパースと検証
+  let mut content = Bytes.new();
+  content.push(119);  // 'w'
+  content.push(111);  // 'r'
+  content.push(108);  // 'l'
+  content.push(100);  // 'd'
+
+  let blob_type = ObjectType.Blob;
+  let raw_obj = encode_raw_object(&blob_type, &content);
+  let expected_id = compute_object_id(&"blob", &content);
+
+  match parse_object_header(&raw_obj) {
+    Ok(hdr) => {
+      if header_size(&hdr) != 4 || header_len(&hdr) != 7 {
+        return false;
+      }
+      match header_obj_type(&hdr) {
+        ObjectType.Blob => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  match verify_object_bytes(&raw_obj, &expected_id) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 改ざん検出: 内容の1バイトを変更すると verify_object_bytes が Corrupt で失敗すること
+  let mut tampered = raw_obj.clone();
+  tampered.push(33);  // '!' を追加してサイズ不一致
+  match verify_object_bytes(&tampered, &expected_id) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 内容のみ変更（サイズは一致するがハッシュ不一致）
+  let mut altered = Bytes.new();
+  altered.extend(&"blob 4".as_bytes());
+  altered.push(0);
+  altered.push(87);  // 'W'
+  altered.push(111);  // 'o'
+  altered.push(108);  // 'l'
+  altered.push(100);  // 'd'
+  match verify_object_bytes(&altered, &expected_id) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 3. 異常系: 不正な型名
+  let mut bad_type = "invalid 4".as_bytes();
+  bad_type.push(0);
+  bad_type.extend(&"test".as_bytes());
+  match parse_object_header(&bad_type) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 4. 異常系: NUL 終端なし
+  let no_null = "blob 4test".as_bytes();
+  match parse_object_header(&no_null) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 5. 異常系: 非数字サイズ
+  let mut non_digit = "blob abc".as_bytes();
+  non_digit.push(0);
+  non_digit.extend(&"test".as_bytes());
+  match parse_object_header(&non_digit) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 6. 異常系: 上限超過 (64 MiB 超過サイズ宣言)
+  let mut huge_size = "blob 9999999999".as_bytes();
+  huge_size.push(0);
+  match parse_object_header(&huge_size) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_limit_exceeded(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 7. hex 変換の往復テスト
+  let hex_str = "8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60";
+  let dec_bytes = hex_to_bytes(&hex_str).unwrap_or(Bytes.new());
+  if dec_bytes.len() != 32 {
+    return false;
+  }
+  let re_hex = bytes_to_hex(&dec_bytes);
+  if re_hex != hex_str {
+    return false;
+  }
+
+  // 不正な hex（奇数長）
+  let odd_hex = "8aec4";
+  match hex_to_bytes(&odd_hex) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 不正な hex（非 hex 文字）
+  let bad_hex = "8aec4z";
+  match hex_to_bytes(&bad_hex) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

@@ -1,0 +1,231 @@
+module git.validate
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.limits.max_path_component_len;
+use git.limits.max_path_depth;
+use git.limits.max_path_total_len;
+use git.limits.max_ref_name_len;
+
+fn to_lower_byte(c: Int) -> Int
+  intent "ASCII 文字を小文字にする"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 65 && c <= 90 {
+    return c + 32;
+  }
+  return c;
+}
+
+pub fn is_git_dir_or_variant(bytes: &Bytes) -> Bool
+  intent "パス構成要素が大文字小文字を問わず .git またはその変種（末尾ドット・空白、NTFS 短い名前 git~1 等）か検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let len = bytes.len();
+  if len < 4 {
+    return false;
+  }
+
+  // 1. .git (4文字)
+  let c0 = bytes.get(0).unwrap_or(0);
+  let c1 = to_lower_byte(bytes.get(1).unwrap_or(0));
+  let c2 = to_lower_byte(bytes.get(2).unwrap_or(0));
+  let c3 = to_lower_byte(bytes.get(3).unwrap_or(0));
+
+  if c0 == 46 && c1 == 103 && c2 == 105 && c3 == 116 {
+    if len == 4 {
+      return true;
+    }
+    // 末尾のドットや空白 (.git., .git )
+    let c4 = bytes.get(4).unwrap_or(0);
+    if c4 == 46 || c4 == 32 {
+      return true;
+    }
+  }
+
+  // 2. NTFS 短い名前: git~1, git~2 など (5文字以上)
+  if len >= 5 {
+    let g0 = to_lower_byte(bytes.get(0).unwrap_or(0));
+    let g1 = to_lower_byte(bytes.get(1).unwrap_or(0));
+    let g2 = to_lower_byte(bytes.get(2).unwrap_or(0));
+    let g3 = bytes.get(3).unwrap_or(0);
+    if g0 == 103 && g1 == 105 && g2 == 116 && g3 == 126 {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+pub fn validate_path(path: &String) -> Result<Bool, GitError>
+  intent "ADR 0047 決定4 に従い、パスの安全性を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let pb = path.as_bytes();
+  let total_len = pb.len();
+  if total_len == 0 {
+    return Err(GitError.InvalidPath("path cannot be empty"));
+  }
+  if total_len > max_path_total_len() {
+    return Err(GitError.LimitExceeded("path total length exceeds 4096 limit"));
+  }
+
+  // 絶対パス禁止
+  if pb.get(0).unwrap_or(0) == 47 {
+    return Err(GitError.InvalidPath("absolute path is not allowed"));
+  }
+
+  // バックスラッシュまたは NUL 禁止
+  let mut i = 0;
+  while i < total_len {
+    let b = pb.get(i).unwrap_or(0);
+    if b == 92 {
+      return Err(GitError.InvalidPath("path cannot contain backslash"));
+    }
+    if b == 0 {
+      return Err(GitError.InvalidPath("path cannot contain null byte"));
+    }
+    i = i + 1;
+  }
+
+  // 各構成要素（/ 区切り）の検査
+  let mut depth = 0;
+  let mut comp_start = 0;
+  i = 0;
+
+  while i <= total_len {
+    let at_end = i == total_len;
+    let is_slash = match at_end {
+      true => false,
+      false => pb.get(i).unwrap_or(0) == 47,
+    };
+
+    if at_end || is_slash {
+      let comp_len = i - comp_start;
+      if comp_len == 0 {
+        return Err(GitError.InvalidPath("path contains empty component or trailing slash"));
+      }
+      if comp_len > max_path_component_len() {
+        return Err(GitError.LimitExceeded("path component length exceeds 255 limit"));
+      }
+
+      let comp_bytes = pb.slice(comp_start, i).unwrap_or(Bytes.new());
+      if comp_len == 1 && comp_bytes.get(0).unwrap_or(0) == 46 {
+        return Err(GitError.InvalidPath("path component cannot be ."));
+      }
+      if comp_len == 2 && comp_bytes.get(0).unwrap_or(0) == 46 && comp_bytes.get(1).unwrap_or(0) == 46 {
+        return Err(GitError.InvalidPath("path component cannot be .."));
+      }
+      if is_git_dir_or_variant(&comp_bytes) {
+        return Err(GitError.InvalidPath("path component cannot be .git or variant"));
+      }
+
+      depth = depth + 1;
+      if depth > max_path_depth() {
+        return Err(GitError.LimitExceeded("path depth exceeds 128 limit"));
+      }
+
+      comp_start = i + 1;
+    }
+    i = i + 1;
+  }
+
+  return Ok(true);
+}
+
+pub fn validate_ref_name(ref_name: &String) -> Result<Bool, GitError>
+  intent "Git の check-ref-format 規則に従い参照名を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let rb = ref_name.as_bytes();
+  let len = rb.len();
+  if len == 0 {
+    return Err(GitError.InvalidRefName("ref name cannot be empty"));
+  }
+  if len > max_ref_name_len() {
+    return Err(GitError.LimitExceeded("ref name length exceeds 1024 limit"));
+  }
+
+  // 先頭または末尾が / 禁止
+  if rb.get(0).unwrap_or(0) == 47 || rb.get(len - 1).unwrap_or(0) == 47 {
+    return Err(GitError.InvalidRefName("ref name cannot begin or end with slash"));
+  }
+
+  let mut i = 0;
+  while i < len {
+    let b = rb.get(i).unwrap_or(0);
+    // 制御文字 (ASCII < 32 または 127) 禁止
+    if b < 32 || b == 127 {
+      return Err(GitError.InvalidRefName("ref name cannot contain control characters"));
+    }
+    // 空白、~, ^, :, ?, *, [, \ 禁止
+    if b == 32 || b == 126 || b == 94 || b == 58 || b == 63 || b == 42 || b == 91 || b == 92 {
+      return Err(GitError.InvalidRefName("ref name contains invalid character"));
+    }
+    // 連続する / (//)
+    if b == 47 && i + 1 < len && rb.get(i + 1).unwrap_or(0) == 47 {
+      return Err(GitError.InvalidRefName("ref name cannot contain consecutive slashes"));
+    }
+    // .. 禁止
+    if b == 46 && i + 1 < len && rb.get(i + 1).unwrap_or(0) == 46 {
+      return Err(GitError.InvalidRefName("ref name cannot contain .."));
+    }
+    // @{ 禁止
+    if b == 64 && i + 1 < len && rb.get(i + 1).unwrap_or(0) == 123 {
+      return Err(GitError.InvalidRefName("ref name cannot contain @{"));
+    }
+    i = i + 1;
+  }
+
+  // 各構成要素（/ 区切り）の検査
+  let mut comp_start = 0;
+  i = 0;
+  while i <= len {
+    let at_end = i == len;
+    let is_slash = match at_end {
+      true => false,
+      false => rb.get(i).unwrap_or(0) == 47,
+    };
+
+    if at_end || is_slash {
+      let comp_len = i - comp_start;
+      let comp_bytes = rb.slice(comp_start, i).unwrap_or(Bytes.new());
+
+      // . で始まる構成要素禁止
+      if comp_bytes.get(0).unwrap_or(0) == 46 {
+        return Err(GitError.InvalidRefName("ref name component cannot begin with dot"));
+      }
+
+      // 末尾が .lock で終わる構成要素禁止
+      if comp_len >= 5 {
+        let l0 = comp_bytes.get(comp_len - 5).unwrap_or(0);
+        let l1 = comp_bytes.get(comp_len - 4).unwrap_or(0);
+        let l2 = comp_bytes.get(comp_len - 3).unwrap_or(0);
+        let l3 = comp_bytes.get(comp_len - 2).unwrap_or(0);
+        let l4 = comp_bytes.get(comp_len - 1).unwrap_or(0);
+        if l0 == 46 && l1 == 108 && l2 == 111 && l3 == 99 && l4 == 107 {
+          return Err(GitError.InvalidRefName("ref name component cannot end with .lock"));
+        }
+      }
+
+      // @ 単体の構成要素禁止
+      if comp_len == 1 && comp_bytes.get(0).unwrap_or(0) == 64 {
+        return Err(GitError.InvalidRefName("ref name component cannot be @ alone"));
+      }
+
+      comp_start = i + 1;
+    }
+    i = i + 1;
+  }
+
+  return Ok(true);
+}

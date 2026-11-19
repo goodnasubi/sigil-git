@@ -1,0 +1,180 @@
+module tests.test_tree
+  targets server
+  trust none
+
+use git.error.is_corrupt;
+use git.hash.hex_to_bytes;
+use git.tree.compare_tree_entries;
+use git.tree.decode_tree;
+use git.tree.encode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.tree.entry_name;
+use git.tree.new_tree_entry;
+
+pub fn run_tree_tests() -> Bool
+  intent "git.tree の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let dummy_id1 = hex_to_bytes(&"1111111111111111111111111111111111111111111111111111111111111111").unwrap_or(Bytes.new());
+  let dummy_id2 = hex_to_bytes(&"2222222222222222222222222222222222222222222222222222222222222222").unwrap_or(Bytes.new());
+  let dummy_id3 = hex_to_bytes(&"3333333333333333333333333333333333333333333333333333333333333333").unwrap_or(Bytes.new());
+
+  // 1. 並び順比較規則（ディレクトリ末尾スラッシュ比較）
+  // 'a' (dir) vs 'a.txt' (file) -> 'a/' (0x2F=47) vs 'a.' (0x2E=46) -> a.txt が先 (-1)
+  let a_dir = "a";
+  let a_file = "a.txt";
+  let cmp_file_dir = compare_tree_entries(&a_file, 100644, &a_dir, 40000);
+  if cmp_file_dir != 0 - 1 {
+    return false;
+  }
+  let cmp_dir_file = compare_tree_entries(&a_dir, 40000, &a_file, 100644);
+  if cmp_dir_file != 1 {
+    return false;
+  }
+  let cmp_same = compare_tree_entries(&a_dir, 40000, &a_dir, 40000);
+  if cmp_same != 0 {
+    return false;
+  }
+
+  // 2. 正常系: tree のエンコードとデコードの往復
+  let mut entries = List.new();
+  entries.push(new_tree_entry(100644, "a.txt", dummy_id1.clone()));
+  entries.push(new_tree_entry(40000, "a", dummy_id2.clone()));
+  entries.push(new_tree_entry(100755, "run.sh", dummy_id3.clone()));
+
+  let mut encoded = Bytes.new();
+  match encode_tree(&entries) {
+    Ok(b) => {
+      encoded = b;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let mut decoded = List.new();
+  match decode_tree(&encoded) {
+    Ok(list) => {
+      decoded = list;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if decoded.len() != 3 {
+    return false;
+  }
+
+  match decoded.get(0) {
+    Some(e) => {
+      let eid = entry_id(&e);
+      if entry_mode(&e) != 100644 || entry_name(&e) != "a.txt" || !ct_eq(&eid, &dummy_id1) {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  match decoded.get(1) {
+    Some(e) => {
+      let eid = entry_id(&e);
+      if entry_mode(&e) != 40000 || entry_name(&e) != "a" || !ct_eq(&eid, &dummy_id2) {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  match decoded.get(2) {
+    Some(e) => {
+      let eid = entry_id(&e);
+      if entry_mode(&e) != 100755 || entry_name(&e) != "run.sh" || !ct_eq(&eid, &dummy_id3) {
+        return false;
+      }
+    }
+    None => {
+      return false;
+    }
+  }
+
+  // 3. 異常系: 重複エントリ
+  let mut dup_entries = List.new();
+  dup_entries.push(new_tree_entry(100644, "foo.txt", dummy_id1.clone()));
+  dup_entries.push(new_tree_entry(100644, "foo.txt", dummy_id2.clone()));
+  match encode_tree(&dup_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 4. 異常系: 順序不整合（ソートされていない）
+  let mut unsorted_entries = List.new();
+  unsorted_entries.push(new_tree_entry(100755, "z.sh", dummy_id1.clone()));
+  unsorted_entries.push(new_tree_entry(100644, "a.txt", dummy_id2.clone()));
+  match encode_tree(&unsorted_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 5. 異常系: 不正な名前 (.git)
+  let mut git_entries = List.new();
+  git_entries.push(new_tree_entry(40000, ".git", dummy_id1.clone()));
+  match encode_tree(&git_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 6. 異常系: 不正な名前 (..)
+  let mut dotdot_entries = List.new();
+  dotdot_entries.push(new_tree_entry(40000, "..", dummy_id1.clone()));
+  match encode_tree(&dotdot_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 7. 異常系: 不正なモード (100666)
+  let mut bad_mode_entries = List.new();
+  bad_mode_entries.push(new_tree_entry(100666, "file.txt", dummy_id1.clone()));
+  match encode_tree(&bad_mode_entries) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

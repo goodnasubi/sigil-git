@@ -1,0 +1,61 @@
+module tests.test_limits
+  targets server
+  trust none
+
+use git.limits.max_commit_header_total_size;
+use git.limits.max_commit_headers;
+use git.limits.max_commit_message_size;
+use git.limits.max_commit_parents;
+use git.limits.max_object_size;
+use git.limits.max_path_component_len;
+use git.limits.max_path_depth;
+use git.limits.max_path_total_len;
+use git.limits.max_ref_name_len;
+use git.limits.max_tag_message_size;
+use git.limits.max_tree_entries;
+use git.limits.max_tree_size;
+
+pub fn run_limits_tests() -> Bool
+  intent "git.limits の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if max_object_size() != 67108864 {
+    return false;
+  }
+  if max_tree_entries() != 100000 {
+    return false;
+  }
+  if max_tree_size() != 16777216 {
+    return false;
+  }
+  if max_path_total_len() != 4096 {
+    return false;
+  }
+  if max_path_component_len() != 255 {
+    return false;
+  }
+  if max_path_depth() != 128 {
+    return false;
+  }
+  if max_commit_parents() != 16 {
+    return false;
+  }
+  if max_commit_headers() != 1024 {
+    return false;
+  }
+  if max_commit_header_total_size() != 65536 {
+    return false;
+  }
+  if max_commit_message_size() != 1048576 {
+    return false;
+  }
+  if max_ref_name_len() != 1024 {
+    return false;
+  }
+  if max_tag_message_size() != 1048576 {
+    return false;
+  }
+  return true;
+}

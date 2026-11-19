@@ -1,0 +1,169 @@
+module tests.test_commit
+  targets server
+  trust none
+
+use git.commit.commit_author;
+use git.commit.commit_committer;
+use git.commit.commit_headers;
+use git.commit.commit_message;
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.commit.encode_commit;
+use git.commit.header_key;
+use git.commit.header_value;
+use git.commit.new_commit_header;
+use git.commit.new_commit_object;
+use git.error.is_corrupt;
+use git.error.is_limit_exceeded;
+
+pub fn run_commit_tests() -> Bool
+  intent "git.commit の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let tree_hex = "24e507f796ca749ec90765f4a9675aa932ad7aa7ef83662e65c24f10f07ff731";
+  let parent1_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+  let parent2_hex = "2222222222222222222222222222222222222222222222222222222222222222";
+
+  // 1. 正常系: マージコミット（2つの親）と追加ヘッダ（gpgsig 複数行）
+  let mut parents = List.new();
+  parents.push(parent1_hex.clone());
+  parents.push(parent2_hex.clone());
+
+  let mut extra_headers = List.new();
+  let gpg_sig = "-----BEGIN PGP SIGNATURE-----\n iQIzBAABCAAdFiEE...\n -----END PGP SIGNATURE-----";
+  extra_headers.push(new_commit_header("gpgsig", gpg_sig.clone()));
+
+  let orig_commit = new_commit_object(tree_hex.clone(), parents, "Author Name <author@example.com> 1700000000 +0000", "Committer Name <committer@example.com> 1700000000 +0000", extra_headers, "Merge branch 'feature'\n\nDetailed merge description.\n");
+
+  let encoded = match encode_commit(&orig_commit) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if encoded.len() == 0 {
+    return false;
+  }
+
+  match decode_commit(&encoded) {
+    Ok(decoded) => {
+      if commit_tree_id(&decoded) != tree_hex {
+        return false;
+      }
+      let dec_parents = commit_parents(&decoded);
+      if dec_parents.len() != 2 {
+        return false;
+      }
+      if commit_author(&decoded) != "Author Name <author@example.com> 1700000000 +0000" {
+        return false;
+      }
+      if commit_committer(&decoded) != "Committer Name <committer@example.com> 1700000000 +0000" {
+        return false;
+      }
+      if commit_message(&decoded) != "Merge branch 'feature'\n\nDetailed merge description.\n" {
+        return false;
+      }
+
+      let dec_headers = commit_headers(&decoded);
+      if dec_headers.len() != 1 {
+        return false;
+      }
+      match dec_headers.get(0) {
+        Some(hdr) => {
+          if header_key(&hdr) != "gpgsig" || header_value(&hdr) != gpg_sig {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 正常系: ルートコミット（親なし）
+  let empty_parents = List.new();
+  let empty_headers = List.new();
+  let root_commit = new_commit_object(tree_hex.clone(), empty_parents, "Author <a@b.c> 1000 +0000", "Committer <a@b.c> 1000 +0000", empty_headers, "Initial commit\n");
+  let root_encoded = match encode_commit(&root_commit) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if root_encoded.len() == 0 {
+    return false;
+  }
+  match decode_commit(&root_encoded) {
+    Ok(root_decoded) => {
+      if commit_parents(&root_decoded).len() != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 正常系境界値: 親 16 個
+  let mut p16 = List.new();
+  let mut i = 0;
+  while i < 16 {
+    p16.push(parent1_hex.clone());
+    i = i + 1;
+  }
+  let c16 = new_commit_object(tree_hex.clone(), p16, "A <a@b.c> 0 +0000", "C <a@b.c> 0 +0000", List.new(), "16 parents\n");
+  let enc16 = match encode_commit(&c16) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if enc16.len() == 0 {
+    return false;
+  }
+  match decode_commit(&enc16) {
+    Ok(dec16) => {
+      if commit_parents(&dec16).len() != 16 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. 異常系: 親 17 個で上限超過 (max_commit_parents = 16)
+  let mut p17 = List.new();
+  i = 0;
+  while i < 17 {
+    p17.push(parent1_hex.clone());
+    i = i + 1;
+  }
+  let c17 = new_commit_object(tree_hex.clone(), p17, "A <a@b.c> 0 +0000", "C <a@b.c> 0 +0000", List.new(), "17 parents\n");
+  match encode_commit(&c17) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_limit_exceeded(&err) {
+        return false;
+      }
+    }
+  }
+
+  // 5. 異常系: tree なし
+  let mut bad_content = "author Author <a@b.c> 0 +0000\ncommitter Committer <a@b.c> 0 +0000\n\nno tree\n".as_bytes();
+  match decode_commit(&bad_content) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

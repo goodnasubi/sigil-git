@@ -1,0 +1,148 @@
+module git.hash
+  targets server
+  trust none
+
+use git.error.GitError;
+
+// 整数を 10 進文字列に変換
+pub fn int_to_str(n: Int) -> String
+  intent "非負整数を 10 進文字列に変換する"
+  requires n >= 0
+  ensures none
+  effects none
+{
+  if n == 0 {
+    return "0";
+  }
+  let mut val = 0 - n;
+  let mut digits = Bytes.new();
+  while val < 0 {
+    let d = val % 10;
+    digits.push(48 - d);
+    val = val / 10;
+  }
+  let mut res = Bytes.new();
+  let mut i = digits.len() - 1;
+  while i >= 0 {
+    res.push(digits.get(i).unwrap_or(48));
+    i = i - 1;
+  }
+  return res.to_string_utf8().unwrap_or("0");
+}
+
+fn hex_char(v: Int) -> Int
+  intent "0..15 の数値を小文字 hex の ASCII コードに変換する"
+  requires v >= 0 && v < 16
+  ensures none
+  effects none
+{
+  if v < 10 {
+    return 48 + v;
+  }
+  return 97 + (v - 10);
+}
+
+fn parse_hex_digit(c: Int) -> Result<Int, GitError>
+  intent "ASCII hex 文字を数値 (0..15) に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return Ok(c - 48);
+  }
+  if c >= 97 && c <= 102 {
+    return Ok(c - 87);
+  }
+  if c >= 65 && c <= 70 {
+    return Ok(c - 55);
+  }
+  return Err(GitError.Corrupt("invalid hex digit"));
+}
+
+pub fn bytes_to_hex(b: &Bytes) -> String
+  intent "バイト列を小文字の 16 進文字列に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut res = Bytes.new();
+  let mut i = 0;
+  let len = b.len();
+  while i < len {
+    let byte = b.get(i).unwrap_or(0);
+    let hi = byte / 16 % 16;
+    let lo = byte % 16;
+    res.push(hex_char(hi));
+    res.push(hex_char(lo));
+    i = i + 1;
+  }
+  return res.to_string_utf8().unwrap_or("");
+}
+
+pub fn hex_to_bytes(s: &String) -> Result<Bytes, GitError>
+  intent "16 進文字列をバイト列に復号する"
+  requires none
+  ensures none
+  effects none
+{
+  let sb = s.as_bytes();
+  let len = sb.len();
+  if len % 2 != 0 {
+    return Err(GitError.Corrupt("hex string length must be even"));
+  }
+  let mut res = Bytes.new();
+  let mut i = 0;
+  while i < len {
+    let c1 = sb.get(i).unwrap_or(0);
+    let c2 = sb.get(i + 1).unwrap_or(0);
+    let hi = parse_hex_digit(c1)?;
+    let lo = parse_hex_digit(c2)?;
+    res.push(hi * 16 + lo);
+    i = i + 2;
+  }
+  return Ok(res);
+}
+
+pub fn compute_sha256(data: &Bytes) -> Bytes
+  intent "データ全体の SHA-256 ダイジェスト (32 バイト) を計算する"
+  requires none
+  ensures result.len() == 32
+  effects none
+{
+  return sha256(&data);
+}
+
+pub fn format_object_header(type_name: &String, content_len: Int) -> Bytes
+  intent "オブジェクトヘッダ (<型> <長さ>\\0) を生成する"
+  requires content_len >= 0
+  ensures none
+  effects none
+{
+  let mut hdr = type_name.as_bytes();
+  hdr.push(32);  // ' '
+  let len_str = int_to_str(content_len);
+  hdr.extend(&len_str.as_bytes());
+  hdr.push(0);  // '\0'
+  return hdr;
+}
+
+pub fn compute_object_id(type_name: &String, content: &Bytes) -> Bytes
+  intent "オブジェクトの型と内容から Git SHA-256 識別子 (32 バイト) を計算する"
+  requires none
+  ensures result.len() == 32
+  effects none
+{
+  let mut full = format_object_header(&type_name, content.len());
+  full.extend(&content);
+  return compute_sha256(&full);
+}
+
+pub fn compute_raw_object_id(raw_data: &Bytes) -> Bytes
+  intent "ヘッダ付き生オブジェクトバイト列全体の SHA-256 識別子を計算する"
+  requires none
+  ensures result.len() == 32
+  effects none
+{
+  return compute_sha256(&raw_data);
+}

@@ -1,0 +1,118 @@
+module git.error
+  targets server
+  trust none
+
+// ADR 0047 決定 1・4・5: リポジトリの核の構造化エラー
+
+pub enum GitError {
+  LimitExceeded(String),
+  Corrupt(String),
+  UnsupportedFormat(String),
+  InvalidPath(String),
+  InvalidRefName(String),
+  TypeMismatch(String),
+}
+
+pub fn error_kind_name(err: &GitError) -> String
+  intent "エラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.LimitExceeded(_) => "LimitExceeded",
+    GitError.Corrupt(_) => "Corrupt",
+    GitError.UnsupportedFormat(_) => "UnsupportedFormat",
+    GitError.InvalidPath(_) => "InvalidPath",
+    GitError.InvalidRefName(_) => "InvalidRefName",
+    GitError.TypeMismatch(_) => "TypeMismatch",
+  };
+}
+
+pub fn error_message(err: &GitError) -> String
+  intent "エラーメッセージを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.LimitExceeded(msg) => msg.clone(),
+    GitError.Corrupt(msg) => msg.clone(),
+    GitError.UnsupportedFormat(msg) => msg.clone(),
+    GitError.InvalidPath(msg) => msg.clone(),
+    GitError.InvalidRefName(msg) => msg.clone(),
+    GitError.TypeMismatch(msg) => msg.clone(),
+  };
+}
+
+pub fn is_limit_exceeded(err: &GitError) -> Bool
+  intent "LimitExceeded エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.LimitExceeded(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_corrupt(err: &GitError) -> Bool
+  intent "Corrupt エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.Corrupt(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_unsupported_format(err: &GitError) -> Bool
+  intent "UnsupportedFormat エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.UnsupportedFormat(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_invalid_path(err: &GitError) -> Bool
+  intent "InvalidPath エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.InvalidPath(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_invalid_ref_name(err: &GitError) -> Bool
+  intent "InvalidRefName エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.InvalidRefName(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_type_mismatch(err: &GitError) -> Bool
+  intent "TypeMismatch エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.TypeMismatch(_) => true,
+    _ => false,
+  };
+}

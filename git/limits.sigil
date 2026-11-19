@@ -1,0 +1,113 @@
+module git.limits
+  targets server
+  trust none
+
+// ADR 0047 決定 5: 初版の上限
+
+pub fn max_object_size() -> Int
+  intent "1 オブジェクトの展開後の最大サイズ (64 MiB = 67108864 byte) を返す"
+  requires none
+  ensures result == 67108864
+  effects none
+{
+  return 67108864;
+}
+
+pub fn max_tree_entries() -> Int
+  intent "tree のエントリ数の上限 (100,000) を返す"
+  requires none
+  ensures result == 100000
+  effects none
+{
+  return 100000;
+}
+
+pub fn max_tree_size() -> Int
+  intent "1 つの tree の符号化サイズの最大値 (16 MiB = 16777216 byte) を返す"
+  requires none
+  ensures result == 16777216
+  effects none
+{
+  return 16777216;
+}
+
+pub fn max_path_total_len() -> Int
+  intent "パス全長の最大値 (4096 byte) を返す"
+  requires none
+  ensures result == 4096
+  effects none
+{
+  return 4096;
+}
+
+pub fn max_path_component_len() -> Int
+  intent "パス構成要素の長さの最大値 (255 byte) を返す"
+  requires none
+  ensures result == 255
+  effects none
+{
+  return 255;
+}
+
+pub fn max_path_depth() -> Int
+  intent "パス階層の深さの最大値 (128) を返す"
+  requires none
+  ensures result == 128
+  effects none
+{
+  return 128;
+}
+
+pub fn max_commit_parents() -> Int
+  intent "commit の親の数の最大値 (16) を返す"
+  requires none
+  ensures result == 16
+  effects none
+{
+  return 16;
+}
+
+pub fn max_commit_headers() -> Int
+  intent "commit ヘッダの数の最大値 (1024) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+pub fn max_commit_header_total_size() -> Int
+  intent "commit ヘッダの合計サイズの最大値 (64 KiB = 65536 byte) を返す"
+  requires none
+  ensures result == 65536
+  effects none
+{
+  return 65536;
+}
+
+pub fn max_commit_message_size() -> Int
+  intent "commit メッセージの大きさの最大値 (1 MiB = 1048576 byte) を返す"
+  requires none
+  ensures result == 1048576
+  effects none
+{
+  return 1048576;
+}
+
+pub fn max_ref_name_len() -> Int
+  intent "参照名の長さの最大値 (1024 byte) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+pub fn max_tag_message_size() -> Int
+  intent "tag メッセージの大きさの最大値 (1 MiB = 1048576 byte) を返す"
+  requires none
+  ensures result == 1048576
+  effects none
+{
+  return 1048576;
+}

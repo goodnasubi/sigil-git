@@ -1,0 +1,91 @@
+module tests.test_tag
+  targets server
+  trust none
+
+use git.error.is_corrupt;
+use git.tag.decode_tag;
+use git.tag.encode_tag;
+use git.tag.new_tag_object;
+use git.tag.tag_message;
+use git.tag.tag_name;
+use git.tag.tag_object_id;
+use git.tag.tag_object_type;
+use git.tag.tag_tagger;
+
+pub fn run_tag_tests() -> Bool
+  intent "git.tag の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let target_id = "448bf96a514b23d784025acda317aa47d7563c3eea79dc68d11db1097e4a758b";
+
+  // 1. 正常系: tagger ありの tag
+  let tag1 = new_tag_object(target_id.clone(), "commit", "v1.0", "Tagger Name <tagger@example.com> 1700000000 +0000", "Release version 1.0\n");
+
+  let enc1 = match encode_tag(&tag1) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if enc1.len() == 0 {
+    return false;
+  }
+
+  match decode_tag(&enc1) {
+    Ok(dec1) => {
+      if tag_object_id(&dec1) != target_id {
+        return false;
+      }
+      if tag_object_type(&dec1) != "commit" {
+        return false;
+      }
+      if tag_name(&dec1) != "v1.0" {
+        return false;
+      }
+      if tag_tagger(&dec1) != "Tagger Name <tagger@example.com> 1700000000 +0000" {
+        return false;
+      }
+      if tag_message(&dec1) != "Release version 1.0\n" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 正常系: tagger なしの tag
+  let tag2 = new_tag_object(target_id.clone(), "commit", "v0.1-light", "", "Lightweight annotated tag\n");
+  let enc2 = match encode_tag(&tag2) {
+    Ok(b) => b,
+    Err(_) => Bytes.new(),
+  };
+  if enc2.len() == 0 {
+    return false;
+  }
+  match decode_tag(&enc2) {
+    Ok(dec2) => {
+      if tag_name(&dec2) != "v0.1-light" || tag_tagger(&dec2) != "" {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. 異常系: object 欠落
+  let bad_tag = "type commit\ntag v1.0\n\nmessage\n".as_bytes();
+  match decode_tag(&bad_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      if !is_corrupt(&err) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

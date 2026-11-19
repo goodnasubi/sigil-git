@@ -1,0 +1,371 @@
+module git.commit
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.limits.max_commit_header_total_size;
+use git.limits.max_commit_headers;
+use git.limits.max_commit_message_size;
+use git.limits.max_commit_parents;
+
+pub struct CommitHeader {
+  key: String,
+  value: String,
+}
+
+pub fn new_commit_header(key: String, value: String) -> CommitHeader
+  intent "CommitHeader を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return CommitHeader { key: key, value: value };
+}
+
+pub fn header_key(h: &CommitHeader) -> String
+  intent "CommitHeader のキーを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return h.key.clone();
+}
+
+pub fn header_value(h: &CommitHeader) -> String
+  intent "CommitHeader の値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return h.value.clone();
+}
+
+pub struct CommitObject {
+  tree_id: String,
+  parents: List<String>,
+  author: String,
+  committer: String,
+  headers: List<CommitHeader>,
+  message: String,
+}
+
+pub fn new_commit_object(tree_id: String, parents: List<String>, author: String, committer: String, headers: List<CommitHeader>, message: String) -> CommitObject
+  intent "CommitObject を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return CommitObject { tree_id: tree_id, parents: parents, author: author, committer: committer, headers: headers, message: message };
+}
+
+pub fn commit_tree_id(c: &CommitObject) -> String
+  intent "CommitObject の tree_id を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.tree_id.clone();
+}
+
+pub fn commit_parents(c: &CommitObject) -> List<String>
+  intent "CommitObject の parents を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.parents.clone();
+}
+
+pub fn commit_author(c: &CommitObject) -> String
+  intent "CommitObject の author を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.author.clone();
+}
+
+pub fn commit_committer(c: &CommitObject) -> String
+  intent "CommitObject の committer を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.committer.clone();
+}
+
+pub fn commit_headers(c: &CommitObject) -> List<CommitHeader>
+  intent "CommitObject の追加ヘッダ一覧を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.headers.clone();
+}
+
+pub fn commit_message(c: &CommitObject) -> String
+  intent "CommitObject のメッセージを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.message.clone();
+}
+
+fn str_concat(a: &String, b: &String) -> String
+  intent "2つの文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.new();
+  let ba = a.as_bytes();
+  let bb = b.as_bytes();
+  let mut i = 0;
+  while i < ba.len() {
+    bytes.push(ba.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  let mut j = 0;
+  while j < bb.len() {
+    bytes.push(bb.get(j).unwrap_or(0));
+    j = j + 1;
+  }
+  return bytes.to_string_utf8().unwrap_or(a.clone());
+}
+
+pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
+  intent "commit オブジェクトの内容バイト列を解析する"
+  requires none
+  ensures none
+  effects none
+{
+  let total_len = content.len();
+  let mut tree_id = "";
+  let mut parents = List.new();
+  let mut author = "";
+  let mut committer = "";
+  let mut headers = List.new();
+
+  let mut pos = 0;
+  let mut in_header = true;
+  let mut header_count = 0;
+  let mut header_bytes_total = 0;
+
+  let mut has_cur = false;
+  let mut cur_key = "";
+  let mut cur_val = "";
+
+  while pos < total_len && in_header {
+    // 次の改行を探す
+    let mut nl_pos = 0 - 1;
+    let mut i = pos;
+    while i < total_len && nl_pos < 0 {
+      if content.get(i).unwrap_or(0) == 10 {
+        nl_pos = i;
+      }
+      i = i + 1;
+    }
+
+    let line_end = match nl_pos >= 0 {
+      true => nl_pos,
+      false => total_len,
+    };
+    let line_len = line_end - pos;
+
+    // 空行ならヘッダ部終了
+    if line_len == 0 {
+      in_header = false;
+      pos = line_end + 1;
+    } else {
+      header_bytes_total = header_bytes_total + line_len + 1;
+      if header_bytes_total > max_commit_header_total_size() {
+        return Err(GitError.LimitExceeded("commit headers total size exceeds 64 KiB limit"));
+      }
+
+      let first_byte = content.get(pos).unwrap_or(0);
+      if first_byte == 32 {
+        // 先頭スペース: 前のヘッダの継続行
+        if !has_cur {
+          return Err(GitError.Corrupt("invalid continuation line in commit headers"));
+        }
+        let cont_slice = content.slice(pos, line_end).unwrap_or(Bytes.new());
+        let cont_str = cont_slice.to_string_utf8().unwrap_or("");
+        let nl = "\n";
+        let with_nl = str_concat(&cur_val, &nl);
+        cur_val = str_concat(&with_nl, &cont_str);
+      } else {
+        // 前のヘッダを確定
+        if has_cur {
+          header_count = header_count + 1;
+          if header_count > max_commit_headers() {
+            return Err(GitError.LimitExceeded("commit header count exceeds 1024 limit"));
+          }
+          if cur_key == "tree" {
+            tree_id = cur_val;
+          } else if cur_key == "parent" {
+            parents.push(cur_val);
+            if parents.len() > max_commit_parents() {
+              return Err(GitError.LimitExceeded("commit parent count exceeds 16 limit"));
+            }
+          } else if cur_key == "author" {
+            author = cur_val;
+          } else if cur_key == "committer" {
+            committer = cur_val;
+          } else {
+            headers.push(new_commit_header(cur_key, cur_val));
+          }
+        }
+
+        // 新しいヘッダ行をパース
+        let mut sp_pos = 0 - 1;
+        let mut j = pos;
+        while j < line_end && sp_pos < 0 {
+          if content.get(j).unwrap_or(0) == 32 {
+            sp_pos = j;
+          }
+          j = j + 1;
+        }
+        if sp_pos <= pos {
+          return Err(GitError.Corrupt("invalid commit header format: missing space between key and value"));
+        }
+
+        let key_bytes = content.slice(pos, sp_pos).unwrap_or(Bytes.new());
+        let val_bytes = content.slice(sp_pos + 1, line_end).unwrap_or(Bytes.new());
+        cur_key = key_bytes.to_string_utf8().unwrap_or("");
+        cur_val = val_bytes.to_string_utf8().unwrap_or("");
+        has_cur = true;
+      }
+
+      if nl_pos >= 0 {
+        pos = nl_pos + 1;
+      } else {
+        pos = total_len;
+      }
+    }
+  }
+
+  // 最後に残ったヘッダを確定
+  if has_cur {
+    header_count = header_count + 1;
+    if header_count > max_commit_headers() {
+      return Err(GitError.LimitExceeded("commit header count exceeds 1024 limit"));
+    }
+    if cur_key == "tree" {
+      tree_id = cur_val;
+    } else if cur_key == "parent" {
+      parents.push(cur_val);
+      if parents.len() > max_commit_parents() {
+        return Err(GitError.LimitExceeded("commit parent count exceeds 16 limit"));
+      }
+    } else if cur_key == "author" {
+      author = cur_val;
+    } else if cur_key == "committer" {
+      committer = cur_val;
+    } else {
+      headers.push(new_commit_header(cur_key, cur_val));
+    }
+  }
+
+  if tree_id == "" {
+    return Err(GitError.Corrupt("missing tree in commit object"));
+  }
+
+  // メッセージ部
+  let msg_len = total_len - pos;
+  if msg_len > max_commit_message_size() {
+    return Err(GitError.LimitExceeded("commit message size exceeds 1 MiB limit"));
+  }
+  let msg_bytes = content.slice(pos, total_len).unwrap_or(Bytes.new());
+  let message = msg_bytes.to_string_utf8().unwrap_or("");
+
+  return Ok(new_commit_object(tree_id, parents, author, committer, headers, message));
+}
+
+pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
+  intent "CommitObject をバイト列に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let tree = commit_tree_id(&commit);
+  if tree == "" {
+    return Err(GitError.Corrupt("commit object must have tree"));
+  }
+
+  let mut buf = Bytes.new();
+
+  // tree
+  buf.extend(&"tree ".as_bytes());
+  buf.extend(&tree.as_bytes());
+  buf.push(10);  // '\n'
+
+  // parents
+  let parents = commit_parents(&commit);
+  if parents.len() > max_commit_parents() {
+    return Err(GitError.LimitExceeded("commit parent count exceeds 16 limit"));
+  }
+  let mut i = 0;
+  while i < parents.len() {
+    match parents.get(i) {
+      Some(p) => {
+        buf.extend(&"parent ".as_bytes());
+        buf.extend(&p.as_bytes());
+        buf.push(10);  // '\n'
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // author
+  let author = commit_author(&commit);
+  buf.extend(&"author ".as_bytes());
+  buf.extend(&author.as_bytes());
+  buf.push(10);  // '\n'
+
+  // committer
+  let committer = commit_committer(&commit);
+  buf.extend(&"committer ".as_bytes());
+  buf.extend(&committer.as_bytes());
+  buf.push(10);  // '\n'
+
+  // headers
+  let headers = commit_headers(&commit);
+  if headers.len() > max_commit_headers() {
+    return Err(GitError.LimitExceeded("commit header count exceeds 1024 limit"));
+  }
+  i = 0;
+  while i < headers.len() {
+    match headers.get(i) {
+      Some(hdr) => {
+        let k = header_key(&hdr);
+        let v = header_value(&hdr);
+        buf.extend(&k.as_bytes());
+        buf.push(32);  // ' '
+        buf.extend(&v.as_bytes());
+        buf.push(10);  // '\n'
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // ヘッダサイズ検査
+  if buf.len() > max_commit_header_total_size() {
+    return Err(GitError.LimitExceeded("commit header total size exceeds 64 KiB limit"));
+  }
+
+  // 空行
+  buf.push(10);  // '\n'
+
+  // message
+  let msg = commit_message(&commit);
+  let msg_bytes = msg.as_bytes();
+  if msg_bytes.len() > max_commit_message_size() {
+    return Err(GitError.LimitExceeded("commit message size exceeds 1 MiB limit"));
+  }
+  buf.extend(&msg_bytes);
+
+  return Ok(buf);
+}
