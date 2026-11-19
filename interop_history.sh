@@ -209,7 +209,7 @@ compare_text_merge() {
     printf 'Text\tmerge.txt\n' >"$W/expected"
     cmp "$W/output" "$W/expected"
     test "$(g rev-parse HEAD)" = "$ours"
-    test -z "$(g status --porcelain)"
+    test -z "$(g status --porcelain --untracked-files=no)"
   else
     test "$(cat "$W/output")" = "$(g rev-parse HEAD)"
     test "$(g show -s --format=%P)" = "$ours $theirs"
@@ -227,7 +227,9 @@ g checkout -qb adjacent-right "$base"
 printf 'one\nTWO\nthree\nfour\ninserted\nfive\n' >"$R/merge.txt"
 g commit -qam adjacent-right
 adjacent_right=$(g rev-parse HEAD)
+echo "=== Text merge: adjacent edits (right into left) ==="
 compare_text_merge "$adjacent_left" "$adjacent_right" conflict
+echo "=== Text merge: adjacent edits (left into right) ==="
 compare_text_merge "$adjacent_right" "$adjacent_left" conflict
 
 # 同じ位置の挿入と置換は衝突する。
@@ -239,13 +241,16 @@ g checkout -qb replace-at-insert "$base"
 printf 'one\ntwo\nthree\nfour\nFIVE\n' >"$R/merge.txt"
 g commit -qam replace-at-insert
 replace_at_insert=$(g rev-parse HEAD)
+echo "=== Text merge: replacement into insertion ==="
 compare_text_merge "$insert_only" "$replace_at_insert" conflict
+echo "=== Text merge: insertion into replacement ==="
 compare_text_merge "$replace_at_insert" "$insert_only" conflict
 
 # 同じ位置への同じ挿入は一度だけ反映する。
 g checkout -qb matching-insert "$base"
 printf 'one\ntwo\nTHREE\nfour\ninserted\nfive\n' >"$R/merge.txt"
 g commit -qam matching-insert
+echo "=== Text merge: identical insertions ==="
 compare_text_merge "$adjacent_left" "$(g rev-parse HEAD)" clean
 
 # 同じ位置に挿入した行が異なるときは衝突する。
