@@ -393,6 +393,15 @@ pub struct DirItem {
   is_symlink: Bool,
 }
 
+pub fn copy_dir_item(it: &DirItem) -> DirItem
+  intent "ディレクトリのエントリの写しを作る"
+  requires none
+  ensures none
+  effects none
+{
+  return DirItem { name: it.name.clone(), is_dir: it.is_dir, is_file: it.is_file, is_symlink: it.is_symlink };
+}
+
 pub fn list_items(dir: &String, max: Int) -> Result<List<DirItem>, GitError>
   intent "ディレクトリのエントリ（名前と種別）を最大 max 件まで列挙する。超えたら LimitExceeded、無ければ NotFound"
   requires max >= 0

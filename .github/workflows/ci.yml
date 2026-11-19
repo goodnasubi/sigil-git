@@ -15,7 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
-  SIGIL_REF: a2ccf0e086b4d7043ba89a740c840c550a4616fb
+  SIGIL_REF: 33467e3b43238fdc69331c58a788c95f1de393e5
 
 jobs:
   test:

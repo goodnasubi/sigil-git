@@ -1,0 +1,645 @@
+module git.ops
+  targets server
+  trust none
+
+use git.commit.encode_commit;
+use git.commit.new_commit_object;
+use git.error.GitError;
+use git.fsio.bytes_starts_with;
+use git.fsio.cat3;
+use git.fsio.lock_create;
+use git.fsio.lock_publish;
+use git.fsio.remove_file_if_exists;
+use git.hash.hex_to_bytes;
+use git.hash.int_to_str;
+use git.index.IndexEntry;
+use git.index.cmp_paths;
+use git.index.copy_entry;
+use git.index.find_entry;
+use git.index.index_lock_path;
+use git.index.index_path;
+use git.index.lower_bound;
+use git.index.new_index_entry;
+use git.index.read_index;
+use git.index.serialize_index;
+use git.index.sort_entries;
+use git.limits.max_add_files;
+use git.limits.max_commit_message_size;
+use git.limits.max_index_entries;
+use git.object.ObjectType;
+use git.odb.odb_write;
+use git.odb.open_packs;
+use git.refs.ExpectOld;
+use git.refs.HeadState;
+use git.refs.read_head;
+use git.refs.read_ref;
+use git.refs.update_ref;
+use git.repo.Repo;
+use git.tree.TreeEntry;
+use git.tree.compare_tree_entries;
+use git.tree.encode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.tree.entry_name;
+use git.tree.new_tree_entry;
+use git.validate.validate_path;
+use git.walk.topo_order;
+use git.worktree.list_sorted;
+use git.worktree.new_cache;
+use git.worktree.probe_path;
+use git.worktree.read_worktree_file;
+use git.worktree.rel_join;
+
+// ADR 0047 決定 3「add」「commit」。
+// add: 明示したパスのファイルを blob にして索引へ入れる（ディレクトリは再帰。.gitignore は見ない。symlink は対象にしない）。
+// commit: 索引から tree を作り、commit を作って現在のブランチを進める。作者・コミッター・時刻・タイムゾーンは呼び出し側が引数で渡す。
+// どちらも index.lock を排他的に取り、完全な索引を書いて rename する。オブジェクトを先に永続化し、参照は後で compare-and-swap で更新する。
+
+pub struct Ident {
+  name: String,
+  email: String,
+  time: Int,
+  tz: String,
+}
+
+pub fn new_ident(name: String, email: String, time: Int, tz: String) -> Ident
+  intent "作者・コミッターの署名を作る。time は UNIX 秒、tz は +0900 のような符号付き 4 桁"
+  requires none
+  ensures none
+  effects none
+{
+  return Ident { name: name, email: email, time: time, tz: tz };
+}
+
+fn has_forbidden(s: &String) -> Bool
+  intent "署名の名前・メールに使えない文字（< > 改行 NUL）を含むかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 60 || c == 62 || c == 10 || c == 0 {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn format_ident(who: &Ident) -> Result<Bytes, GitError>
+  intent "署名を `名前 <メール> 秒 タイムゾーン` の形にする。名前・メールに < > 改行 NUL があれば、時刻が負、タイムゾーンが符号付き 4 桁でなければ Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  if has_forbidden(&who.name) || has_forbidden(&who.email) {
+    return Err(GitError.Corrupt("name and email cannot contain <, >, a newline or NUL"));
+  }
+  if who.time < 0 {
+    return Err(GitError.Corrupt("commit time cannot be negative"));
+  }
+  let tz = who.tz.as_bytes();
+  if tz.len() != 5 {
+    return Err(GitError.Corrupt("time zone must look like +0900"));
+  }
+  let sign = tz.get(0).unwrap_or(0);
+  if sign != 43 && sign != 45 {
+    return Err(GitError.Corrupt("time zone must start with + or -"));
+  }
+  let mut i = 1;
+  while i < 5 {
+    let c = tz.get(i).unwrap_or(0);
+    if c < 48 || c > 57 {
+      return Err(GitError.Corrupt("time zone must be four digits"));
+    }
+    i = i + 1;
+  }
+  let mut out = who.name.as_bytes();
+  out.extend(&" <".as_bytes());
+  out.extend(&who.email.as_bytes());
+  out.extend(&"> ".as_bytes());
+  out.extend(&int_to_str(who.time).as_bytes());
+  out.push(32);
+  out.extend(&tz);
+  return Ok(out);
+}
+
+fn release_lock(path: &String) -> Bool
+  intent "自分が作ったロックファイルを消す（失敗は無視する）"
+  requires none
+  ensures none
+  effects fs
+{
+  let _ = remove_file_if_exists(&path);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// add
+// ---------------------------------------------------------------------------
+
+fn collect_dir(work: &String, rel_dir: &String, out: &mut List<String>, depth: Int) -> Result<Bool, GitError>
+  intent "作業木のディレクトリを再帰的に列挙し、通常ファイルの相対パスを out に積む。symlink と特殊ファイルは対象にしない。作業木のルートの .git は読み飛ばし、他の .git の変種は InvalidPath で拒否する。上限は 100000 ファイル"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 128 {
+    return Err(GitError.LimitExceeded("directory tree is nested too deeply"));
+  }
+  let items = list_sorted(&work, &rel_dir)?;
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        if rel_dir == "" && it.name == ".git" {
+          // リポジトリ自身のメタデータ。
+        } else {
+          let rel = rel_join(&rel_dir, &it.name);
+          validate_path(&rel)?;
+          if it.is_symlink {
+            // symlink は対象にしない。
+          } else {
+            if it.is_dir {
+              collect_dir(&work, &rel, &mut out, depth + 1)?;
+            } else {
+              if it.is_file {
+                if out.len() >= max_add_files() {
+                  return Err(GitError.LimitExceeded("too many files to add"));
+                }
+                out.push(rel);
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn gather_files(work: &String, paths: &List<String>) -> Result<List<String>, GitError>
+  intent "add に渡されたパスを検査し、追加する通常ファイルの相対パスの一覧にする。\".\" は作業木全体。無いパスは NotFound、明示した symlink と特殊ファイルは UnsupportedEntry"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut files = List.new();
+  let mut cache = new_cache();
+  let mut i = 0;
+  while i < paths.len() {
+    match paths.get(i) {
+      None => {}
+      Some(p) => {
+        if p == "." {
+          collect_dir(&work, &"", &mut files, 0)?;
+        } else {
+          validate_path(&p)?;
+          let probe = probe_path(&mut cache, &work, &p)?;
+          if probe.blocker != "" || probe.kind == 0 {
+            return Err(GitError.NotFound("path does not exist in the work tree"));
+          }
+          if probe.kind == 1 {
+            if files.len() >= max_add_files() {
+              return Err(GitError.LimitExceeded("too many files to add"));
+            }
+            files.push(p.clone());
+          } else {
+            if probe.kind == 2 {
+              collect_dir(&work, &p, &mut files, 0)?;
+            } else {
+              return Err(GitError.UnsupportedEntry("symlinks and special files are not added"));
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(files);
+}
+
+fn conflicts_with_index(entries: &List<IndexEntry>, path: &String) -> Bool
+  intent "path が索引の既存エントリとディレクトリ／ファイルの関係で衝突するか（path の上位のディレクトリがファイルとして、または path がディレクトリとして既にあるか）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let b = path.as_bytes();
+  let mut i = 0;
+  while i < b.len() {
+    if b.get(i).unwrap_or(0) == 47 {
+      let upper = b.slice(0, i).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+      if find_entry(&entries, &upper) >= 0 {
+        return true;
+      }
+    }
+    i = i + 1;
+  }
+  let dir = cat3(&path, &"/", &"");
+  let at = lower_bound(&entries, &dir);
+  if at < entries.len() {
+    match entries.get(at) {
+      None => {}
+      Some(e) => {
+        if bytes_starts_with(&e.path.as_bytes(), &dir.as_bytes()) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+fn merge_new(current: &List<IndexEntry>, added: &List<IndexEntry>) -> List<IndexEntry>
+  intent "整列済みの現在の索引と追加分を併合する。同じパスは追加分が勝つ"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  let mut j = 0;
+  while i < current.len() || j < added.len() {
+    let mut pick = 0;
+    if i >= current.len() {
+      pick = 2;
+    } else {
+      if j >= added.len() {
+        pick = 1;
+      } else {
+        match current.get(i) {
+          None => {}
+          Some(c) => {
+            match added.get(j) {
+              None => {}
+              Some(a) => {
+                let cm = cmp_paths(&c.path, &a.path);
+                if cm < 0 {
+                  pick = 1;
+                } else {
+                  if cm > 0 {
+                    pick = 2;
+                  } else {
+                    pick = 3;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if pick == 1 {
+      match current.get(i) {
+        None => {}
+        Some(c) => {
+          out.push(copy_entry(&c));
+        }
+      }
+      i = i + 1;
+    } else {
+      match added.get(j) {
+        None => {}
+        Some(a) => {
+          out.push(copy_entry(&a));
+        }
+      }
+      j = j + 1;
+      if pick == 3 {
+        i = i + 1;
+      }
+    }
+  }
+  return out;
+}
+
+fn dedupe_sorted(src: &List<IndexEntry>) -> List<IndexEntry>
+  intent "パスで整列済みの一覧から、同じパスの重複（後のものを残す）を除く"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < src.len() {
+    match src.get(i) {
+      None => {}
+      Some(e) => {
+        let mut last = true;
+        if i + 1 < src.len() {
+          match src.get(i + 1) {
+            None => {}
+            Some(n) => {
+              if cmp_paths(&n.path, &e.path) == 0 {
+                last = false;
+              }
+            }
+          }
+        }
+        if last {
+          out.push(copy_entry(&e));
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn add_locked(repo: &Repo, paths: &List<String>) -> Result<Bytes, GitError>
+  intent "index.lock を取得した状態で、パスのファイルを blob にして索引へ加えた完全な索引のバイト列を返す。索引は書かない"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let current = read_index(&repo)?;
+  let files = gather_files(&repo.work_dir, &paths)?;
+  let mut added = List.new();
+  let mut i = 0;
+  while i < files.len() {
+    match files.get(i) {
+      None => {}
+      Some(rel) => {
+        let f = read_worktree_file(&repo.work_dir, &rel)?;
+        let id = odb_write(&repo, &ObjectType.Blob, &f.content)?;
+        let mut mode = 100644;
+        if f.exec {
+          mode = 100755;
+        }
+        added.push(new_index_entry(rel.clone(), mode, id));
+      }
+    }
+    i = i + 1;
+  }
+  let sorted = dedupe_sorted(&sort_entries(&added));
+  let mut k = 0;
+  while k < sorted.len() {
+    match sorted.get(k) {
+      None => {}
+      Some(e) => {
+        if conflicts_with_index(&current, &e.path) {
+          return Err(GitError.AlreadyExists("path conflicts with an existing index entry as a file and a directory"));
+        }
+      }
+    }
+    k = k + 1;
+  }
+  let merged = merge_new(&current, &sorted);
+  if merged.len() > max_index_entries() {
+    return Err(GitError.LimitExceeded("too many index entries"));
+  }
+  return serialize_index(&merged);
+}
+
+pub fn add_paths(repo: &Repo, paths: &List<String>) -> Result<Bool, GitError>
+  intent "paths（作業木からの相対パス。\".\" は作業木全体）のファイルを blob にして索引へ入れる。ディレクトリは再帰し、.gitignore は見ず、symlink は対象にしない。index.lock を排他的に取り、完全な索引を書いて rename で公開する。途中で失敗しても索引は変わらない"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if repo.bare {
+    return Err(GitError.UnsupportedFormat("a bare repository has no work tree"));
+  }
+  let lock = index_lock_path(&repo);
+  let f = lock_create(&lock)?;
+  match add_locked(&repo, &paths) {
+    Err(e) => {
+      let _ = f.close();
+      release_lock(&lock);
+      return Err(e);
+    }
+    Ok(data) => {
+      match lock_publish(f, &data, &lock, &index_path(&repo), &repo.git_dir) {
+        Err(e) => {
+          release_lock(&lock);
+          return Err(e);
+        }
+        Ok(_) => {
+          return Ok(true);
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// commit
+// ---------------------------------------------------------------------------
+
+fn copy_tree_entry(e: &TreeEntry) -> TreeEntry
+  intent "tree のエントリの写しを作る"
+  requires none
+  ensures none
+  effects none
+{
+  return new_tree_entry(entry_mode(&e), entry_name(&e), entry_id(&e));
+}
+
+fn merge_tree_entries(left: &List<TreeEntry>, right: &List<TreeEntry>) -> List<TreeEntry>
+  intent "tree の並びで整列済みの 2 つの一覧を併合する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  let mut j = 0;
+  while i < left.len() || j < right.len() {
+    let mut take_right = false;
+    if i >= left.len() {
+      take_right = true;
+    } else {
+      if j < right.len() {
+        match left.get(i) {
+          None => {}
+          Some(l) => {
+            match right.get(j) {
+              None => {}
+              Some(r) => {
+                if compare_tree_entries(&entry_name(&r), entry_mode(&r), &entry_name(&l), entry_mode(&l)) < 0 {
+                  take_right = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if take_right {
+      match right.get(j) {
+        None => {}
+        Some(r) => {
+          out.push(copy_tree_entry(&r));
+        }
+      }
+      j = j + 1;
+    } else {
+      match left.get(i) {
+        None => {}
+        Some(l) => {
+          out.push(copy_tree_entry(&l));
+        }
+      }
+      i = i + 1;
+    }
+  }
+  return out;
+}
+
+fn sort_tree_range(src: &List<TreeEntry>, lo: Int, hi: Int) -> List<TreeEntry>
+  intent "src の [lo, hi) を tree の並びに整列した一覧を返す"
+  requires lo <= hi
+  ensures none
+  effects none
+{
+  if hi - lo <= 1 {
+    let mut one = List.new();
+    if hi - lo == 1 {
+      match src.get(lo) {
+        None => {}
+        Some(e) => {
+          one.push(copy_tree_entry(&e));
+        }
+      }
+    }
+    return one;
+  }
+  let mid = lo + (hi - lo) / 2;
+  let left = sort_tree_range(&src, lo, mid);
+  let right = sort_tree_range(&src, mid, hi);
+  return merge_tree_entries(&left, &right);
+}
+
+fn build_tree(repo: &Repo, entries: &List<IndexEntry>, lo: Int, hi: Int, plen: Int) -> Result<String, GitError>
+  intent "整列済みの索引の [lo, hi)（先頭の plen byte が共通のディレクトリ）から tree オブジェクトを書き、識別子を返す。サブディレクトリは先に再帰して書く"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut items = List.new();
+  let mut i = lo;
+  while i < hi {
+    match entries.get(i) {
+      None => {
+        i = i + 1;
+      }
+      Some(e) => {
+        let pb = e.path.as_bytes();
+        let mut slash = -1;
+        let mut k = plen;
+        while k < pb.len() && slash < 0 {
+          if pb.get(k).unwrap_or(0) == 47 {
+            slash = k;
+          }
+          k = k + 1;
+        }
+        if slash < 0 {
+          let name = pb.slice(plen, pb.len()).unwrap_or(Bytes.new());
+          items.push(new_tree_entry(e.mode, name, hex_to_bytes(&e.id)?));
+          i = i + 1;
+        } else {
+          let prefix = pb.slice(0, slash + 1).unwrap_or(Bytes.new());
+          let name = pb.slice(plen, slash).unwrap_or(Bytes.new());
+          let mut j = i;
+          let mut more = true;
+          while j < hi && more {
+            match entries.get(j) {
+              None => {
+                more = false;
+              }
+              Some(n) => {
+                if bytes_starts_with(&n.path.as_bytes(), &prefix) {
+                  j = j + 1;
+                } else {
+                  more = false;
+                }
+              }
+            }
+          }
+          let sub = build_tree(&repo, &entries, i, j, slash + 1)?;
+          items.push(new_tree_entry(40000, name, hex_to_bytes(&sub)?));
+          i = j;
+        }
+      }
+    }
+  }
+  let sorted = sort_tree_range(&items, 0, items.len());
+  let content = encode_tree(&sorted)?;
+  return odb_write(&repo, &ObjectType.Tree, &content);
+}
+
+pub fn write_tree(repo: &Repo) -> Result<String, GitError>
+  intent "現在の索引から tree オブジェクトを書き、ルートの tree の識別子を返す（空の索引なら空の tree）"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let entries = read_index(&repo)?;
+  return build_tree(&repo, &entries, 0, entries.len(), 0);
+}
+
+fn commit_locked(repo: &Repo, author: &Ident, committer: &Ident, message: &Bytes) -> Result<String, GitError>
+  intent "index.lock を取得した状態で commit を作り、現在のブランチを compare-and-swap で進める。オブジェクト（tree・commit）を先に永続化し、参照は後で更新する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let author_bytes = format_ident(&author)?;
+  let committer_bytes = format_ident(&committer)?;
+  if message.len() > max_commit_message_size() {
+    return Err(GitError.LimitExceeded("commit message is too large"));
+  }
+  let head = read_head(&repo)?;
+  let mut branch_ref = "";
+  match head {
+    HeadState.Detached(_) => {
+      return Err(GitError.UnsupportedFormat("commit on a detached HEAD is not supported"));
+    }
+    HeadState.Symbolic(r) => {
+      branch_ref = r;
+    }
+  }
+  let tip = read_ref(&repo, &branch_ref)?;
+  let mut parents = List.new();
+  let mut expect = ExpectOld.Absent;
+  match tip {
+    None => {}
+    Some(t) => {
+      // 参照が指す commit と、到達できる親がすべて永続化済みであることを確かめる（読めない親があればエラー）。
+      let packs = open_packs(&repo)?;
+      topo_order(&repo, &packs, &t)?;
+      parents.push(t.clone());
+      expect = ExpectOld.Is(t.clone());
+    }
+  }
+  let entries = read_index(&repo)?;
+  let tree_id = build_tree(&repo, &entries, 0, entries.len(), 0)?;
+  let obj = new_commit_object(tree_id, parents, author_bytes, committer_bytes, List.new(), message.clone());
+  let content = encode_commit(&obj)?;
+  let id = odb_write(&repo, &ObjectType.Commit, &content)?;
+  update_ref(&repo, &branch_ref, &id, expect)?;
+  return Ok(id);
+}
+
+pub fn commit(repo: &Repo, author: &Ident, committer: &Ident, message: &Bytes) -> Result<String, GitError>
+  intent "索引から tree を作り、commit を作って現在のブランチを進め、commit の識別子を返す。作者・コミッター・時刻・タイムゾーン・メッセージは引数で受け取り（環境変数・設定・時計を読まない）、メッセージはバイト列のまま正規化しない。変更が無くても commit する。分離 HEAD では UnsupportedFormat。index.lock を取っている間に別の add が割り込めない"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if repo.bare {
+    return Err(GitError.UnsupportedFormat("a bare repository has no work tree"));
+  }
+  let lock = index_lock_path(&repo);
+  let f = lock_create(&lock)?;
+  let outcome = commit_locked(&repo, &author, &committer, &message);
+  let _ = f.close();
+  release_lock(&lock);
+  return outcome;
+}
