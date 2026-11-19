@@ -5,6 +5,8 @@
 #  C. 私たちの checkout の結果が、実 Git の checkout と同じ索引・作業木で、git status が clean。
 #  D. 衝突（作業木の変更・索引の変更・追跡外ファイルの上書き）は何も変えずに失敗する。
 #  E. 悪意のある tree（.git・..・gitlink・symlink）は木の外に何も書かず、panic せずに失敗する。
+#  F. 作業木の中の symlink を通した書き込み・読み取り・checkout は失敗し、外には何も書かれない。
+#  H. 日本語など UTF-8 のパスが add・commit・checkout で往復する。
 set -euo pipefail
 
 if [ -z "${SIGIL:-}" ]; then
@@ -18,7 +20,7 @@ git init --object-format=sha256 --bare -q "$(mktemp -d)" || { echo "this git doe
 W=tmp/interop_ops
 rm -rf "$W"
 mkdir -p "$W"
-trap 'rm -rf "$W"' EXIT
+trap '[ -n "${KEEP:-}" ] || rm -rf "$W"' EXIT
 export GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@example.com
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
@@ -206,4 +208,87 @@ rm -f "$R/n"
 test -z "$(find "$OUT" -type f)"
 test -z "$(g status --porcelain)"
 echo "malicious trees are refused; nothing was written outside the work tree"
+echo "=== F. writes and reads never follow symlinks in the work tree ==="
+# 作業木の中の（外を指す）ディレクトリ symlink を通した書き込み・読み取りは失敗し、外には何も書かれない。
+OUT2="$PWD/$W/outside2"
+mkdir -p "$OUT2/sub"
+printf 'secret\n' >"$OUT2/secret"
+ln -s "$OUT2" "$R/lnk"
+run <<'CMDS'
+wtwrite:lnk/x.txt
+wtwrite:lnk/sub/y.txt
+wtread:lnk/secret
+CMDS
+test "$(sed -n 1p "$W/out.txt" | cut -c1-6)" = "error:" || { echo "write through a directory symlink was accepted" >&2; exit 1; }
+test "$(sed -n 2p "$W/out.txt" | cut -c1-6)" = "error:" || { echo "write through a nested directory symlink was accepted" >&2; exit 1; }
+test "$(sed -n 3p "$W/out.txt" | cut -c1-6)" = "error:" || { echo "read through a directory symlink was accepted" >&2; exit 1; }
+test ! -e "$OUT2/x.txt" && test ! -e "$OUT2/sub/y.txt"
+test -z "$(find "$OUT2" -name '.sigil-tmp-*')"
+test "$(cat "$OUT2/secret")" = "secret"
+rm -f "$R/lnk"
+# 最後の成分が symlink のとき、rename は symlink 自体を置き換え、リンク先は変わらない。
+printf 'orig\n' >"$OUT2/target"
+ln -s "$OUT2/target" "$R/fl"
+run <<'CMDS'
+wtwrite:fl
+CMDS
+test "$(cat "$OUT2/target")" = "orig"
+test ! -L "$R/fl" && test "$(cat "$R/fl")" = "pwn"
+rm -f "$R/fl"
+# 実 Git と同じ入れ子の木（n/x.txt）を、作業木の既存の symlink n（外を指す）に対して checkout する。
+OUT3="$PWD/$W/outside3"
+mkdir -p "$OUT3"
+INNER="$(printf '100644 blob %s\tx.txt\n' "$BLOB" | g mktree)"
+OUTER="$(printf '040000 tree %s\tn\n' "$INNER" | g mktree)"
+g update-ref refs/heads/nested "$(mk_commit "$OUTER")"
+ln -s "$OUT3" "$R/n"
+S0="$(snap)"
+run <<'CMDS'
+checkout:nested
+CMDS
+grep -q '^error:' "$W/out.txt" || { echo "checkout through a symlink was accepted" >&2; exit 1; }
+test -z "$(find "$OUT3" -type f)"
+test -L "$R/n"
+test "$(snap)" = "$S0"
+rm -f "$R/n"
+# 追跡しているディレクトリ dir が、外の同じ内容のディレクトリを指す symlink に置き換えられている。
+OUT4="$PWD/$W/outside4"
+mkdir -p "$OUT4"
+cp -r "$R/dir/." "$OUT4/"
+mv "$R/dir" "$W/dir.bak"
+ln -s "$OUT4" "$R/dir"
+run <<'CMDS'
+checkout:topic
+CMDS
+expect_out "error:Conflict"
+test "$(cat "$OUT4/b.txt")" = "bravo2"
+test -L "$R/dir"
+rm -f "$R/dir"
+mv "$W/dir.bak" "$R/dir"
+test -z "$(g status --porcelain)"
+echo "no write or read follows a symlink; the checkout is refused without touching the target"
+echo "=== H. non-ASCII paths ==="
+printf 'こんにちは\n' >"$R/ファイル.txt"
+run <<'CMDS'
+add:ファイル.txt
+commit:japanese
+CMDS
+C3="$(g rev-parse HEAD)"
+test "$(sed -n 1p "$W/out.txt")" = "ok:added"
+test "$(g -c core.quotepath=false ls-tree -r --name-only HEAD | grep -c 'ファイル.txt')" = "1"
+# 悪意のある木（セクション E）が残っているので全体の fsck はせず、新しい commit から辿れるオブジェクトだけを検査する。
+g rev-list --objects "$C3" >/dev/null
+test -z "$(g status --porcelain)"
+run <<'CMDS'
+checkout:topic
+CMDS
+expect_out "ok:$C1"
+test ! -e "$R/ファイル.txt"
+run <<'CMDS'
+checkout:refs/heads/main
+CMDS
+expect_out "ok:$C3"
+test "$(cat "$R/ファイル.txt")" = "こんにちは"
+test -z "$(g status --porcelain)"
+echo "non-ASCII paths round trip"
 echo "=== interop_ops OK ==="

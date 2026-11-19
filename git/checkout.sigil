@@ -7,6 +7,7 @@ use git.fsio.join_path;
 use git.fsio.lock_create;
 use git.fsio.lock_publish;
 use git.fsio.remove_file_if_exists;
+use git.fsio.string_starts_with;
 use git.hash.bytes_to_hex;
 use git.hash.compute_object_id;
 use git.hash.is_valid_hex_id;
@@ -90,9 +91,14 @@ fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefi
       None => {}
       Some(e) => {
         let nb = entry_name(&e);
-        let name = nb.to_string_utf8().unwrap_or("");
-        if name.len() != nb.len() {
-          return Err(GitError.InvalidPath("tree entry name is not valid UTF-8"));
+        let mut name = "";
+        match nb.to_string_utf8() {
+          Ok(v) => {
+            name = v;
+          }
+          Err(_) => {
+            return Err(GitError.InvalidPath("tree entry name is not valid UTF-8"));
+          }
         }
         let path = rel_join(&prefix, &name);
         validate_path(&path)?;
@@ -414,6 +420,18 @@ fn head_entries(repo: &Repo, packs: &List<PackStore>) -> Result<List<IndexEntry>
   };
 }
 
+fn branch_ref_name(target: &String) -> String
+  intent "ブランチ名（main のような短い名前、または refs/heads/main のような完全な名前）を完全な参照名にする"
+  requires none
+  ensures none
+  effects none
+{
+  if string_starts_with(&target, &"refs/heads/") {
+    return target.clone();
+  }
+  return join_path(&"refs/heads", &target);
+}
+
 fn resolve_target(repo: &Repo, target: &String) -> Result<String, GitError>
   intent "target（commit の識別子、またはブランチ名）を commit の識別子にする。ブランチが無ければ NotFound、commit でなければ TypeMismatch"
   requires none
@@ -427,7 +445,7 @@ fn resolve_target(repo: &Repo, target: &String) -> Result<String, GitError>
       _ => Err(GitError.TypeMismatch("checkout target must be a commit")),
     };
   }
-  let name = join_path(&"refs/heads", &target);
+  let name = branch_ref_name(&target);
   validate_ref_name(&name)?;
   return match read_ref(&repo, &name)? {
     None => Err(GitError.NotFound("branch does not exist")),
@@ -513,6 +531,25 @@ fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Resu
     return Err(GitError.LimitExceeded("too many index entries"));
   }
   let data = serialize_index(&next_sorted)?;
+  // 書き込みの前に、切り替え先の blob がすべて読めて blob であることを確かめる（欠落・破損・blob でない場合に、作業木を変えずに失敗するため）。
+  let mut v = 0;
+  while v < changes.len() {
+    match changes.get(v) {
+      None => {}
+      Some(c) => {
+        if c.tmode != 0 {
+          let probe_obj = odb_read_in(&repo, &packs, &c.tid)?;
+          match probe_obj.obj_type {
+            ObjectType.Blob => {}
+            _ => {
+              return Err(GitError.TypeMismatch("a tree entry points to a non-blob object"));
+            }
+          }
+        }
+      }
+    }
+    v = v + 1;
+  }
   // ここから書き込み。まず削除、置き換えるディレクトリの片付け、次にファイルの書き込み。
   let mut d = 0;
   while d < dels.len() {
@@ -559,7 +596,7 @@ fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Resu
   if is_valid_hex_id(&target) {
     set_head_detached(&repo, &commit_id)?;
   } else {
-    set_head_symbolic(&repo, &join_path(&"refs/heads", &target))?;
+    set_head_symbolic(&repo, &branch_ref_name(&target))?;
   }
   return Ok(commit_id);
 }

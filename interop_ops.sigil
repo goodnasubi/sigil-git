@@ -20,6 +20,8 @@ use git.refs.read_ref;
 use git.repo.Repo;
 use git.repo.init_repo;
 use git.repo.open_repo;
+use git.worktree.read_worktree_file;
+use git.worktree.write_worktree_file;
 
 fn current_commit(repo: &Repo) -> Result<String, GitError>
   intent "HEAD が指す commit の識別子を返す"
@@ -44,22 +46,30 @@ fn step(repo: &Repo, line: &String) -> Result<String, GitError>
 {
   if string_starts_with(&line, &"add:") {
     let mut paths = List.new();
-    paths.push(string_slice(&line, 4, line.len()));
+    paths.push(string_slice(&line, 4, line.as_bytes().len()));
     add_paths(&repo, &paths)?;
     return Ok("added");
   }
   if string_starts_with(&line, &"commit:") {
     let who = new_ident("T".clone(), "t@example.com".clone(), 1700000000, "+0900".clone());
-    let msg = cat2(&string_slice(&line, 7, line.len()), &"\n");
+    let msg = cat2(&string_slice(&line, 7, line.as_bytes().len()), &"\n");
     return commit(&repo, &who, &who, &msg.as_bytes());
   }
   if string_starts_with(&line, &"checkout:") {
-    return checkout(&repo, &string_slice(&line, 9, line.len()));
+    return checkout(&repo, &string_slice(&line, 9, line.as_bytes().len()));
   }
   if string_starts_with(&line, &"branch:") {
     let head = current_commit(&repo)?;
-    create_branch(&repo, &string_slice(&line, 7, line.len()), &head)?;
+    create_branch(&repo, &string_slice(&line, 7, line.as_bytes().len()), &head)?;
     return Ok("branched");
+  }
+  if string_starts_with(&line, &"wtwrite:") {
+    write_worktree_file(&repo.work_dir, &string_slice(&line, 8, line.as_bytes().len()), &"pwn\n".as_bytes(), false)?;
+    return Ok("written");
+  }
+  if string_starts_with(&line, &"wtread:") {
+    let f = read_worktree_file(&repo.work_dir, &string_slice(&line, 7, line.as_bytes().len()))?;
+    return Ok(f.content.to_string_utf8().unwrap_or("<binary>"));
   }
   return Err(GitError.InvalidPath("unknown command"));
 }

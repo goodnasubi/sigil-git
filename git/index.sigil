@@ -365,9 +365,14 @@ pub fn parse_index(data: &Bytes) -> Result<List<IndexEntry>, GitError>
       }
       pad = pad + 1;
     }
-    let name = name_bytes.to_string_utf8().unwrap_or("");
-    if name.len() != name_bytes.len() {
-      return Err(GitError.InvalidPath("index entry name is not valid UTF-8"));
+    let mut name = "";
+    match name_bytes.to_string_utf8() {
+      Ok(v) => {
+        name = v;
+      }
+      Err(_) => {
+        return Err(GitError.InvalidPath("index entry name is not valid UTF-8"));
+      }
     }
     validate_path(&name)?;
     if n > 0 && cmp_paths(&prev, &name) >= 0 {

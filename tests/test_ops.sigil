@@ -885,6 +885,58 @@ fn test_malicious(repo: &Repo, base: &String) -> Bool
   return ok;
 }
 
+fn test_review_fixes(repo: &Repo) -> Bool
+  intent "レビュー指摘の修正を確かめる: 日本語のパスの往復、切り替え先の blob の欠落で何も変えない、完全なブランチ名での checkout、署名の CR の拒否"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let work = repo.work_dir.clone();
+  ok = expect(wf(&work, &"a.txt", &"alpha\n", false), &"write a.txt") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"a.txt"))) == "ok", &"add a.txt") && ok;
+  let c1 = str_or(&commit(&repo, &ident(1700000300), &ident(1700000300), &"one\n".as_bytes()), &"");
+  ok = expect(c1.len() == 64, &"first commit") && ok;
+  // 日本語（マルチバイト）のパスが add・commit・checkout で往復する
+  ok = expect(wf(&work, &"日本語/ファイル.txt", &"こんにちは\n", false), &"write a multibyte path") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"日本語"))) == "ok", &"add a multibyte path") && ok;
+  ok = expect(kind_i(&read_index(&repo)) == "ok", &"the index with a multibyte path is readable") && ok;
+  let c2 = str_or(&commit(&repo, &ident(1700000301), &ident(1700000301), &"two\n".as_bytes()), &"");
+  ok = expect(c2.len() == 64, &"second commit") && ok;
+  ok = expect(kind_b(&create_branch(&repo, &"back", &c1)) == "ok", &"branch back") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"back")) == "ok", &"checkout back (multibyte path removed)") && ok;
+  ok = expect(text_of(&work, &"日本語/ファイル.txt") == "<missing>", &"multibyte file removed") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"main")) == "ok", &"checkout main (multibyte path restored)") && ok;
+  ok = expect(text_of(&work, &"日本語/ファイル.txt") == "こんにちは\n", &"multibyte file restored") && ok;
+  // 完全なブランチ名
+  ok = expect(kind_s(&checkout(&repo, &"refs/heads/back")) == "ok", &"checkout with a full branch name") && ok;
+  ok = expect(head_name(&repo) == "refs/heads/back", &"HEAD is refs/heads/back") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"main")) == "ok", &"checkout main again") && ok;
+  // 切り替え先の blob が無い: 何も変えずに失敗する（a.txt などが先に消えてはならない）
+  let missing = "abababababababababababababababababababababababababababababababab";
+  let t = tree_with(&repo, 100644, &"new.txt".as_bytes(), &missing);
+  let mc = commit_of_tree(&repo, &t);
+  ok = expect(mc.len() == 64, &"commit with a missing blob") && ok;
+  ok = expect(kind_b(&create_branch(&repo, &"missingblob", &mc)) == "ok", &"branch missingblob") && ok;
+  let before = state_line(&repo);
+  let k = kind_s(&checkout(&repo, &"missingblob"));
+  ok = expect(k != "ok", &"a missing target blob is refused") && ok;
+  ok = expect(state_line(&repo) == before, &"a missing target blob changes nothing") && ok;
+  ok = expect(!has_lock(&repo), &"no stale index.lock after a missing blob") && ok;
+  // blob でないオブジェクト（tree）を blob として指す
+  let t2 = tree_with(&repo, 100644, &"x.txt".as_bytes(), &t);
+  let mc2 = commit_of_tree(&repo, &t2);
+  ok = expect(kind_b(&create_branch(&repo, &"notblob", &mc2)) == "ok", &"branch notblob") && ok;
+  let before2 = state_line(&repo);
+  ok = expect(kind_s(&checkout(&repo, &"notblob")) == "TypeMismatch", &"a non-blob target is TypeMismatch") && ok;
+  ok = expect(state_line(&repo) == before2, &"a non-blob target changes nothing") && ok;
+  // 署名の CR は拒否する
+  let bad = new_ident("A\rB", "t@example.com", 1700000302, "+0000");
+  ok = expect(kind_s(&commit(&repo, &bad, &ident(1700000302), &"x\n".as_bytes())) != "ok", &"CR in a name is refused") && ok;
+  ok = expect(head_commit(&repo) == c2, &"the branch did not move after the refused commit") && ok;
+  return ok;
+}
+
 pub fn run_ops_tests() -> Bool
   intent "索引・add・commit・checkout の全テストを実行し全合格なら true を返す。作業用ディレクトリは tmp/ の下に作る"
   requires none
@@ -918,6 +970,16 @@ pub fn run_ops_tests() -> Bool
       ok = test_checkout(&repo) && ok;
       console.log(&"  malicious trees");
       ok = test_malicious(&repo, &base) && ok;
+    }
+  }
+  match init_repo(&join_path(&base, &"work2"), false, &"main") {
+    Err(_) => {
+      console.log(&"  FAILED: cannot init the second test repository");
+      return false;
+    }
+    Ok(repo2) => {
+      console.log(&"  review fixes");
+      ok = test_review_fixes(&repo2) && ok;
     }
   }
   return ok;
