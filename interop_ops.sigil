@@ -1,0 +1,125 @@
+module interop_ops
+  targets server
+  trust none
+
+use git.checkout.checkout;
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat2;
+use git.fsio.cat3;
+use git.fsio.read_file_opt;
+use git.fsio.string_slice;
+use git.fsio.string_starts_with;
+use git.ops.add_paths;
+use git.ops.commit;
+use git.ops.new_ident;
+use git.refs.HeadState;
+use git.refs.create_branch;
+use git.refs.read_head;
+use git.refs.read_ref;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.repo.open_repo;
+use git.worktree.read_worktree_file;
+use git.worktree.write_worktree_file;
+
+fn current_commit(repo: &Repo) -> Result<String, GitError>
+  intent "HEAD が指す commit の識別子を返す"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_head(&repo)? {
+    HeadState.Detached(id) => Ok(id),
+    HeadState.Symbolic(r) => match read_ref(&repo, &r)? {
+      None => Err(GitError.NotFound("no commit yet")),
+      Some(id) => Ok(id),
+    },
+  };
+}
+
+fn step(repo: &Repo, line: &String) -> Result<String, GitError>
+  intent "コマンド 1 行（add:パス／commit:メッセージ／checkout:対象／branch:名前）を実行し、結果の文字列（commit の識別子など）を返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if string_starts_with(&line, &"add:") {
+    let mut paths = List.new();
+    paths.push(string_slice(&line, 4, line.as_bytes().len()));
+    add_paths(&repo, &paths)?;
+    return Ok("added");
+  }
+  if string_starts_with(&line, &"commit:") {
+    let who = new_ident("T".clone(), "t@example.com".clone(), 1700000000, "+0900".clone());
+    let msg = cat2(&string_slice(&line, 7, line.as_bytes().len()), &"\n");
+    return commit(&repo, &who, &who, &msg.as_bytes());
+  }
+  if string_starts_with(&line, &"checkout:") {
+    return checkout(&repo, &string_slice(&line, 9, line.as_bytes().len()));
+  }
+  if string_starts_with(&line, &"branch:") {
+    let head = current_commit(&repo)?;
+    create_branch(&repo, &string_slice(&line, 7, line.as_bytes().len()), &head)?;
+    return Ok("branched");
+  }
+  if string_starts_with(&line, &"wtwrite:") {
+    write_worktree_file(&repo.work_dir, &string_slice(&line, 8, line.as_bytes().len()), &"pwn\n".as_bytes(), false)?;
+    return Ok("written");
+  }
+  if string_starts_with(&line, &"wtread:") {
+    let f = read_worktree_file(&repo.work_dir, &string_slice(&line, 7, line.as_bytes().len()))?;
+    return Ok(f.content.to_string_utf8().unwrap_or("<binary>"));
+  }
+  return Err(GitError.InvalidPath("unknown command"));
+}
+
+fn run_line(root: &String, line: &String) -> Result<String, GitError>
+  intent "1 行を実行する。init なら新しいリポジトリを作り、それ以外は開き直してから step に渡す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if line == "init" {
+    init_repo(&root, false, &"main")?;
+    return Ok("init");
+  }
+  let repo = open_repo(&root)?;
+  return step(&repo, &line);
+}
+
+pub fn main() -> Int
+  intent "tmp/interop_ops/cmds.txt のコマンドを 1 行ずつ tmp/interop_ops/repo（SHA-256）に対して実行し、結果を 1 行ずつ出力する（成功は ok:結果、失敗は error:種別）。コマンドが読めなければ 1"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = "tmp/interop_ops/repo";
+  let cmds = match read_file_opt(&"tmp/interop_ops/cmds.txt", 1048576, false) {
+    Ok(Some(b)) => b.to_string_utf8().unwrap_or(""),
+    _ => "",
+  };
+  if cmds == "" {
+    console.log(&"error: no commands");
+    return 1;
+  }
+  let lines = cmds.lines();
+  let mut i = 0;
+  while i < lines.len() {
+    match lines.get(i) {
+      None => {}
+      Some(line) => {
+        match run_line(&root, &line) {
+          Ok(v) => {
+            console.log(&cat3(&"ok:", &v, &""));
+          }
+          Err(e) => {
+            console.log(&cat2(&"error:", &error_kind_name(&e)));
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}

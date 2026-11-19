@@ -1,0 +1,500 @@
+module git.index
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.join_path;
+use git.fsio.read_file_opt;
+use git.hash.bytes_to_hex;
+use git.hash.compute_sha256;
+use git.hash.hex_to_bytes;
+use git.limits.max_index_entries;
+use git.limits.max_index_size;
+use git.repo.Repo;
+use git.validate.validate_path;
+
+// ADR 0047 決定 3「索引」: 索引（index v2）の最小実装。SHA-256 形式の索引（エントリ 32 byte の識別子、末尾に SHA-256 の検査値）。
+// stat 情報（時刻・dev・ino・uid・gid・大きさ）は読んでも信頼せず、書くときは 0 にする（常に内容で判定する）。
+// 読めないものは黙って捨てずに拒否する: version が 2 以外、拡張フラグ付きのエントリ、stage が 0 以外（衝突）、
+// 小文字で始まる拡張（必須の拡張。split index の link など）。大文字で始まる拡張（TREE・REUC・UNTR など）はキャッシュなので読み飛ばし、書き戻さない。
+
+pub struct IndexEntry {
+  path: String,
+  mode: Int,
+  id: String,
+}
+
+pub fn new_index_entry(path: String, mode: Int, id: String) -> IndexEntry
+  intent "索引のエントリを作る。mode は tree と同じ 10 進に見える表現（100644・100755・120000・160000）"
+  requires none
+  ensures none
+  effects none
+{
+  return IndexEntry { path: path, mode: mode, id: id };
+}
+
+pub fn copy_entry(e: &IndexEntry) -> IndexEntry
+  intent "索引のエントリの写しを作る"
+  requires none
+  ensures none
+  effects none
+{
+  return IndexEntry { path: e.path.clone(), mode: e.mode, id: e.id.clone() };
+}
+
+pub fn cmp_bytes(a: &Bytes, b: &Bytes) -> Int
+  intent "2 つのバイト列を先頭から符号なしで辞書順に比べる（a < b なら -1、等しければ 0、a > b なら 1）"
+  requires none
+  ensures result >= -1 && result <= 1
+  effects none
+{
+  let la = a.len();
+  let lb = b.len();
+  let mut i = 0;
+  while i < la && i < lb {
+    let x = a.get(i).unwrap_or(0);
+    let y = b.get(i).unwrap_or(0);
+    if x < y {
+      return -1;
+    }
+    if x > y {
+      return 1;
+    }
+    i = i + 1;
+  }
+  if la < lb {
+    return -1;
+  }
+  if la > lb {
+    return 1;
+  }
+  return 0;
+}
+
+pub fn cmp_paths(a: &String, b: &String) -> Int
+  intent "2 つのパスをバイトの辞書順に比べる"
+  requires none
+  ensures result >= -1 && result <= 1
+  effects none
+{
+  return cmp_bytes(&a.as_bytes(), &b.as_bytes());
+}
+
+fn merge_entries(left: &List<IndexEntry>, right: &List<IndexEntry>) -> List<IndexEntry>
+  intent "パスで整列済みの 2 つの一覧を、安定に（等しければ left を先に）併合する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  let mut j = 0;
+  while i < left.len() || j < right.len() {
+    if i >= left.len() {
+      match right.get(j) {
+        None => {}
+        Some(r) => {
+          out.push(copy_entry(&r));
+        }
+      }
+      j = j + 1;
+    } else {
+      if j >= right.len() {
+        match left.get(i) {
+          None => {}
+          Some(l) => {
+            out.push(copy_entry(&l));
+          }
+        }
+        i = i + 1;
+      } else {
+        match left.get(i) {
+          None => {
+            i = i + 1;
+          }
+          Some(l) => {
+            match right.get(j) {
+              None => {
+                j = j + 1;
+              }
+              Some(r) => {
+                if cmp_paths(&r.path, &l.path) < 0 {
+                  out.push(copy_entry(&r));
+                  j = j + 1;
+                } else {
+                  out.push(copy_entry(&l));
+                  i = i + 1;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+fn sort_range(src: &List<IndexEntry>, lo: Int, hi: Int) -> List<IndexEntry>
+  intent "src の [lo, hi) をパスで整列した新しい一覧を返す（併合整列）"
+  requires lo <= hi
+  ensures none
+  effects none
+{
+  if hi - lo <= 1 {
+    let mut one = List.new();
+    if hi - lo == 1 {
+      match src.get(lo) {
+        None => {}
+        Some(e) => {
+          one.push(copy_entry(&e));
+        }
+      }
+    }
+    return one;
+  }
+  let mid = lo + (hi - lo) / 2;
+  let left = sort_range(&src, lo, mid);
+  let right = sort_range(&src, mid, hi);
+  return merge_entries(&left, &right);
+}
+
+pub fn sort_entries(src: &List<IndexEntry>) -> List<IndexEntry>
+  intent "索引のエントリをパスのバイト順に整列した新しい一覧を返す（安定）"
+  requires none
+  ensures none
+  effects none
+{
+  return sort_range(&src, 0, src.len());
+}
+
+pub fn find_entry(entries: &List<IndexEntry>, path: &String) -> Int
+  intent "パスで整列済みの一覧から path のエントリの位置を二分探索で返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut lo = 0;
+  let mut hi = entries.len();
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    match entries.get(mid) {
+      None => {
+        return -1;
+      }
+      Some(e) => {
+        let c = cmp_paths(&e.path, &path);
+        if c == 0 {
+          return mid;
+        }
+        if c < 0 {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+pub fn lower_bound(entries: &List<IndexEntry>, path: &String) -> Int
+  intent "パスで整列済みの一覧で、path 以上の最初の位置（無ければ長さ）を二分探索で返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut lo = 0;
+  let mut hi = entries.len();
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    match entries.get(mid) {
+      None => {
+        return entries.len();
+      }
+      Some(e) => {
+        if cmp_paths(&e.path, &path) < 0 {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+  }
+  return lo;
+}
+
+fn index_mode_to_tree_mode(m: Int) -> Result<Int, GitError>
+  intent "索引のバイナリのモード（st_mode）を tree の 10 進に見える表現にする。通常ファイルは実行ビットの有無で 100644／100755（Git と同じ正規化）、symlink は 120000、gitlink は 160000"
+  requires none
+  ensures none
+  effects none
+{
+  let kind = m / 4096;
+  if kind == 8 {
+    if m / 64 % 2 == 1 {
+      return Ok(100755);
+    }
+    return Ok(100644);
+  }
+  if kind == 10 {
+    return Ok(120000);
+  }
+  if kind == 14 {
+    return Ok(160000);
+  }
+  return Err(GitError.Corrupt("index entry has an invalid mode"));
+}
+
+fn tree_mode_to_index_mode(m: Int) -> Result<Int, GitError>
+  intent "tree の表現のモードを索引のバイナリのモードにする（100644 → 0o100644 など）"
+  requires none
+  ensures none
+  effects none
+{
+  if m == 100644 {
+    return Ok(33188);
+  }
+  if m == 100755 {
+    return Ok(33261);
+  }
+  if m == 120000 {
+    return Ok(40960);
+  }
+  if m == 160000 {
+    return Ok(57344);
+  }
+  return Err(GitError.Corrupt("index entry mode must be 100644, 100755, 120000 or 160000"));
+}
+
+fn read_u16(b: &Bytes, off: Int) -> Int
+  intent "ビッグエンディアンの 2 byte 整数を読む（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return b.get(off).unwrap_or(0) * 256 + b.get(off + 1).unwrap_or(0);
+}
+
+fn read_u32(b: &Bytes, off: Int) -> Int
+  intent "ビッグエンディアンの 4 byte 整数を読む（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return b.read_u32_be(off).unwrap_or(0);
+}
+
+fn entry_total_len(name_len: Int) -> Int
+  intent "エントリ全体の長さ（固定部 74 byte と名前、1〜8 byte の NUL で 8 の倍数に詰めた長さ）を返す"
+  requires name_len >= 0
+  ensures none
+  effects none
+{
+  return (74 + name_len + 8) / 8 * 8;
+}
+
+pub fn parse_index(data: &Bytes) -> Result<List<IndexEntry>, GitError>
+  intent "索引（v2、SHA-256）を解析する。検査値・並び・パス・モードを検査し、読めない形は拒否する。エントリ数は 100000 まで"
+  requires none
+  ensures none
+  effects none
+{
+  let len = data.len();
+  if len > max_index_size() {
+    return Err(GitError.LimitExceeded("index file is too large"));
+  }
+  if len < 44 {
+    return Err(GitError.Corrupt("index file is too short"));
+  }
+  if data.get(0).unwrap_or(0) != 68 || data.get(1).unwrap_or(0) != 73 || data.get(2).unwrap_or(0) != 82 || data.get(3).unwrap_or(0) != 67 {
+    return Err(GitError.Corrupt("index file has a wrong signature"));
+  }
+  let version = read_u32(&data, 4);
+  if version != 2 {
+    return Err(GitError.UnsupportedFormat("only index version 2 is supported"));
+  }
+  let count = read_u32(&data, 8);
+  if count > max_index_entries() {
+    return Err(GitError.LimitExceeded("too many index entries"));
+  }
+  let body_end = len - 32;
+  let sum = compute_sha256(&data.slice(0, body_end).unwrap_or(Bytes.new()));
+  let stored = data.slice(body_end, len).unwrap_or(Bytes.new());
+  if cmp_bytes(&sum, &stored) != 0 {
+    return Err(GitError.Corrupt("index checksum does not match"));
+  }
+  let mut out = List.new();
+  let mut pos = 12;
+  let mut n = 0;
+  let mut prev = "";
+  while n < count {
+    if pos + 74 > body_end {
+      return Err(GitError.Corrupt("index entry is truncated"));
+    }
+    let mode = read_u32(&data, pos + 24);
+    let id_bytes = data.slice(pos + 40, pos + 72).unwrap_or(Bytes.new());
+    let flags = read_u16(&data, pos + 72);
+    if flags / 16384 % 2 == 1 {
+      return Err(GitError.UnsupportedFormat("index entries with the extended flag are not supported"));
+    }
+    if flags / 4096 % 4 != 0 {
+      return Err(GitError.UnsupportedFormat("index has unmerged (conflicted) entries"));
+    }
+    let mut name_len = flags % 4096;
+    if name_len == 4095 {
+      let mut k = pos + 74;
+      while k < body_end && data.get(k).unwrap_or(0) != 0 {
+        k = k + 1;
+      }
+      if k >= body_end {
+        return Err(GitError.Corrupt("index entry name is not terminated"));
+      }
+      name_len = k - (pos + 74);
+    }
+    let total = entry_total_len(name_len);
+    if pos + total > body_end {
+      return Err(GitError.Corrupt("index entry is truncated"));
+    }
+    let name_bytes = data.slice(pos + 74, pos + 74 + name_len).unwrap_or(Bytes.new());
+    let mut pad = pos + 74 + name_len;
+    while pad < pos + total {
+      if data.get(pad).unwrap_or(1) != 0 {
+        return Err(GitError.Corrupt("index entry padding is not zero"));
+      }
+      pad = pad + 1;
+    }
+    let mut name = "";
+    match name_bytes.to_string_utf8() {
+      Ok(v) => {
+        name = v;
+      }
+      Err(_) => {
+        return Err(GitError.InvalidPath("index entry name is not valid UTF-8"));
+      }
+    }
+    validate_path(&name)?;
+    if n > 0 && cmp_paths(&prev, &name) >= 0 {
+      return Err(GitError.Corrupt("index entries are not in strictly increasing path order"));
+    }
+    let tmode = index_mode_to_tree_mode(mode)?;
+    out.push(IndexEntry { path: name.clone(), mode: tmode, id: bytes_to_hex(&id_bytes) });
+    prev = name;
+    pos = pos + total;
+    n = n + 1;
+  }
+  // 拡張: 大文字で始まるものはキャッシュなので読み飛ばす。それ以外（必須の拡張）は拒否する。
+  while pos < body_end {
+    if pos + 8 > body_end {
+      return Err(GitError.Corrupt("index extension header is truncated"));
+    }
+    let first = data.get(pos).unwrap_or(0);
+    let size = read_u32(&data, pos + 4);
+    if size > body_end - (pos + 8) {
+      return Err(GitError.Corrupt("index extension is truncated"));
+    }
+    if first < 65 || first > 90 {
+      return Err(GitError.UnsupportedFormat("index has a required extension that is not supported"));
+    }
+    pos = pos + 8 + size;
+  }
+  return Ok(out);
+}
+
+pub fn serialize_index(entries: &List<IndexEntry>) -> Result<Bytes, GitError>
+  intent "索引（v2、SHA-256）を符号化する。パスは厳密に増える並びでなければならない。stat 欄は 0。末尾に SHA-256 の検査値"
+  requires none
+  ensures none
+  effects none
+{
+  if entries.len() > max_index_entries() {
+    return Err(GitError.LimitExceeded("too many index entries"));
+  }
+  let mut out = Bytes.new();
+  out.push(68);
+  out.push(73);
+  out.push(82);
+  out.push(67);
+  out.push_u32_be(2);
+  out.push_u32_be(entries.len());
+  let mut prev = "";
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      None => {}
+      Some(e) => {
+        validate_path(&e.path)?;
+        if i > 0 && cmp_paths(&prev, &e.path) >= 0 {
+          return Err(GitError.Corrupt("index entries must be in strictly increasing path order"));
+        }
+        let m = tree_mode_to_index_mode(e.mode)?;
+        let id = hex_to_bytes(&e.id)?;
+        if id.len() != 32 {
+          return Err(GitError.Corrupt("index entry id must be 32 bytes"));
+        }
+        let mut k = 0;
+        while k < 6 {
+          out.push_u32_be(0);
+          k = k + 1;
+        }
+        out.push_u32_be(m);
+        out.push_u32_be(0);
+        out.push_u32_be(0);
+        out.push_u32_be(0);
+        out.extend(&id);
+        let name = e.path.as_bytes();
+        let mut nl = name.len();
+        if nl > 4095 {
+          nl = 4095;
+        }
+        out.push_u16_be(nl);
+        out.extend(&name);
+        let total = entry_total_len(name.len());
+        let mut pad = 74 + name.len();
+        while pad < total {
+          out.push(0);
+          pad = pad + 1;
+        }
+        prev = e.path.clone();
+      }
+    }
+    i = i + 1;
+  }
+  let sum = compute_sha256(&out);
+  out.extend(&sum);
+  return Ok(out);
+}
+
+pub fn index_path(repo: &Repo) -> String
+  intent "索引ファイルのパスを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return join_path(&repo.git_dir, &"index");
+}
+
+pub fn index_lock_path(repo: &Repo) -> String
+  intent "索引のロックファイルのパスを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return cat3(&index_path(&repo), &".lock", &"");
+}
+
+pub fn read_index(repo: &Repo) -> Result<List<IndexEntry>, GitError>
+  intent "リポジトリの索引を読む。無ければ空。作業木の無い（bare）リポジトリでは UnsupportedFormat"
+  requires none
+  ensures none
+  effects fs.read
+{
+  if repo.bare {
+    return Err(GitError.UnsupportedFormat("a bare repository has no index"));
+  }
+  return match read_file_opt(&index_path(&repo), max_index_size(), false)? {
+    None => Ok(List.new()),
+    Some(b) => parse_index(&b),
+  };
+}

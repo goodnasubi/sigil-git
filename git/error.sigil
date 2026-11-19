@@ -16,6 +16,8 @@ pub enum GitError {
   NotFound(String),
   AlreadyExists(String),
   RefMismatch(String),
+  UnsupportedEntry(String),
+  Conflict(String),
 }
 
 pub fn error_kind_name(err: &GitError) -> String
@@ -36,6 +38,8 @@ pub fn error_kind_name(err: &GitError) -> String
     GitError.NotFound(_) => "NotFound",
     GitError.AlreadyExists(_) => "AlreadyExists",
     GitError.RefMismatch(_) => "RefMismatch",
+    GitError.UnsupportedEntry(_) => "UnsupportedEntry",
+    GitError.Conflict(_) => "Conflict",
   };
 }
 
@@ -57,6 +61,8 @@ pub fn error_message(err: &GitError) -> String
     GitError.NotFound(msg) => msg.clone(),
     GitError.AlreadyExists(msg) => msg.clone(),
     GitError.RefMismatch(msg) => msg.clone(),
+    GitError.UnsupportedEntry(msg) => msg.clone(),
+    GitError.Conflict(msg) => msg.clone(),
   };
 }
 
@@ -188,6 +194,30 @@ pub fn is_ref_mismatch(err: &GitError) -> Bool
 {
   return match err {
     GitError.RefMismatch(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_unsupported_entry(err: &GitError) -> Bool
+  intent "UnsupportedEntry エラー（symlink・gitlink など作業木に作らないエントリ）かどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.UnsupportedEntry(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_conflict(err: &GitError) -> Bool
+  intent "Conflict エラー（チェックアウトが未保存の変更を失うため拒否された）かどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.Conflict(_) => true,
     _ => false,
   };
 }

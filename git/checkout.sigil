@@ -1,0 +1,624 @@
+module git.checkout
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.join_path;
+use git.fsio.lock_create;
+use git.fsio.lock_publish;
+use git.fsio.remove_file_if_exists;
+use git.fsio.string_starts_with;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.hash.is_valid_hex_id;
+use git.index.IndexEntry;
+use git.index.cmp_paths;
+use git.index.copy_entry;
+use git.index.find_entry;
+use git.index.index_lock_path;
+use git.index.index_path;
+use git.index.new_index_entry;
+use git.index.read_index;
+use git.index.serialize_index;
+use git.index.sort_entries;
+use git.limits.max_index_entries;
+use git.object.ObjectType;
+use git.odb.odb_info;
+use git.odb.odb_read_in;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.refs.HeadState;
+use git.refs.read_head;
+use git.refs.read_ref;
+use git.refs.set_head_detached;
+use git.refs.set_head_symbolic;
+use git.repo.Repo;
+use git.tree.decode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.tree.entry_name;
+use git.validate.validate_path;
+use git.validate.validate_ref_name;
+use git.walk.commit_tree;
+use git.worktree.list_sorted;
+use git.worktree.new_cache;
+use git.worktree.probe_path;
+use git.worktree.read_worktree_file;
+use git.worktree.rel_join;
+use git.worktree.remove_worktree_file;
+use git.worktree.write_worktree_file;
+
+// ADR 0047 決定 4・決定 2 の checkout。コミットまたはブランチへ、作業木・索引・HEAD を切り替える。
+//
+// 失敗するときは何も変更しない（事前にすべて検査する）:
+//  - 切り替えで内容が変わるパス（HEAD の木と切り替え先で mode か識別子が違うパス）ごとに、HEAD・索引・作業木・切り替え先の四つを比べる。
+//    (a) 作業木のファイルが索引と違う（変更・削除・種別の置き換え）、(b) 索引が HEAD の木と違う（add 済みで未コミット）、
+//    (c) 追跡されていないファイル（またはディレクトリ）が上書き・置き換えられる、のいずれかがあれば Conflict で失敗する。
+//  - 切り替え先に symlink（120000）・gitlink（160000）のエントリがあれば UnsupportedEntry で失敗する。
+//  - 切り替え先のパスは add と同じ規則で検査する（.git の変種・`..`・絶対パス・バックスラッシュ・UTF-8 でない名前などは InvalidPath）。
+// 書き込みの順序: 削除 → ファイルの書き込み（一時名に書いて rename）→ 索引の公開 → HEAD の更新（最後）。
+// 中断しても、HEAD と索引は更新前のまま（または索引だけが先に進んだ状態）で、status は「HEAD の木と索引の差分」として観察でき、未保存の変更を失わない。
+// 強制する指定は初版に含めない。
+
+struct Change {
+  path: String,
+  hmode: Int,
+  hid: String,
+  tmode: Int,
+  tid: String,
+}
+
+fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: &String, out: &mut List<IndexEntry>, depth: Int) -> Result<Bool, GitError>
+  intent "tree を再帰的に展開し、ディレクトリ以外のエントリを（mode・識別子つきで）out に積む。各パスは validate_path で検査し、名前が UTF-8 でなければ InvalidPath。エントリ数は 100000 まで、深さは 128 まで"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 128 {
+    return Err(GitError.LimitExceeded("tree is nested too deeply"));
+  }
+  let o = odb_read_in(&repo, &packs, &tree_id)?;
+  match o.obj_type {
+    ObjectType.Tree => {}
+    _ => {
+      return Err(GitError.TypeMismatch("expected a tree"));
+    }
+  }
+  let entries = decode_tree(&o.content)?;
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      None => {}
+      Some(e) => {
+        let nb = entry_name(&e);
+        let mut name = "";
+        match nb.to_string_utf8() {
+          Ok(v) => {
+            name = v;
+          }
+          Err(_) => {
+            return Err(GitError.InvalidPath("tree entry name is not valid UTF-8"));
+          }
+        }
+        let path = rel_join(&prefix, &name);
+        validate_path(&path)?;
+        let mode = entry_mode(&e);
+        let id = bytes_to_hex(&entry_id(&e));
+        if mode == 40000 {
+          flatten_checked(&repo, &packs, &id, &path, &mut out, depth + 1)?;
+        } else {
+          if out.len() >= max_index_entries() {
+            return Err(GitError.LimitExceeded("too many tree entries"));
+          }
+          out.push(new_index_entry(path, mode, id));
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn flatten_commit(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<List<IndexEntry>, GitError>
+  intent "commit の木を、パスのバイト順に整列したエントリの一覧にする"
+  requires none
+  ensures none
+  effects fs
+{
+  let tree_id = commit_tree(&repo, &packs, &commit_id)?;
+  let mut out = List.new();
+  flatten_checked(&repo, &packs, &tree_id, &"", &mut out, 0)?;
+  return Ok(sort_entries(&out));
+}
+
+fn compute_changes(h: &List<IndexEntry>, t: &List<IndexEntry>) -> List<Change>
+  intent "HEAD の木 h と切り替え先 t（どちらもパスで整列済み）を比べ、mode か識別子が違うパスを（パス順に）返す。mode 0 はそちらに無いことを表す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  let mut j = 0;
+  while i < h.len() || j < t.len() {
+    let mut pick = 0;
+    if i >= h.len() {
+      pick = 2;
+    } else {
+      if j >= t.len() {
+        pick = 1;
+      } else {
+        match h.get(i) {
+          None => {}
+          Some(a) => {
+            match t.get(j) {
+              None => {}
+              Some(b) => {
+                let c = cmp_paths(&a.path, &b.path);
+                if c < 0 {
+                  pick = 1;
+                } else {
+                  if c > 0 {
+                    pick = 2;
+                  } else {
+                    pick = 3;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if pick == 1 {
+      match h.get(i) {
+        None => {}
+        Some(a) => {
+          out.push(Change { path: a.path.clone(), hmode: a.mode, hid: a.id.clone(), tmode: 0, tid: "" });
+        }
+      }
+      i = i + 1;
+    }
+    if pick == 2 {
+      match t.get(j) {
+        None => {}
+        Some(b) => {
+          out.push(Change { path: b.path.clone(), hmode: 0, hid: "", tmode: b.mode, tid: b.id.clone() });
+        }
+      }
+      j = j + 1;
+    }
+    if pick == 3 {
+      match h.get(i) {
+        None => {}
+        Some(a) => {
+          match t.get(j) {
+            None => {}
+            Some(b) => {
+              if a.mode != b.mode || a.id != b.id {
+                out.push(Change { path: a.path.clone(), hmode: a.mode, hid: a.id.clone(), tmode: b.mode, tid: b.id.clone() });
+              }
+            }
+          }
+        }
+      }
+      i = i + 1;
+      j = j + 1;
+    }
+  }
+  return out;
+}
+
+fn is_unsupported_mode(m: Int) -> Bool
+  intent "symlink（120000）か gitlink（160000）かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return m == 120000 || m == 160000;
+}
+
+fn str_has(sorted: &List<String>, p: &String) -> Bool
+  intent "パスで整列済みの一覧に p があるかを二分探索で返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut lo = 0;
+  let mut hi = sorted.len();
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    match sorted.get(mid) {
+      None => {
+        return false;
+      }
+      Some(s) => {
+        let c = cmp_paths(&s, &p);
+        if c == 0 {
+          return true;
+        }
+        if c < 0 {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+fn dir_removable(work: &String, rel: &String, dels: &List<String>, depth: Int) -> Result<Bool, GitError>
+  intent "作業木のディレクトリ rel が、削除予定のファイル（dels）と空のディレクトリだけでできているかを返す。追跡されていないファイル・symlink・特殊ファイルがあれば false"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 128 {
+    return Ok(false);
+  }
+  let items = list_sorted(&work, &rel)?;
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        let child = rel_join(&rel, &it.name);
+        if it.is_symlink {
+          return Ok(false);
+        }
+        if it.is_dir {
+          if !dir_removable(&work, &child, &dels, depth + 1)? {
+            return Ok(false);
+          }
+        } else {
+          if it.is_file {
+            if !str_has(&dels, &child) {
+              return Ok(false);
+            }
+          } else {
+            return Ok(false);
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn remove_empty_tree(work: &String, rel: &String, depth: Int) -> Result<Bool, GitError>
+  intent "ファイルを含まない（空のディレクトリだけの）ディレクトリ rel を、下から消す。ファイルなどが残っていれば Conflict"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 128 {
+    return Err(GitError.LimitExceeded("directory tree is nested too deeply"));
+  }
+  let mut gone = false;
+  let mut items = List.new();
+  match list_sorted(&work, &rel) {
+    Ok(v) => {
+      items = v;
+    }
+    Err(GitError.NotFound(_)) => {
+      gone = true;
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+  if gone {
+    return Ok(false);
+  }
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        if it.is_dir && !it.is_symlink {
+          remove_empty_tree(&work, &rel_join(&rel, &it.name), depth + 1)?;
+        } else {
+          return Err(GitError.Conflict("a directory to be replaced still has files"));
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return match fs.remove_dir(&Path.new(&join_path(&work, &rel))) {
+    Ok(_) => Ok(true),
+    Err(_) => Err(GitError.Io("failed to remove a directory")),
+  };
+}
+
+fn precheck(work: &String, index: &List<IndexEntry>, changes: &List<Change>, dels: &List<String>) -> Result<List<String>, GitError>
+  intent "変更されるパスごとに、HEAD・索引・作業木・切り替え先を比べる。問題があれば Conflict（何も変更しない）。置き換えるディレクトリ（追跡外の空のディレクトリ）のパスの一覧を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut swaps = List.new();
+  let mut cache = new_cache();
+  let mut i = 0;
+  while i < changes.len() {
+    match changes.get(i) {
+      None => {}
+      Some(c) => {
+        let ix = find_entry(&index, &c.path);
+        if c.hmode == 0 {
+          if ix >= 0 {
+            return Err(GitError.Conflict("a path has a staged addition that is not in HEAD"));
+          }
+        } else {
+          if ix < 0 {
+            return Err(GitError.Conflict("a tracked path is missing from the index (staged deletion)"));
+          }
+          match index.get(ix) {
+            None => {}
+            Some(e) => {
+              if e.mode != c.hmode || e.id != c.hid {
+                return Err(GitError.Conflict("the index differs from HEAD for a path (staged change)"));
+              }
+            }
+          }
+        }
+        let probe = probe_path(&mut cache, &work, &c.path)?;
+        if c.hmode != 0 {
+          if probe.blocker != "" || probe.kind != 1 {
+            return Err(GitError.Conflict("a tracked file is missing or replaced in the work tree"));
+          }
+          let wf = read_worktree_file(&work, &c.path)?;
+          let wid = bytes_to_hex(&compute_object_id(&"blob", &wf.content));
+          let want_exec = c.hmode == 100755;
+          if wid != c.hid {
+            return Err(GitError.Conflict("a tracked file is modified in the work tree"));
+          }
+          if wf.exec && !want_exec {
+            return Err(GitError.Conflict("a tracked file is modified in the work tree (mode)"));
+          }
+          if !wf.exec && want_exec {
+            return Err(GitError.Conflict("a tracked file is modified in the work tree (mode)"));
+          }
+        } else {
+          if probe.blocker != "" {
+            if !str_has(&dels, &probe.blocker) {
+              return Err(GitError.Conflict("an untracked file is in the way of a new directory"));
+            }
+          } else {
+            if probe.kind != 0 {
+              if probe.kind == 2 {
+                if !dir_removable(&work, &c.path, &dels, 0)? {
+                  return Err(GitError.Conflict("an untracked directory is in the way of a new file"));
+                }
+                swaps.push(c.path.clone());
+              } else {
+                return Err(GitError.Conflict("an untracked file would be overwritten"));
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(swaps);
+}
+
+fn head_entries(repo: &Repo, packs: &List<PackStore>) -> Result<List<IndexEntry>, GitError>
+  intent "現在の HEAD の木のエントリを返す。まだ commit が無いブランチなら空"
+  requires none
+  ensures none
+  effects fs
+{
+  return match read_head(&repo)? {
+    HeadState.Detached(id) => flatten_commit(&repo, &packs, &id),
+    HeadState.Symbolic(r) => match read_ref(&repo, &r)? {
+      None => Ok(List.new()),
+      Some(id) => flatten_commit(&repo, &packs, &id),
+    },
+  };
+}
+
+fn branch_ref_name(target: &String) -> String
+  intent "ブランチ名（main のような短い名前、または refs/heads/main のような完全な名前）を完全な参照名にする"
+  requires none
+  ensures none
+  effects none
+{
+  if string_starts_with(&target, &"refs/heads/") {
+    return target.clone();
+  }
+  return join_path(&"refs/heads", &target);
+}
+
+fn resolve_target(repo: &Repo, target: &String) -> Result<String, GitError>
+  intent "target（commit の識別子、またはブランチ名）を commit の識別子にする。ブランチが無ければ NotFound、commit でなければ TypeMismatch"
+  requires none
+  ensures none
+  effects fs
+{
+  if is_valid_hex_id(&target) {
+    let info = odb_info(&repo, &target)?;
+    return match info.obj_type {
+      ObjectType.Commit => Ok(target.clone()),
+      _ => Err(GitError.TypeMismatch("checkout target must be a commit")),
+    };
+  }
+  let name = branch_ref_name(&target);
+  validate_ref_name(&name)?;
+  return match read_ref(&repo, &name)? {
+    None => Err(GitError.NotFound("branch does not exist")),
+    Some(id) => Ok(id),
+  };
+}
+
+fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Result<String, GitError>
+  intent "index.lock を取得した状態で checkout する。事前の検査をすべて終えてから、削除・書き込み・索引の公開・HEAD の更新の順に進める"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let commit_id = resolve_target(&repo, &target)?;
+  let packs = open_packs(&repo)?;
+  let t = flatten_commit(&repo, &packs, &commit_id)?;
+  let h = head_entries(&repo, &packs)?;
+  let index = read_index(&repo)?;
+  let changes = compute_changes(&h, &t);
+  // symlink・gitlink は作業木に作らない。切り替え先のどこかにあれば、実行前に全体を拒否する。
+  let mut k = 0;
+  while k < t.len() {
+    match t.get(k) {
+      None => {}
+      Some(e) => {
+        if is_unsupported_mode(e.mode) {
+          return Err(GitError.UnsupportedEntry("symlink and gitlink entries are not checked out"));
+        }
+      }
+    }
+    k = k + 1;
+  }
+  let mut dels = List.new();
+  let mut change_paths = List.new();
+  let mut m = 0;
+  while m < changes.len() {
+    match changes.get(m) {
+      None => {}
+      Some(c) => {
+        if is_unsupported_mode(c.hmode) {
+          return Err(GitError.UnsupportedEntry("symlink and gitlink entries are not replaced or removed"));
+        }
+        change_paths.push(c.path.clone());
+        if c.tmode == 0 {
+          dels.push(c.path.clone());
+        }
+      }
+    }
+    m = m + 1;
+  }
+  let swaps = precheck(&repo.work_dir, &index, &changes, &dels)?;
+  if index.len() + changes.len() > max_index_entries() * 2 {
+    return Err(GitError.LimitExceeded("too many index entries"));
+  }
+  // 新しい索引: 変更されたパスの索引エントリ（HEAD と同じことは確かめ済み）を除き、切り替え先のエントリを足す。
+  let mut next = List.new();
+  let mut n = 0;
+  while n < index.len() {
+    match index.get(n) {
+      None => {}
+      Some(e) => {
+        if !str_has(&change_paths, &e.path) {
+          next.push(copy_entry(&e));
+        }
+      }
+    }
+    n = n + 1;
+  }
+  let mut p = 0;
+  while p < changes.len() {
+    match changes.get(p) {
+      None => {}
+      Some(c) => {
+        if c.tmode != 0 {
+          next.push(new_index_entry(c.path.clone(), c.tmode, c.tid.clone()));
+        }
+      }
+    }
+    p = p + 1;
+  }
+  let next_sorted = sort_entries(&next);
+  if next_sorted.len() > max_index_entries() {
+    return Err(GitError.LimitExceeded("too many index entries"));
+  }
+  let data = serialize_index(&next_sorted)?;
+  // 書き込みの前に、切り替え先の blob がすべて読めて blob であることを確かめる（欠落・破損・blob でない場合に、作業木を変えずに失敗するため）。
+  let mut v = 0;
+  while v < changes.len() {
+    match changes.get(v) {
+      None => {}
+      Some(c) => {
+        if c.tmode != 0 {
+          let probe_obj = odb_read_in(&repo, &packs, &c.tid)?;
+          match probe_obj.obj_type {
+            ObjectType.Blob => {}
+            _ => {
+              return Err(GitError.TypeMismatch("a tree entry points to a non-blob object"));
+            }
+          }
+        }
+      }
+    }
+    v = v + 1;
+  }
+  // ここから書き込み。まず削除、置き換えるディレクトリの片付け、次にファイルの書き込み。
+  let mut d = 0;
+  while d < dels.len() {
+    match dels.get(d) {
+      None => {}
+      Some(path) => {
+        remove_worktree_file(&repo.work_dir, &path)?;
+      }
+    }
+    d = d + 1;
+  }
+  let mut s = 0;
+  while s < swaps.len() {
+    match swaps.get(s) {
+      None => {}
+      Some(path) => {
+        remove_empty_tree(&repo.work_dir, &path, 0)?;
+      }
+    }
+    s = s + 1;
+  }
+  let mut w = 0;
+  while w < changes.len() {
+    match changes.get(w) {
+      None => {}
+      Some(c) => {
+        if c.tmode != 0 {
+          let o = odb_read_in(&repo, &packs, &c.tid)?;
+          match o.obj_type {
+            ObjectType.Blob => {}
+            _ => {
+              return Err(GitError.TypeMismatch("a tree entry points to a non-blob object"));
+            }
+          }
+          let exec_out = c.tmode == 100755;
+          write_worktree_file(&repo.work_dir, &c.path, &o.content, exec_out)?;
+        }
+      }
+    }
+    w = w + 1;
+  }
+  // 索引を公開し、最後に HEAD を更新する。
+  lock_publish(f, &data, &lock, &index_path(&repo), &repo.git_dir)?;
+  if is_valid_hex_id(&target) {
+    set_head_detached(&repo, &commit_id)?;
+  } else {
+    set_head_symbolic(&repo, &branch_ref_name(&target))?;
+  }
+  return Ok(commit_id);
+}
+
+pub fn checkout(repo: &Repo, target: &String) -> Result<String, GitError>
+  intent "target（commit の識別子 64 桁の hex、またはブランチ名）へ作業木・索引・HEAD を切り替え、commit の識別子を返す。切り替えで内容が変わるパスに、索引の未コミットの変更・作業木の変更や削除・追跡されていないファイルの上書きがあれば、何も変更せずに Conflict で失敗する。symlink・gitlink が切り替え先にあれば UnsupportedEntry。強制する指定は無い"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if repo.bare {
+    return Err(GitError.UnsupportedFormat("a bare repository has no work tree"));
+  }
+  let lock = index_lock_path(&repo);
+  let f = lock_create(&lock)?;
+  match checkout_locked(&repo, &target, f, &lock) {
+    Err(e) => {
+      let _ = remove_file_if_exists(&lock);
+      return Err(e);
+    }
+    Ok(id) => {
+      return Ok(id);
+    }
+  }
+}

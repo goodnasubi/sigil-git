@@ -60,9 +60,27 @@ SHA-256 形式のリポジトリの作成（`init`）、緩いオブジェクト
 - 読み取りのたびに `.idx`・pack を開き直します。多数を読むときは `open_packs` と `odb_read_in` を使ってください（pack の末尾の検査値の検証は `open_pack` で 1 回だけ行います）。
 - pack の書き込み、`repack`/`gc`/`prune`、thin pack（pack 外の基点を持つ REF_DELTA）は範囲外です。
 
+## 第4段「索引・add・commit・checkout・作業木の書き込み」（ADR 0047 単位4）
+
+SHA-256 のリポジトリで、`add` → `commit` → `checkout` の一連が動きます。環境変数・設定・時計・フック・`.gitignore` は読みません。
+
+### モジュール構成
+
+- `git/index.sigil`: 索引 v2 の読み書き（最小）。stat 情報は信用せず（書くときは 0）、内容で判断します。検査値（SHA-256）・順序・段階（stage）・拡張フラグ・必須の拡張（小文字始まり）を検証し、拡張のうち大文字始まり（`TREE` など）は読み飛ばします。
+- `git/worktree.sigil`: 作業木の読み書き。パスは書く直前に成分ごとに検査し、ディレクトリは `O_NOFOLLOW` で開き、symlink をたどりません。ファイルは一時名（`.sigil-tmp-*`、`create_new`）に書いてから rename し、実行ビットは `File.set_mode`（0644／0755 のみ）で付けます。
+- `git/ops.sigil`: `add_paths`（明示したパス。ディレクトリは再帰、`.gitignore` なし、symlink は対象外）、`write_tree`、`commit`（索引 → tree → commit → 現在のブランチの更新。作者・コミッター・時刻・tz は引数、メッセージはバイト列のまま）。オブジェクトを先に永続化し、参照は `<ref>.lock` を使った compare-and-swap で更新します。`index.lock` は add/commit の間ずっと保持します。
+- `git/checkout.sigil`: `checkout`（commit の識別子またはブランチ名）。変更されるパスごとに HEAD・索引・作業木・切り替え先を比べ、（a）作業木が索引と違う、（b）索引が HEAD と違う、（c）追跡外のファイルが上書きされる、のいずれかがあれば何も変えずに `Conflict`。symlink（120000）・gitlink（160000）が切り替え先にあれば、何も書く前に `UnsupportedEntry`。書き込みの順は 削除 → 置き換えるディレクトリの片付け → 書き込み → 索引 → HEAD。強制する指定はありません。
+
+### 判断と制限
+
+- パスの検査（`.`・`..`・空・`/`・NUL・`.git` の変種・絶対パス・バックスラッシュ・UTF-8 でない名前）は `validate_path` を作業木への書き込みの直前にも使います。上限は ADR 0047 決定 5（パス 4096・成分 255・深さ 128、索引 100000、1 回の add は 100000 ファイル、オブジェクト 64 MiB）。
+- 空のディレクトリは作りません。SHA-1 のリポジトリ・bare リポジトリは `UnsupportedFormat`、分離 HEAD への `commit` も `UnsupportedFormat` です。
+- `add` に symlink を明示すると `UnsupportedEntry`、ディレクトリを再帰するときの symlink・特殊ファイルは読み飛ばします。
+- 実 Git との確認は `interop_ops.sh`（fsck・log・ls-tree・diff・cat-file、実 Git の clone/checkout、衝突、悪意のある tree）。
+
 ## テストの実行
 
-前提として、Sigil コンパイラ（固定版コミット `a2ccf0e086b4d7043ba89a740c840c550a4616fb`）が利用可能である必要があります。
+前提として、Sigil コンパイラ（固定版コミット `33467e3b43238fdc69331c58a788c95f1de393e5`）が利用可能である必要があります。
 
 ```bash
 # 全体テストの実行（fmt, check, SIR 評価器, ネイティブバイナリビルド＆実行）

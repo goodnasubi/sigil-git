@@ -1,0 +1,667 @@
+module git.worktree
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.DirItem;
+use git.fsio.cat3;
+use git.fsio.copy_dir_item;
+use git.fsio.file_size;
+use git.fsio.join_path;
+use git.fsio.list_items;
+use git.fsio.map_io;
+use git.fsio.random_hex;
+use git.fsio.read_range;
+use git.index.cmp_paths;
+use git.limits.max_add_files;
+use git.limits.max_object_size;
+use git.validate.validate_path;
+
+// ADR 0047 決定 2・4 の作業木の読み書き。公開 std.fs だけを使う。
+// 読み書きはすべて、作業木のルートを開いた Dir 起点の相対パスで行う（ADR 0049: 構成要素の symlink 追従と `..` を拒否する）。
+// 作業木のファイルは一時名に書いてから rename する。所有者・時刻は復元せず、モードは 0644／0755 だけを設定する（setuid 等は設定しない）。
+// 作業木のファイルは fsync しない（Git と同じ。持続性が要るのは .git の中身で、HEAD と索引は更新の最後に公開する）。
+
+// 種別: 0 無い、1 通常ファイル、2 ディレクトリ、3 symlink、4 その他
+pub fn kind_missing() -> Int
+  intent "種別: 無い"
+  requires none
+  ensures result == 0
+  effects none
+{
+  return 0;
+}
+
+pub fn kind_file() -> Int
+  intent "種別: 通常ファイル"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+pub fn kind_dir() -> Int
+  intent "種別: ディレクトリ"
+  requires none
+  ensures result == 2
+  effects none
+{
+  return 2;
+}
+
+pub fn kind_symlink() -> Int
+  intent "種別: symlink"
+  requires none
+  ensures result == 3
+  effects none
+{
+  return 3;
+}
+
+pub fn kind_name(k: Int) -> String
+  intent "種別の名前（メッセージ用）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if k == 0 {
+    return "missing";
+  }
+  if k == 1 {
+    return "file";
+  }
+  if k == 2 {
+    return "directory";
+  }
+  if k == 3 {
+    return "symlink";
+  }
+  return "special file";
+}
+
+pub fn item_kind(it: &DirItem) -> Int
+  intent "ディレクトリのエントリの種別を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if it.is_symlink {
+    return 3;
+  }
+  if it.is_dir {
+    return 2;
+  }
+  if it.is_file {
+    return 1;
+  }
+  return 4;
+}
+
+pub fn rel_parent(rel: &String) -> String
+  intent "相対パスの親（最後の / より前）を返す。単一の構成要素なら空文字列"
+  requires none
+  ensures none
+  effects none
+{
+  let b = rel.as_bytes();
+  let mut i = b.len();
+  while i > 0 {
+    if b.get(i - 1).unwrap_or(0) == 47 {
+      return b.slice(0, i - 1).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+    }
+    i = i - 1;
+  }
+  return "";
+}
+
+pub fn rel_name(rel: &String) -> String
+  intent "相対パスの最後の構成要素を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let b = rel.as_bytes();
+  let mut i = b.len();
+  while i > 0 {
+    if b.get(i - 1).unwrap_or(0) == 47 {
+      return b.slice(i, b.len()).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+    }
+    i = i - 1;
+  }
+  return rel.clone();
+}
+
+pub fn rel_join(dir: &String, name: &String) -> String
+  intent "相対パスのディレクトリと名前を / でつなぐ（dir が空なら name）"
+  requires none
+  ensures none
+  effects none
+{
+  if dir == "" {
+    return name.clone();
+  }
+  return cat3(&dir, &"/", &name);
+}
+
+fn abs_of(work: &String, rel: &String) -> String
+  intent "作業木のルートと相対パスをつなぐ（rel が空ならルート）"
+  requires none
+  ensures none
+  effects none
+{
+  if rel == "" {
+    return work.clone();
+  }
+  return join_path(&work, &rel);
+}
+
+fn merge_items(left: &List<DirItem>, right: &List<DirItem>) -> List<DirItem>
+  intent "名前で整列済みの 2 つの一覧を併合する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  let mut j = 0;
+  while i < left.len() || j < right.len() {
+    let mut take_right = false;
+    if i >= left.len() {
+      take_right = true;
+    } else {
+      if j < right.len() {
+        match left.get(i) {
+          None => {}
+          Some(l) => {
+            match right.get(j) {
+              None => {}
+              Some(r) => {
+                if cmp_paths(&r.name, &l.name) < 0 {
+                  take_right = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if take_right {
+      match right.get(j) {
+        None => {}
+        Some(r) => {
+          out.push(copy_dir_item(&r));
+        }
+      }
+      j = j + 1;
+    } else {
+      match left.get(i) {
+        None => {}
+        Some(l) => {
+          out.push(copy_dir_item(&l));
+        }
+      }
+      i = i + 1;
+    }
+  }
+  return out;
+}
+
+fn sort_items_range(src: &List<DirItem>, lo: Int, hi: Int) -> List<DirItem>
+  intent "src の [lo, hi) を名前のバイト順に整列した一覧を返す"
+  requires lo <= hi
+  ensures none
+  effects none
+{
+  if hi - lo <= 1 {
+    let mut one = List.new();
+    if hi - lo == 1 {
+      match src.get(lo) {
+        None => {}
+        Some(e) => {
+          one.push(copy_dir_item(&e));
+        }
+      }
+    }
+    return one;
+  }
+  let mid = lo + (hi - lo) / 2;
+  let left = sort_items_range(&src, lo, mid);
+  let right = sort_items_range(&src, mid, hi);
+  return merge_items(&left, &right);
+}
+
+fn find_item(items: &List<DirItem>, name: &String) -> Int
+  intent "名前で整列済みの一覧から name の位置を二分探索で返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut lo = 0;
+  let mut hi = items.len();
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    match items.get(mid) {
+      None => {
+        return -1;
+      }
+      Some(e) => {
+        let c = cmp_paths(&e.name, &name);
+        if c == 0 {
+          return mid;
+        }
+        if c < 0 {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+pub fn list_sorted(work: &String, rel_dir: &String) -> Result<List<DirItem>, GitError>
+  intent "作業木の中のディレクトリのエントリを名前のバイト順に整列して返す。ディレクトリが無ければ NotFound。上限は 1 回の add のファイル数の上限と同じ"
+  requires none
+  ensures none
+  effects fs
+{
+  let items = list_items(&abs_of(&work, &rel_dir), max_add_files())?;
+  return Ok(sort_items_range(&items, 0, items.len()));
+}
+
+// ディレクトリの一覧のキャッシュ（同じディレクトリの連続した問い合わせを速くする。変更のない読み取りの間だけ使う）。
+pub struct DirCache {
+  dirs: List<String>,
+  lists: List<List<DirItem>>,
+}
+
+pub fn new_cache() -> DirCache
+  intent "空のディレクトリ一覧キャッシュを作る"
+  requires none
+  ensures none
+  effects none
+{
+  return DirCache { dirs: List.new(), lists: List.new() };
+}
+
+fn cache_find(c: &DirCache, dir: &String) -> Int
+  intent "キャッシュにある dir の位置を返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < c.dirs.len() {
+    match c.dirs.get(i) {
+      None => {}
+      Some(d) => {
+        if d == dir {
+          return i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn cache_kind(c: &mut DirCache, work: &String, rel: &String) -> Result<Int, GitError>
+  intent "rel（親のディレクトリが実在することが前提）の種別を、親ディレクトリの一覧から返す。親が無ければ「無い」"
+  requires none
+  ensures none
+  effects fs
+{
+  let parent = rel_parent(&rel);
+  let name = rel_name(&rel);
+  let mut at = cache_find(&c, &parent);
+  if at < 0 {
+    let mut loaded = List.new();
+    match list_sorted(&work, &parent) {
+      Ok(l) => {
+        loaded = l;
+      }
+      Err(e) => {
+        let nf = match e {
+          GitError.NotFound(_) => true,
+          _ => false,
+        };
+        if !nf {
+          return Err(e);
+        }
+      }
+    }
+    if c.dirs.len() >= 256 {
+      c.dirs = List.new();
+      c.lists = List.new();
+    }
+    c.dirs.push(parent.clone());
+    c.lists.push(loaded);
+    at = c.dirs.len() - 1;
+  }
+  match c.lists.get(at) {
+    None => {
+      return Ok(0);
+    }
+    Some(l) => {
+      let pos = find_item(&l, &name);
+      if pos < 0 {
+        return Ok(0);
+      }
+      return match l.get(pos) {
+        None => Ok(0),
+        Some(it) => Ok(item_kind(&it)),
+      };
+    }
+  }
+}
+
+pub struct Probe {
+  kind: Int,
+  blocker: String,
+}
+
+pub fn probe_path(c: &mut DirCache, work: &String, rel: &String) -> Result<Probe, GitError>
+  intent "rel を上から順にたどる。途中の構成要素がディレクトリでない実体（ファイル・symlink など）なら、その構成要素のパスを blocker として返す。途中で無くなれば kind は「無い」。最後まで着けば rel 自身の種別を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  validate_path(&rel)?;
+  let b = rel.as_bytes();
+  let mut prefix = "";
+  let mut start = 0;
+  let mut i = 0;
+  while i <= b.len() {
+    if i == b.len() || b.get(i).unwrap_or(0) == 47 {
+      let comp = b.slice(start, i).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+      prefix = rel_join(&prefix, &comp);
+      let k = cache_kind(&mut c, &work, &prefix)?;
+      if k == 0 {
+        return Ok(Probe { kind: 0, blocker: "" });
+      }
+      if i == b.len() {
+        return Ok(Probe { kind: k, blocker: "" });
+      }
+      if k != 2 {
+        return Ok(Probe { kind: k, blocker: prefix });
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return Ok(Probe { kind: 0, blocker: "" });
+}
+
+pub struct WtFile {
+  content: Bytes,
+  exec: Bool,
+}
+
+fn read_in_dir(d: &Dir, rel: &String) -> Result<WtFile, GitError>
+  intent "開いた作業木のルートから rel の通常ファイルを読む（symlink は辿らない）。モードの実行ビットも返す。大きさの上限は 64 MiB"
+  requires none
+  ensures none
+  effects fs
+{
+  let opts = fs.open_options();
+  match d.open_file(&Path.new(&rel), &opts) {
+    Err(e) => {
+      return Err(map_io(&e, &"failed to open work tree file"));
+    }
+    Ok(f) => {
+      let outcome = read_open_file(&f);
+      let _ = f.close();
+      return outcome;
+    }
+  }
+}
+
+fn read_open_file(f: &File) -> Result<WtFile, GitError>
+  intent "開いたファイルの中身と実行ビットを読む。通常ファイルでなければ TypeMismatch"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut m = 0;
+  match f.mode() {
+    Ok(v) => {
+      m = v;
+    }
+    Err(_) => {
+      return Err(GitError.TypeMismatch("work tree path is not a regular file"));
+    }
+  }
+  let size = file_size(&f)?;
+  if size > max_object_size() {
+    return Err(GitError.LimitExceeded("work tree file is larger than the object size limit"));
+  }
+  let content = read_range(&f, 0, size)?;
+  let exec = m / 64 % 2 == 1;
+  return Ok(WtFile { content: content, exec: exec });
+}
+
+pub fn read_worktree_file(work: &String, rel: &String) -> Result<WtFile, GitError>
+  intent "作業木の通常ファイルを読む。パスを検査し、Dir 起点で開く（構成要素・末尾の symlink は拒否）。内容はバイト列のまま変換しない"
+  requires none
+  ensures none
+  effects fs
+{
+  validate_path(&rel)?;
+  match fs.open_dir(&Path.new(&work)) {
+    Err(e) => {
+      return Err(map_io(&e, &"failed to open work tree"));
+    }
+    Ok(d) => {
+      let outcome = read_in_dir(&d, &rel);
+      let _ = d.close();
+      return outcome;
+    }
+  }
+}
+
+fn dir_is_plain(path: &String) -> Result<Bool, GitError>
+  intent "path が実在する通常のディレクトリ（全構成要素が symlink でない）かを返す。無ければ false。それ以外の理由で開けなければ InvalidPath"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.open_dir(&Path.new(&path)) {
+    Ok(d) => {
+      let _ = d.close();
+      return Ok(true);
+    }
+    Err(e) => {
+      return match e {
+        IoError.NotFound(_) => Ok(false),
+        _ => Err(GitError.InvalidPath("a directory on the path is not a plain directory")),
+      };
+    }
+  }
+}
+
+fn ensure_dirs(work: &String, rel_dir: &String) -> Result<Bool, GitError>
+  intent "作業木の中の rel_dir を祖先ごとに作る。作るたびに、その構成要素が通常のディレクトリ（symlink でない）であることを開いて確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  if rel_dir == "" {
+    return Ok(true);
+  }
+  let b = rel_dir.as_bytes();
+  let mut prefix = "";
+  let mut start = 0;
+  let mut i = 0;
+  while i <= b.len() {
+    if i == b.len() || b.get(i).unwrap_or(0) == 47 {
+      let comp = b.slice(start, i).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+      prefix = rel_join(&prefix, &comp);
+      let abs = abs_of(&work, &prefix);
+      if !dir_is_plain(&abs)? {
+        match fs.create_dir(&Path.new(&abs)) {
+          Ok(_) => {}
+          Err(e) => {
+            match e {
+              IoError.AlreadyExists(_) => {}
+              _ => {
+                return Err(map_io(&e, &"failed to create a work tree directory"));
+              }
+            }
+          }
+        }
+        if !dir_is_plain(&abs)? {
+          return Err(GitError.InvalidPath("a created directory is not a plain directory"));
+        }
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn write_tmp(d: &Dir, tmp_rel: &String, content: &Bytes, exec: Bool) -> Result<Bool, GitError>
+  intent "一時ファイルを排他的に作って内容を書き、モードを 0644／0755 にして閉じる"
+  requires none
+  ensures none
+  effects fs
+{
+  let opts = fs.open_options().write(true).create_new(true);
+  match d.open_file(&Path.new(&tmp_rel), &opts) {
+    Err(e) => {
+      return Err(map_io(&e, &"failed to create a temporary file in the work tree"));
+    }
+    Ok(f) => {
+      let mut file = f;
+      if content.len() > 0 {
+        match file.write_all(&content) {
+          Err(_) => {
+            let _ = file.close();
+            return Err(GitError.Io("failed to write a work tree file"));
+          }
+          Ok(_) => {}
+        }
+      }
+      let mut mode = 420;
+      if exec {
+        mode = 493;
+      }
+      match file.set_mode(mode) {
+        Err(_) => {
+          let _ = file.close();
+          return Err(GitError.Io("failed to set the file mode"));
+        }
+        Ok(_) => {}
+      }
+      match file.close() {
+        Err(_) => {
+          return Err(GitError.Io("failed to close a work tree file"));
+        }
+        Ok(_) => {}
+      }
+      return Ok(true);
+    }
+  }
+}
+
+pub fn write_worktree_file(work: &String, rel: &String, content: &Bytes, exec: Bool) -> Result<Bool, GitError>
+  intent "作業木のファイルを書く。パスを検査し、親ディレクトリを（通常のディレクトリであることを確かめながら）作り、同じディレクトリの一時名に書いてから rename する。exec なら 0755、そうでなければ 0644。symlink をたどって書かない"
+  requires none
+  ensures none
+  effects fs, random
+{
+  validate_path(&rel)?;
+  let parent = rel_parent(&rel);
+  ensure_dirs(&work, &parent)?;
+  let tmp_name = cat3(&".sigil-tmp-", &random_hex(8)?, &"");
+  let tmp_rel = rel_join(&parent, &tmp_name);
+  match fs.open_dir(&Path.new(&work)) {
+    Err(e) => {
+      return Err(map_io(&e, &"failed to open work tree"));
+    }
+    Ok(d) => {
+      match write_tmp(&d, &tmp_rel, &content, exec) {
+        Ok(_) => {}
+        Err(e) => {
+          let _ = d.remove_file(&Path.new(&tmp_rel));
+          let _ = d.close();
+          return Err(e);
+        }
+      }
+      let mut outcome = Ok(true);
+      match fs.rename(&Path.new(&abs_of(&work, &tmp_rel)), &Path.new(&abs_of(&work, &rel))) {
+        Ok(_) => {}
+        Err(e) => {
+          let _ = d.remove_file(&Path.new(&tmp_rel));
+          outcome = Err(map_io(&e, &"failed to move a work tree file into place"));
+        }
+      }
+      let _ = d.close();
+      return outcome;
+    }
+  }
+}
+
+pub fn remove_worktree_file(work: &String, rel: &String) -> Result<Bool, GitError>
+  intent "作業木のファイルを消し（Dir 起点。symlink は辿らない）、空になった親ディレクトリを作業木のルートの手前まで消す。無ければ false"
+  requires none
+  ensures none
+  effects fs
+{
+  validate_path(&rel)?;
+  let mut removed = false;
+  match fs.open_dir(&Path.new(&work)) {
+    Err(e) => {
+      return Err(map_io(&e, &"failed to open work tree"));
+    }
+    Ok(d) => {
+      match d.remove_file(&Path.new(&rel)) {
+        Ok(_) => {
+          removed = true;
+        }
+        Err(e) => {
+          let nf = match e {
+            IoError.NotFound(_) => true,
+            _ => false,
+          };
+          if !nf {
+            let _ = d.close();
+            return Err(map_io(&e, &"failed to remove a work tree file"));
+          }
+        }
+      }
+      let _ = d.close();
+    }
+  }
+  prune_empty_dirs(&work, &rel_parent(&rel));
+  return Ok(removed);
+}
+
+pub fn prune_empty_dirs(work: &String, rel_dir: &String) -> Bool
+  intent "rel_dir から作業木のルートの手前まで、空のディレクトリを下から消す。空でない、または通常のディレクトリでなければそこで止める（失敗は無視する）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut cur = rel_dir.clone();
+  while cur != "" {
+    let abs = abs_of(&work, &cur);
+    let plain = match dir_is_plain(&abs) {
+      Ok(p) => p,
+      Err(_) => false,
+    };
+    if !plain {
+      return false;
+    }
+    match fs.remove_dir(&Path.new(&abs)) {
+      Ok(_) => {}
+      Err(_) => {
+        return false;
+      }
+    }
+    cur = rel_parent(&cur);
+  }
+  return true;
+}

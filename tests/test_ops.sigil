@@ -1,0 +1,986 @@
+module tests.test_ops
+  targets server
+  trust none
+
+use git.checkout.checkout;
+use git.commit.commit_message;
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.commit.encode_commit;
+use git.commit.new_commit_object;
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.join_path;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.fsio.remove_file_if_exists;
+use git.hash.compute_sha256;
+use git.hash.hex_to_bytes;
+use git.hash.int_to_str;
+use git.index.IndexEntry;
+use git.index.find_entry;
+use git.index.index_path;
+use git.index.new_index_entry;
+use git.index.parse_index;
+use git.index.read_index;
+use git.index.serialize_index;
+use git.index.sort_entries;
+use git.object.ObjectType;
+use git.odb.odb_read;
+use git.odb.odb_write;
+use git.ops.Ident;
+use git.ops.add_paths;
+use git.ops.commit;
+use git.ops.new_ident;
+use git.ops.write_tree;
+use git.refs.HeadState;
+use git.refs.create_branch;
+use git.refs.read_head;
+use git.refs.read_ref;
+use git.refs.set_head_symbolic;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.tree.encode_tree;
+use git.tree.new_tree_entry;
+use git.worktree.list_sorted;
+use git.worktree.read_worktree_file;
+use git.worktree.rel_join;
+use git.worktree.remove_worktree_file;
+use git.worktree.write_worktree_file;
+
+fn expect(ok: Bool, label: &String) -> Bool
+  intent "条件が偽ならラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  if !ok {
+    console.log(&cat3(&"  FAILED: ", &label, &""));
+  }
+  return ok;
+}
+
+fn kind_b(r: &Result<Bool, GitError>) -> String
+  intent "結果が成功なら ok、失敗ならエラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn kind_s(r: &Result<String, GitError>) -> String
+  intent "結果が成功なら ok、失敗ならエラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn kind_i(r: &Result<List<IndexEntry>, GitError>) -> String
+  intent "結果が成功なら ok、失敗ならエラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn str_or(r: &Result<String, GitError>, other: &String) -> String
+  intent "成功なら値、失敗なら other を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(s) => s.clone(),
+    Err(_) => other.clone(),
+  };
+}
+
+fn ident(t: Int) -> Ident
+  intent "テスト用の署名を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return new_ident("T", "t@example.com", t, "+0000");
+}
+
+fn wf(work: &String, rel: &String, text: &String, exec: Bool) -> Bool
+  intent "テスト用に作業木のファイルを書く"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return match write_worktree_file(&work, &rel, &text.as_bytes(), exec) {
+    Ok(_) => true,
+    Err(_) => false,
+  };
+}
+
+fn text_of(work: &String, rel: &String) -> String
+  intent "作業木のファイルの内容（文字列）を返す。読めなければ <missing>"
+  requires none
+  ensures none
+  effects fs
+{
+  return match read_worktree_file(&work, &rel) {
+    Ok(f) => f.content.to_string_utf8().unwrap_or("<binary>"),
+    Err(_) => "<missing>",
+  };
+}
+
+fn exec_of(work: &String, rel: &String) -> Bool
+  intent "作業木のファイルに実行ビットが付いているかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  return match read_worktree_file(&work, &rel) {
+    Ok(f) => f.exec,
+    Err(_) => false,
+  };
+}
+
+fn snapshot_into(work: &String, rel: &String, out: &mut Bytes, depth: Int) -> Bool
+  intent "作業木（.git を除く）の構造と内容を決まった並びの文字列にして out に足す"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 32 {
+    return false;
+  }
+  match list_sorted(&work, &rel) {
+    Err(_) => {
+      return false;
+    }
+    Ok(items) => {
+      let mut i = 0;
+      while i < items.len() {
+        match items.get(i) {
+          None => {}
+          Some(it) => {
+            if rel == "" && it.name == ".git" {
+              // 除く
+            } else {
+              let child = rel_join(&rel, &it.name);
+              if it.is_dir {
+                out.extend(&cat3(&"D:", &child, &"\n").as_bytes());
+                snapshot_into(&work, &child, &mut out, depth + 1);
+              } else {
+                out.extend(&cat3(&"F:", &child, &"=").as_bytes());
+                out.extend(&text_of(&work, &child).as_bytes());
+                if exec_of(&work, &child) {
+                  out.extend(&"(x)".as_bytes());
+                }
+                out.push(10);
+              }
+            }
+          }
+        }
+        i = i + 1;
+      }
+      return true;
+    }
+  }
+}
+
+fn snapshot(work: &String) -> String
+  intent "作業木（.git を除く）の構造と内容の文字列を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut out = Bytes.new();
+  let _ = snapshot_into(&work, &"", &mut out, 0);
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn head_commit(repo: &Repo) -> String
+  intent "HEAD の commit の識別子（無ければ none）を返す"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_head(&repo) {
+    Err(_) => "error",
+    Ok(h) => match h {
+      HeadState.Detached(id) => id.clone(),
+      HeadState.Symbolic(r) => match read_ref(&repo, &r) {
+        Ok(o) => match o {
+          None => "none",
+          Some(id) => id.clone(),
+        },
+        Err(_) => "error",
+      },
+    },
+  };
+}
+
+fn head_name(repo: &Repo) -> String
+  intent "HEAD がシンボリックならそのブランチの参照名、分離なら detached を返す"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_head(&repo) {
+    Err(_) => "error",
+    Ok(h) => match h {
+      HeadState.Detached(_) => "detached",
+      HeadState.Symbolic(r) => r.clone(),
+    },
+  };
+}
+
+fn one(p: &String) -> List<String>
+  intent "1 つのパスだけの一覧を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(p.clone());
+  return l;
+}
+
+fn index_text(repo: &Repo) -> String
+  intent "索引の内容を `モード 先頭8桁 パス` の行に並べた文字列を返す"
+  requires none
+  ensures none
+  effects fs.read
+{
+  match read_index(&repo) {
+    Err(e) => {
+      return cat3(&"error:", &error_kind_name(&e), &"");
+    }
+    Ok(es) => {
+      let mut out = "";
+      let mut i = 0;
+      while i < es.len() {
+        match es.get(i) {
+          None => {}
+          Some(e) => {
+            out = cat3(&out, &cat3(&int_to_str(e.mode), &" ", &e.path), &"\n");
+          }
+        }
+        i = i + 1;
+      }
+      return out;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 索引の符号化
+// ---------------------------------------------------------------------------
+
+fn reseal(body: &Bytes) -> Bytes
+  intent "検査値（末尾 32 byte）を除いた本体に、正しい SHA-256 を付け直す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = body.clone();
+  out.extend(&compute_sha256(&body));
+  return out;
+}
+
+fn body_of(data: &Bytes) -> Bytes
+  intent "索引のバイト列から末尾の検査値を除く"
+  requires none
+  ensures none
+  effects none
+{
+  return data.slice(0, data.len() - 32).unwrap_or(Bytes.new());
+}
+
+fn sample_entries() -> List<IndexEntry>
+  intent "テスト用の整列済みの索引のエントリ"
+  requires none
+  ensures none
+  effects none
+{
+  let id1 = "1111111111111111111111111111111111111111111111111111111111111111";
+  let id2 = "2222222222222222222222222222222222222222222222222222222222222222";
+  let mut l = List.new();
+  l.push(new_index_entry("a.txt", 100644, id1.clone()));
+  l.push(new_index_entry("b.d/x", 100755, id2.clone()));
+  l.push(new_index_entry("b.d/y", 100644, id1.clone()));
+  l.push(new_index_entry("link", 120000, id2.clone()));
+  l.push(new_index_entry("sub", 160000, id1.clone()));
+  return l;
+}
+
+fn test_index_codec() -> Bool
+  intent "索引の符号化・復号、検査値、並び、版、フラグ、拡張、上限を試す"
+  requires none
+  ensures none
+  effects console
+{
+  let mut ok = true;
+  let src = sample_entries();
+  match serialize_index(&src) {
+    Err(_) => {
+      ok = expect(false, &"serialize") && ok;
+    }
+    Ok(data) => {
+      match parse_index(&data) {
+        Err(_) => {
+          ok = expect(false, &"parse round trip") && ok;
+        }
+        Ok(back) => {
+          ok = expect(back.len() == 5, &"round trip count") && ok;
+          let mut same = back.len() == src.len();
+          let mut i = 0;
+          while i < back.len() && i < src.len() {
+            match back.get(i) {
+              None => {}
+              Some(b) => {
+                match src.get(i) {
+                  None => {}
+                  Some(s) => {
+                    if b.path != s.path || b.mode != s.mode || b.id != s.id {
+                      same = false;
+                    }
+                  }
+                }
+              }
+            }
+            i = i + 1;
+          }
+          ok = expect(same, &"round trip entries") && ok;
+        }
+      }
+      // 検査値が合わない
+      let mut bad = data.clone();
+      let _ = bad.set(20, 255);
+      ok = expect(kind_i(&parse_index(&bad)) == "Corrupt", &"bad checksum is Corrupt") && ok;
+      // 短すぎる・署名が違う
+      ok = expect(kind_i(&parse_index(&Bytes.new())) == "Corrupt", &"empty is Corrupt") && ok;
+      let mut sig = body_of(&data);
+      let _ = sig.set(0, 88);
+      ok = expect(kind_i(&parse_index(&reseal(&sig))) == "Corrupt", &"bad signature is Corrupt") && ok;
+      // 版 3
+      let mut v3 = body_of(&data);
+      let _ = v3.set(7, 3);
+      ok = expect(kind_i(&parse_index(&reseal(&v3))) == "UnsupportedFormat", &"version 3 is unsupported") && ok;
+      // エントリ数の上限（宣言された数が大きすぎる）
+      let mut many = body_of(&data);
+      let _ = many.set(9, 1);
+      let _ = many.set(10, 134);
+      let _ = many.set(11, 161);
+      ok = expect(kind_i(&parse_index(&reseal(&many))) == "LimitExceeded", &"huge entry count is LimitExceeded") && ok;
+      // stage（衝突）・拡張フラグ: 最初のエントリのフラグは 12 + 72 = 84, 85 byte 目
+      let mut staged = body_of(&data);
+      let _ = staged.set(84, 16);
+      ok = expect(kind_i(&parse_index(&reseal(&staged))) == "UnsupportedFormat", &"unmerged entry is unsupported") && ok;
+      let mut ext = body_of(&data);
+      let _ = ext.set(84, 64);
+      ok = expect(kind_i(&parse_index(&reseal(&ext))) == "UnsupportedFormat", &"extended flag is unsupported") && ok;
+      // 拡張: 大文字（キャッシュ）は読み飛ばし、必須の拡張は拒否する
+      let mut cache = body_of(&data);
+      cache.extend(&"TREE".as_bytes());
+      cache.push_u32_be(2);
+      cache.push(0);
+      cache.push(0);
+      ok = expect(kind_i(&parse_index(&reseal(&cache))) == "ok", &"optional extension is skipped") && ok;
+      let mut req = body_of(&data);
+      req.extend(&"link".as_bytes());
+      req.push_u32_be(0);
+      ok = expect(kind_i(&parse_index(&reseal(&req))) == "UnsupportedFormat", &"required extension is unsupported") && ok;
+      let mut trunc = body_of(&data);
+      trunc.extend(&"TREE".as_bytes());
+      trunc.push_u32_be(1000);
+      ok = expect(kind_i(&parse_index(&reseal(&trunc))) == "Corrupt", &"truncated extension is Corrupt") && ok;
+    }
+  }
+  // 並びの違反・重複・不正なパス・不正な mode は書く前に拒否する
+  let id1 = "1111111111111111111111111111111111111111111111111111111111111111";
+  let mut unsorted = List.new();
+  unsorted.push(new_index_entry("b", 100644, id1.clone()));
+  unsorted.push(new_index_entry("a", 100644, id1.clone()));
+  ok = expect(match serialize_index(&unsorted) {
+    Ok(_) => false,
+    Err(_) => true,
+  }, &"unsorted index is rejected") && ok;
+  let mut dup = List.new();
+  dup.push(new_index_entry("a", 100644, id1.clone()));
+  dup.push(new_index_entry("a", 100644, id1.clone()));
+  ok = expect(match serialize_index(&dup) {
+    Ok(_) => false,
+    Err(_) => true,
+  }, &"duplicate path is rejected") && ok;
+  let mut gitpath = List.new();
+  gitpath.push(new_index_entry(".git/config", 100644, id1.clone()));
+  ok = expect(match serialize_index(&gitpath) {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == "InvalidPath",
+  }, &".git path is InvalidPath") && ok;
+  let mut badmode = List.new();
+  badmode.push(new_index_entry("a", 100664, id1.clone()));
+  ok = expect(match serialize_index(&badmode) {
+    Ok(_) => false,
+    Err(_) => true,
+  }, &"bad mode is rejected") && ok;
+  // sort_entries と find_entry
+  let mut mixed = List.new();
+  mixed.push(new_index_entry("z", 100644, id1.clone()));
+  mixed.push(new_index_entry("a/b", 100644, id1.clone()));
+  mixed.push(new_index_entry("a-b", 100644, id1.clone()));
+  mixed.push(new_index_entry("a", 100644, id1.clone()));
+  let sorted = sort_entries(&mixed);
+  ok = expect(find_entry(&sorted, &"a") == 0 && find_entry(&sorted, &"a-b") == 1 && find_entry(&sorted, &"a/b") == 2 && find_entry(&sorted, &"z") == 3 && find_entry(&sorted, &"nope") == -1, &"sort order is bytewise") && ok;
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// add・commit・checkout
+// ---------------------------------------------------------------------------
+
+fn test_add_commit(repo: &Repo) -> Bool
+  intent "add（ファイル・ディレクトリ・実行ビット・拒否）と commit（tree・親・メッセージ）を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let work = repo.work_dir.clone();
+  ok = expect(wf(&work, &"a.txt", &"alpha\n", false), &"write a.txt") && ok;
+  ok = expect(wf(&work, &"dir/b.txt", &"bravo\n", false), &"write dir/b.txt") && ok;
+  ok = expect(wf(&work, &"dir/sub/run.sh", &"#!/bin/sh\n", true), &"write run.sh") && ok;
+  ok = expect(wf(&work, &"dir.txt", &"dot\n", false), &"write dir.txt") && ok;
+  ok = expect(index_text(&repo) == "", &"index starts empty") && ok;
+  // 失敗する add は索引を変えない
+  let mut two = List.new();
+  two.push("a.txt");
+  two.push("missing.txt");
+  ok = expect(kind_b(&add_paths(&repo, &two)) == "NotFound", &"add of a missing path is NotFound") && ok;
+  ok = expect(index_text(&repo) == "", &"failed add leaves the index unchanged") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&".git/config"))) == "InvalidPath", &"add .git/config") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"../x"))) == "InvalidPath", &"add ../x") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"/etc/passwd"))) == "InvalidPath", &"add absolute path") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"dir\\x"))) == "InvalidPath", &"add backslash") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"dir/"))) == "InvalidPath", &"add trailing slash") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&".GIT/x"))) == "InvalidPath", &"add .GIT variant") && ok;
+  // ディレクトリは再帰
+  ok = expect(kind_b(&add_paths(&repo, &one(&"dir"))) == "ok", &"add dir") && ok;
+  ok = expect(index_text(&repo) == "100644 dir/b.txt\n100755 dir/sub/run.sh\n", &"index after add dir") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"."))) == "ok", &"add .") && ok;
+  ok = expect(index_text(&repo) == "100644 a.txt\n100644 dir.txt\n100644 dir/b.txt\n100755 dir/sub/run.sh\n", &"index after add .") && ok;
+  ok = expect(!has_lock(&repo), &"no stale index.lock") && ok;
+  // 最初の commit
+  let c1 = commit(&repo, &ident(1700000000), &ident(1700000000), &"first\n".as_bytes());
+  let id1 = str_or(&c1, &"");
+  ok = expect(id1.len() == 64, &"first commit id") && ok;
+  ok = expect(head_commit(&repo) == id1, &"branch points to the first commit") && ok;
+  match odb_read(&repo, &id1) {
+    Err(_) => {
+      ok = expect(false, &"read first commit") && ok;
+    }
+    Ok(o) => {
+      match decode_commit(&o.content) {
+        Err(_) => {
+          ok = expect(false, &"decode first commit") && ok;
+        }
+        Ok(c) => {
+          ok = expect(commit_parents(&c).len() == 0, &"first commit has no parent") && ok;
+          ok = expect(commit_message(&c) == "first\n".as_bytes(), &"message round trip") && ok;
+          ok = expect(str_or(&write_tree(&repo), &"x") == commit_tree_id(&c), &"commit tree equals write_tree") && ok;
+        }
+      }
+    }
+  }
+  // 2 つ目: メッセージはバイト列のまま（末尾の改行なし・非 ASCII）
+  ok = expect(wf(&work, &"a.txt", &"alpha2\n", false), &"modify a.txt") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"a.txt"))) == "ok", &"add a.txt again") && ok;
+  let msg = "second あ".as_bytes();
+  let c2 = commit(&repo, &ident(1700000100), &ident(1700000100), &msg);
+  let id2 = str_or(&c2, &"");
+  ok = expect(id2.len() == 64 && id2 != id1, &"second commit id") && ok;
+  match odb_read(&repo, &id2) {
+    Err(_) => {
+      ok = expect(false, &"read second commit") && ok;
+    }
+    Ok(o) => {
+      match decode_commit(&o.content) {
+        Err(_) => {
+          ok = expect(false, &"decode second commit") && ok;
+        }
+        Ok(c) => {
+          ok = expect(commit_parents(&c).len() == 1, &"second commit has a parent") && ok;
+          ok = expect(commit_message(&c) == msg, &"message is not normalized") && ok;
+        }
+      }
+    }
+  }
+  // 署名の検査と、分離 HEAD
+  ok = expect(kind_s(&commit(&repo, &new_ident("T", "t@e.com>x", 1, "+0000"), &ident(1), &"m\n".as_bytes())) == "Corrupt", &"bad email") && ok;
+  ok = expect(kind_s(&commit(&repo, &new_ident("T", "t@e.com", 1, "0900"), &ident(1), &"m\n".as_bytes())) == "Corrupt", &"bad time zone") && ok;
+  ok = expect(kind_s(&commit(&repo, &new_ident("T\n", "t@e.com", 1, "+0900"), &ident(1), &"m\n".as_bytes())) == "Corrupt", &"newline in name") && ok;
+  ok = expect(!has_lock(&repo), &"no stale index.lock after commits") && ok;
+  ok = expect(head_commit(&repo) == id2, &"failed commits do not move the branch") && ok;
+  return ok;
+}
+
+fn has_lock(repo: &Repo) -> Bool
+  intent "index.lock が残っているかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  match list_sorted(&repo.git_dir, &"") {
+    Err(_) => {
+      return true;
+    }
+    Ok(items) => {
+      let mut i = 0;
+      while i < items.len() {
+        match items.get(i) {
+          None => {}
+          Some(it) => {
+            if it.name == "index.lock" {
+              return true;
+            }
+          }
+        }
+        i = i + 1;
+      }
+      return false;
+    }
+  }
+}
+
+fn put_index(repo: &Repo, entries: &List<IndexEntry>) -> Bool
+  intent "テスト用に索引ファイルを直接置き換える"
+  requires none
+  ensures none
+  effects fs
+{
+  let path = index_path(&repo);
+  let _ = remove_file_if_exists(&path);
+  return match serialize_index(&entries) {
+    Err(_) => false,
+    Ok(data) => match create_synced_file(&path, &data) {
+      Ok(_) => true,
+      Err(_) => false,
+    },
+  };
+}
+
+fn blob(repo: &Repo, text: &String) -> String
+  intent "テスト用に blob を書いて識別子を返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return str_or(&odb_write(&repo, &ObjectType.Blob, &text.as_bytes()), &"");
+}
+
+fn entry_id_of(entries: &List<IndexEntry>, path: &String) -> String
+  intent "一覧から path のエントリの識別子を返す。無ければ空"
+  requires none
+  ensures none
+  effects none
+{
+  let at = find_entry(&entries, &path);
+  if at < 0 {
+    return "";
+  }
+  return match entries.get(at) {
+    None => "",
+    Some(e) => e.id.clone(),
+  };
+}
+
+fn commit_with_index(repo: &Repo, branch_ref: &String, entries: &List<IndexEntry>, t: Int) -> String
+  intent "索引を entries に置き換え、HEAD を未作成のブランチに向けて commit し、その commit の識別子を返す（作業木は変えない）"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if !put_index(&repo, &entries) {
+    return "";
+  }
+  match set_head_symbolic(&repo, &branch_ref) {
+    Err(_) => {
+      return "";
+    }
+    Ok(_) => {}
+  }
+  return str_or(&commit(&repo, &ident(t), &ident(t), &"topic\n".as_bytes()), &"");
+}
+
+fn state_line(repo: &Repo) -> String
+  intent "作業木・HEAD・索引の状態を 1 つの文字列にする（失敗した checkout で変わっていないことの確認用）"
+  requires none
+  ensures none
+  effects fs
+{
+  return cat3(&snapshot(&repo.work_dir), &cat3(&head_name(&repo), &head_commit(&repo), &index_text(&repo)), &"");
+}
+
+fn expect_refused(repo: &Repo, target: &String, kind: &String, label: &String) -> Bool
+  intent "checkout が指定の種別のエラーで失敗し、作業木・HEAD・索引が変わらないことを確かめる"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let before = state_line(&repo);
+  let k = kind_s(&checkout(&repo, &target));
+  let mut ok = expect(k == kind, &cat3(&label, &cat3(&": error kind ", &k, &""), &""));
+  ok = expect(state_line(&repo) == before, &cat3(&label, &": state is unchanged", &"")) && ok;
+  ok = expect(!has_lock(&repo), &cat3(&label, &": no stale index.lock", &"")) && ok;
+  return ok;
+}
+
+fn tree_with(repo: &Repo, mode: Int, name: &Bytes, blob_id: &String) -> String
+  intent "テスト用に、1 つのエントリだけの tree を書いて識別子を返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut items = List.new();
+  match hex_to_bytes(&blob_id) {
+    Err(_) => {
+      return "";
+    }
+    Ok(idb) => {
+      items.push(new_tree_entry(mode, name.clone(), idb));
+    }
+  }
+  return match encode_tree(&items) {
+    Err(_) => "",
+    Ok(content) => str_or(&odb_write(&repo, &ObjectType.Tree, &content), &""),
+  };
+}
+
+fn commit_of_tree(repo: &Repo, tree_id: &String) -> String
+  intent "テスト用に、親のない commit オブジェクトを書いて識別子を返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let obj = new_commit_object(tree_id.clone(), List.new(), "T <t@example.com> 1700000000 +0000".as_bytes(), "T <t@example.com> 1700000000 +0000".as_bytes(), List.new(), "evil\n".as_bytes());
+  return match encode_commit(&obj) {
+    Err(_) => "",
+    Ok(content) => str_or(&odb_write(&repo, &ObjectType.Commit, &content), &""),
+  };
+}
+
+fn test_checkout(repo: &Repo) -> Bool
+  intent "checkout の往復（内容・モード・削除・ディレクトリとファイルの置き換え）と、未保存の変更を失わない拒否を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let work = repo.work_dir.clone();
+  let main_ref = "refs/heads/main";
+  let main_tip = head_commit(&repo);
+  let main_entries = match read_index(&repo) {
+    Ok(e) => e,
+    Err(_) => List.new(),
+  };
+  let main_state = state_line(&repo);
+  ok = expect(main_entries.len() == 4, &"main has four files") && ok;
+  // topic: a.txt は同じ、dir/b.txt は変更、run.sh は実行ビットなし、新規 n/new.txt、dir.txt（ファイル）は消えて dir.txt/inner（ディレクトリ）になる
+  let a_id = entry_id_of(&main_entries, &"a.txt");
+  let run_id = entry_id_of(&main_entries, &"dir/sub/run.sh");
+  let mut topic_entries = List.new();
+  topic_entries.push(new_index_entry("a.txt", 100644, a_id.clone()));
+  topic_entries.push(new_index_entry("dir.txt/inner", 100644, blob(&repo, &"inner\n")));
+  topic_entries.push(new_index_entry("dir/b.txt", 100644, blob(&repo, &"bravo2\n")));
+  topic_entries.push(new_index_entry("dir/sub/run.sh", 100644, run_id.clone()));
+  topic_entries.push(new_index_entry("n/new.txt", 100644, blob(&repo, &"new\n")));
+  let topic_id = commit_with_index(&repo, &"refs/heads/topic", &topic_entries, 1700000200);
+  ok = expect(topic_id.len() == 64, &"topic commit") && ok;
+  ok = expect(match set_head_symbolic(&repo, &main_ref) {
+    Ok(_) => true,
+    Err(_) => false,
+  }, &"back to main") && ok;
+  ok = expect(put_index(&repo, &main_entries), &"restore main index") && ok;
+  ok = expect(state_line(&repo) == main_state, &"state is restored") && ok;
+  ok = expect(head_commit(&repo) == main_tip, &"main tip is unchanged") && ok;
+
+  // 1. main → topic（クリーンな状態）
+  ok = expect(kind_s(&checkout(&repo, &"topic")) == "ok", &"checkout topic") && ok;
+  ok = expect(head_name(&repo) == "refs/heads/topic" && head_commit(&repo) == topic_id, &"HEAD is topic") && ok;
+  ok = expect(text_of(&work, &"dir/b.txt") == "bravo2\n", &"b.txt updated") && ok;
+  ok = expect(text_of(&work, &"dir.txt/inner") == "inner\n", &"file became a directory") && ok;
+  ok = expect(text_of(&work, &"n/new.txt") == "new\n", &"new file in a new directory") && ok;
+  ok = expect(!exec_of(&work, &"dir/sub/run.sh"), &"exec bit cleared") && ok;
+  ok = expect(index_text(&repo) == "100644 a.txt\n100644 dir.txt/inner\n100644 dir/b.txt\n100644 dir/sub/run.sh\n100644 n/new.txt\n", &"index matches topic") && ok;
+  // 2. topic → main（往復。モードも戻る）
+  ok = expect(kind_s(&checkout(&repo, &"main")) == "ok", &"checkout main") && ok;
+  ok = expect(state_line(&repo) == main_state, &"round trip restores everything") && ok;
+  ok = expect(exec_of(&work, &"dir/sub/run.sh"), &"exec bit restored") && ok;
+  ok = expect(text_of(&work, &"n/new.txt") == "<missing>", &"n/new.txt is gone") && ok;
+
+  // 3. 拒否: 作業木の変更
+  ok = expect(wf(&work, &"dir/b.txt", &"edited\n", false), &"edit b.txt") && ok;
+  ok = expect(expect_refused(&repo, &"topic", &"Conflict", &"modified file"), &"modified file is refused") && ok;
+  ok = expect(text_of(&work, &"dir/b.txt") == "edited\n", &"edit survives") && ok;
+  ok = expect(wf(&work, &"dir/b.txt", &"bravo\n", false), &"revert b.txt") && ok;
+  // 作業木の削除（モードだけ変わるパス）
+  ok = expect(match remove_worktree_file(&work, &"dir/sub/run.sh") {
+    Ok(_) => true,
+    Err(_) => false,
+  }, &"delete run.sh") && ok;
+  ok = expect(expect_refused(&repo, &"topic", &"Conflict", &"deleted file"), &"deleted file is refused") && ok;
+  ok = expect(wf(&work, &"dir/sub/run.sh", &"#!/bin/sh\n", true), &"restore run.sh") && ok;
+  // 実行ビットだけの変更
+  ok = expect(wf(&work, &"dir/sub/run.sh", &"#!/bin/sh\n", false), &"drop exec bit") && ok;
+  ok = expect(expect_refused(&repo, &"topic", &"Conflict", &"mode-only change"), &"mode-only change is refused") && ok;
+  ok = expect(wf(&work, &"dir/sub/run.sh", &"#!/bin/sh\n", true), &"restore exec bit") && ok;
+  ok = expect(state_line(&repo) == main_state, &"clean again") && ok;
+
+  // 4. 拒否: add 済みで未コミットの変更
+  ok = expect(wf(&work, &"dir/b.txt", &"staged\n", false), &"stage edit") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"dir/b.txt"))) == "ok", &"add staged edit") && ok;
+  ok = expect(wf(&work, &"dir/b.txt", &"bravo\n", false), &"revert worktree only") && ok;
+  ok = expect(expect_refused(&repo, &"topic", &"Conflict", &"staged change"), &"staged change is refused") && ok;
+  ok = expect(put_index(&repo, &main_entries), &"restore index") && ok;
+  ok = expect(state_line(&repo) == main_state, &"clean after restoring the index") && ok;
+
+  // 5. 拒否: 追跡されていないファイルの上書き、ディレクトリの場所にあるファイル
+  ok = expect(wf(&work, &"n/new.txt", &"mine\n", false), &"untracked n/new.txt") && ok;
+  ok = expect(expect_refused(&repo, &"topic", &"Conflict", &"untracked overwrite"), &"untracked overwrite is refused") && ok;
+  ok = expect(match remove_worktree_file(&work, &"n/new.txt") {
+    Ok(_) => true,
+    Err(_) => false,
+  }, &"remove untracked") && ok;
+  ok = expect(wf(&work, &"n", &"i am a file\n", false), &"untracked file named n") && ok;
+  ok = expect(expect_refused(&repo, &"topic", &"Conflict", &"untracked file blocks a directory"), &"untracked file blocking a new directory is refused") && ok;
+  ok = expect(match remove_worktree_file(&work, &"n") {
+    Ok(_) => true,
+    Err(_) => false,
+  }, &"remove untracked n") && ok;
+
+  // 6. 成功: 無関係な追跡外ファイルと、変更されないパスの作業木の変更は保たれる
+  ok = expect(wf(&work, &"zzz.txt", &"untracked\n", false), &"unrelated untracked file") && ok;
+  ok = expect(wf(&work, &"a.txt", &"alpha local\n", false), &"local edit of an unchanged path") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"topic")) == "ok", &"checkout with unrelated local changes") && ok;
+  ok = expect(text_of(&work, &"zzz.txt") == "untracked\n", &"untracked file survives") && ok;
+  ok = expect(text_of(&work, &"a.txt") == "alpha local\n", &"local edit of an unchanged path survives") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"main")) == "ok", &"checkout back") && ok;
+  ok = expect(match remove_worktree_file(&work, &"zzz.txt") {
+    Ok(_) => true,
+    Err(_) => false,
+  }, &"remove zzz.txt") && ok;
+  ok = expect(wf(&work, &"a.txt", &"alpha2\n", false), &"restore a.txt") && ok;
+  ok = expect(state_line(&repo) == main_state, &"clean state again") && ok;
+
+  // 7. 分離 HEAD と、見つからない・種類の違う対象
+  ok = expect(kind_s(&checkout(&repo, &topic_id)) == "ok", &"checkout by commit id") && ok;
+  ok = expect(head_name(&repo) == "detached" && head_commit(&repo) == topic_id, &"HEAD is detached") && ok;
+  ok = expect(kind_s(&commit(&repo, &ident(1), &ident(1), &"m\n".as_bytes())) == "UnsupportedFormat", &"commit on a detached HEAD is refused") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"main")) == "ok", &"back to main") && ok;
+  ok = expect(state_line(&repo) == main_state, &"clean after detached round trip") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"nope")) == "NotFound", &"unknown branch") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"bad..name")) == "InvalidRefName", &"invalid branch name") && ok;
+  match odb_read(&repo, &topic_id) {
+    Err(_) => {
+      ok = expect(false, &"read topic commit") && ok;
+    }
+    Ok(o) => {
+      match decode_commit(&o.content) {
+        Err(_) => {
+          ok = expect(false, &"decode topic commit") && ok;
+        }
+        Ok(c) => {
+          ok = expect(kind_s(&checkout(&repo, &commit_tree_id(&c))) == "TypeMismatch", &"a tree id is not a commit") && ok;
+        }
+      }
+    }
+  }
+  ok = expect(state_line(&repo) == main_state, &"state unchanged after refusals") && ok;
+  return ok;
+}
+
+fn test_malicious(repo: &Repo, base: &String) -> Bool
+  intent "悪意のある木（.git の変種・..・バックスラッシュ・UTF-8 でない名前・深すぎる木・symlink・gitlink）の checkout が、何も書かずに拒否されることを試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let before_base = match list_sorted(&base, &"") {
+    Ok(items) => items.len(),
+    Err(_) => -1,
+  };
+  let b = blob(&repo, &"evil\n");
+  let mut non_utf8 = Bytes.new();
+  non_utf8.push(255);
+  non_utf8.push(97);
+  let mut names = List.new();
+  names.push(".git".as_bytes());
+  names.push(".GIT".as_bytes());
+  names.push("git~1".as_bytes());
+  names.push(".git.".as_bytes());
+  names.push("..".as_bytes());
+  names.push("a\\b".as_bytes());
+  names.push(non_utf8);
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      None => {}
+      Some(name) => {
+        let t = tree_with(&repo, 100644, &name, &b);
+        let c = commit_of_tree(&repo, &t);
+        let br = cat3(&"evil", &int_to_str(i), &"");
+        ok = expect(c.len() == 64, &"evil commit") && ok;
+        ok = expect(kind_b(&create_branch(&repo, &br, &c)) == "ok", &"evil branch") && ok;
+        ok = expect(expect_refused(&repo, &br, &"InvalidPath", &cat3(&"bad name ", &int_to_str(i), &"")), &"bad name is InvalidPath") && ok;
+      }
+    }
+    i = i + 1;
+  }
+  // .git ディレクトリ（中にファイル）
+  let sub = tree_with(&repo, 100644, &"config".as_bytes(), &b);
+  let dir_tree = tree_with(&repo, 40000, &".git".as_bytes(), &sub);
+  let dc = commit_of_tree(&repo, &dir_tree);
+  ok = expect(kind_b(&create_branch(&repo, &"evil_gitdir", &dc)) == "ok", &"evil gitdir branch") && ok;
+  ok = expect(expect_refused(&repo, &"evil_gitdir", &"InvalidPath", &"a .git directory"), &"a .git directory is InvalidPath") && ok;
+  // symlink・gitlink
+  let lt = tree_with(&repo, 120000, &"link".as_bytes(), &b);
+  let lc = commit_of_tree(&repo, &lt);
+  ok = expect(kind_b(&create_branch(&repo, &"evil_symlink", &lc)) == "ok", &"symlink branch") && ok;
+  ok = expect(expect_refused(&repo, &"evil_symlink", &"UnsupportedEntry", &"a symlink entry"), &"a symlink entry is UnsupportedEntry") && ok;
+  let gt = tree_with(&repo, 160000, &"sub".as_bytes(), &b);
+  let gc = commit_of_tree(&repo, &gt);
+  ok = expect(kind_b(&create_branch(&repo, &"evil_gitlink", &gc)) == "ok", &"gitlink branch") && ok;
+  ok = expect(expect_refused(&repo, &"evil_gitlink", &"UnsupportedEntry", &"a gitlink entry"), &"a gitlink entry is UnsupportedEntry") && ok;
+  // 深すぎる木（130 段）
+  let mut deep = tree_with(&repo, 100644, &"f".as_bytes(), &b);
+  let mut d = 0;
+  while d < 130 {
+    deep = tree_with(&repo, 40000, &"d".as_bytes(), &deep);
+    d = d + 1;
+  }
+  let deepc = commit_of_tree(&repo, &deep);
+  ok = expect(kind_b(&create_branch(&repo, &"evil_deep", &deepc)) == "ok", &"deep branch") && ok;
+  let deep_kind = kind_s(&checkout(&repo, &"evil_deep"));
+  ok = expect(deep_kind == "LimitExceeded", &"a too deep tree is LimitExceeded") && ok;
+  // 作業木の外には何も作られていない
+  let after_base = match list_sorted(&base, &"") {
+    Ok(items) => items.len(),
+    Err(_) => -2,
+  };
+  ok = expect(before_base == after_base, &"nothing was written outside the work tree") && ok;
+  return ok;
+}
+
+fn test_review_fixes(repo: &Repo) -> Bool
+  intent "レビュー指摘の修正を確かめる: 日本語のパスの往復、切り替え先の blob の欠落で何も変えない、完全なブランチ名での checkout、署名の CR の拒否"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let work = repo.work_dir.clone();
+  ok = expect(wf(&work, &"a.txt", &"alpha\n", false), &"write a.txt") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"a.txt"))) == "ok", &"add a.txt") && ok;
+  let c1 = str_or(&commit(&repo, &ident(1700000300), &ident(1700000300), &"one\n".as_bytes()), &"");
+  ok = expect(c1.len() == 64, &"first commit") && ok;
+  // 日本語（マルチバイト）のパスが add・commit・checkout で往復する
+  ok = expect(wf(&work, &"日本語/ファイル.txt", &"こんにちは\n", false), &"write a multibyte path") && ok;
+  ok = expect(kind_b(&add_paths(&repo, &one(&"日本語"))) == "ok", &"add a multibyte path") && ok;
+  ok = expect(kind_i(&read_index(&repo)) == "ok", &"the index with a multibyte path is readable") && ok;
+  let c2 = str_or(&commit(&repo, &ident(1700000301), &ident(1700000301), &"two\n".as_bytes()), &"");
+  ok = expect(c2.len() == 64, &"second commit") && ok;
+  ok = expect(kind_b(&create_branch(&repo, &"back", &c1)) == "ok", &"branch back") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"back")) == "ok", &"checkout back (multibyte path removed)") && ok;
+  ok = expect(text_of(&work, &"日本語/ファイル.txt") == "<missing>", &"multibyte file removed") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"main")) == "ok", &"checkout main (multibyte path restored)") && ok;
+  ok = expect(text_of(&work, &"日本語/ファイル.txt") == "こんにちは\n", &"multibyte file restored") && ok;
+  // 完全なブランチ名
+  ok = expect(kind_s(&checkout(&repo, &"refs/heads/back")) == "ok", &"checkout with a full branch name") && ok;
+  ok = expect(head_name(&repo) == "refs/heads/back", &"HEAD is refs/heads/back") && ok;
+  ok = expect(kind_s(&checkout(&repo, &"main")) == "ok", &"checkout main again") && ok;
+  // 切り替え先の blob が無い: 何も変えずに失敗する（a.txt などが先に消えてはならない）
+  let missing = "abababababababababababababababababababababababababababababababab";
+  let t = tree_with(&repo, 100644, &"new.txt".as_bytes(), &missing);
+  let mc = commit_of_tree(&repo, &t);
+  ok = expect(mc.len() == 64, &"commit with a missing blob") && ok;
+  ok = expect(kind_b(&create_branch(&repo, &"missingblob", &mc)) == "ok", &"branch missingblob") && ok;
+  let before = state_line(&repo);
+  let k = kind_s(&checkout(&repo, &"missingblob"));
+  ok = expect(k != "ok", &"a missing target blob is refused") && ok;
+  ok = expect(state_line(&repo) == before, &"a missing target blob changes nothing") && ok;
+  ok = expect(!has_lock(&repo), &"no stale index.lock after a missing blob") && ok;
+  // blob でないオブジェクト（tree）を blob として指す
+  let t2 = tree_with(&repo, 100644, &"x.txt".as_bytes(), &t);
+  let mc2 = commit_of_tree(&repo, &t2);
+  ok = expect(kind_b(&create_branch(&repo, &"notblob", &mc2)) == "ok", &"branch notblob") && ok;
+  let before2 = state_line(&repo);
+  ok = expect(kind_s(&checkout(&repo, &"notblob")) == "TypeMismatch", &"a non-blob target is TypeMismatch") && ok;
+  ok = expect(state_line(&repo) == before2, &"a non-blob target changes nothing") && ok;
+  // 署名の CR は拒否する
+  let bad = new_ident("A\rB", "t@example.com", 1700000302, "+0000");
+  ok = expect(kind_s(&commit(&repo, &bad, &ident(1700000302), &"x\n".as_bytes())) != "ok", &"CR in a name is refused") && ok;
+  ok = expect(head_commit(&repo) == c2, &"the branch did not move after the refused commit") && ok;
+  return ok;
+}
+
+pub fn run_ops_tests() -> Bool
+  intent "索引・add・commit・checkout の全テストを実行し全合格なら true を返す。作業用ディレクトリは tmp/ の下に作る"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  console.log(&"  index codec");
+  ok = test_index_codec() && ok;
+  let suffix = match random_hex(6) {
+    Ok(s) => s,
+    Err(_) => "fallback",
+  };
+  let base = cat3(&"tmp/o_", &suffix, &"");
+  match make_dirs(&base) {
+    Err(_) => {
+      console.log(&"  FAILED: cannot create the work directory");
+      return false;
+    }
+    Ok(_) => {}
+  }
+  match init_repo(&join_path(&base, &"work"), false, &"main") {
+    Err(_) => {
+      console.log(&"  FAILED: cannot init the test repository");
+      return false;
+    }
+    Ok(repo) => {
+      console.log(&"  add / commit");
+      ok = test_add_commit(&repo) && ok;
+      console.log(&"  checkout");
+      ok = test_checkout(&repo) && ok;
+      console.log(&"  malicious trees");
+      ok = test_malicious(&repo, &base) && ok;
+    }
+  }
+  match init_repo(&join_path(&base, &"work2"), false, &"main") {
+    Err(_) => {
+      console.log(&"  FAILED: cannot init the second test repository");
+      return false;
+    }
+    Ok(repo2) => {
+      console.log(&"  review fixes");
+      ok = test_review_fixes(&repo2) && ok;
+    }
+  }
+  return ok;
+}
