@@ -256,12 +256,6 @@ fn inflate_dynamic(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> 
     return Err(GitError.Corrupt("too many length or distance codes"));
   }
   let order = ints(&"16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15");
-  let mut cl = List.new();
-  let mut a = 0;
-  while a < 19 {
-    cl.push(0);
-    a = a + 1;
-  }
   let mut cl2 = List.new();
   let mut idx = 0;
   while idx < 19 {
@@ -272,7 +266,8 @@ fn inflate_dynamic(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> 
     cl2.push(v);
     idx = idx + 1;
   }
-  // cl2 は読んだ順（order の順）。符号の番号の順に並べ替える。
+  // cl2 は読んだ順（order の順）。符号の番号の順に並べ替えて clens にする。
+  let mut clens = List.new();
   let mut k = 0;
   while k < 19 {
     let mut found = 0;
@@ -283,14 +278,8 @@ fn inflate_dynamic(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> 
       }
       m = m + 1;
     }
-    cl.push(found);
+    clens.push(found);
     k = k + 1;
-  }
-  let mut clens = List.new();
-  let mut q = 19;
-  while q < cl.len() {
-    clens.push(at(&cl, q));
-    q = q + 1;
   }
   let lencode = build_huff(&clens)?;
   let mut lengths = List.new();

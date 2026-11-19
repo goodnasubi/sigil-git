@@ -56,7 +56,7 @@ SHA-256 形式のリポジトリの作成（`init`）、緩いオブジェクト
 - **未対応は明示的に拒否します。** `.idx` v1・未知の version、SHA-1 形式の `.idx`、`multi-pack-index`、`*.bitmap`、`commit-graph` は `UnsupportedFormat`（`open_repo`/`open_pack`）。本物の Git で `gc` したリポジトリを読むときは、これらを作らない設定（`gc.writeCommitGraph=false`、`repack.writeBitmaps=false`、`core.multiPackIndex=false`）が前提です（`interop_pack.sh` が設定しています）。
 - **pack の大きさ・オブジェクト数の上限**（4 GiB・2^24）と **差分の深さ**（64）は `git/limits.sigil`。宣言された大きさは割り当ての前に検査し、offset の加算・乗算の溢れは拒否します。
 - **ファイルの大きさ**は標準ライブラリに `File` の大きさを得る API が無いため、位置指定の 1 byte 読み取りで EOF を二分探索して求めています（`fsio.file_size`）。API が入ったら置き換えます。
-- 圧縮済みデータを読む範囲は、宣言された展開後の大きさから決まる上限（大きさ + 1/8 + 256 byte）までです。これを超えて水増しされた zlib ストリームは `Corrupt` になります（Git が書く zlib はこの範囲に収まります）。
+- pack には圧縮後の長さが書かれていないため、圧縮済みデータは 64 KiB の窓から読み、ストリームが窓の末尾で切れていれば窓を 4 倍にして読み直します。窓の上限は宣言された展開後の大きさから決まる値（大きさ + 1/8 + 256 byte）です。zlib が書く最悪の場合は固定 Huffman の 9 bit/文字（9/8 倍）で、stored でも 5 byte/16 KiB 程度なので、Git が書く zlib はこの範囲に収まります。これを超えて水増しされた zlib ストリームは `Corrupt` になります。
 - 読み取りのたびに `.idx`・pack を開き直します。多数を読むときは `open_packs` と `odb_read_in` を使ってください（pack の末尾の検査値の検証は `open_pack` で 1 回だけ行います）。
 - pack の書き込み、`repack`/`gc`/`prune`、thin pack（pack 外の基点を持つ REF_DELTA）は範囲外です。
 

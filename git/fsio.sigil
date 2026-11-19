@@ -603,7 +603,7 @@ pub fn file_size(f: &File) -> Result<Int, GitError>
 }
 
 pub fn read_range(f: &File, offset: Int, len: Int) -> Result<Bytes, GitError>
-  intent "offset から len byte を位置指定で読む。ファイルがそこまで無ければ Corrupt。len は 64 MiB 以下（それ以上は LimitExceeded）。64 KiB ずつ読み、全体を一度に確保しない"
+  intent "offset から len byte を位置指定で読む。ファイルがそこまで無ければ Corrupt。len は 128 MiB 以下（それ以上は LimitExceeded。64 MiB のオブジェクトの圧縮データの窓に足りる大きさ）。64 KiB ずつ読み、全体を一度に確保しない"
   requires none
   ensures none
   effects fs

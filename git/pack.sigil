@@ -3,6 +3,7 @@ module git.pack
   trust none
 
 use git.error.GitError;
+use git.error.is_corrupt;
 use git.fsio.cat3;
 use git.fsio.file_size;
 use git.fsio.open_read;
@@ -361,6 +362,9 @@ fn read_entry(pack: &File, ps: &PackStore, off: Int) -> Result<Entry, GitError>
   let mut base_off = 0;
   let mut base_id = "";
   if kind == 6 {
+    if pos >= b.len() {
+      return Err(GitError.Corrupt("pack OFS_DELTA header is truncated"));
+    }
     let mut c = b.get(pos).unwrap_or(0);
     pos = pos + 1;
     let mut rel = c % 128;
@@ -391,25 +395,44 @@ fn read_entry(pack: &File, ps: &PackStore, off: Int) -> Result<Entry, GitError>
 }
 
 fn inflate_entry(pack: &File, ps: &PackStore, e: &Entry) -> Result<Bytes, GitError>
-  intent "見出しの後ろの zlib ストリームを伸長して返す。宣言された大きさと一致しなければ Corrupt。読む範囲は宣言された大きさから決まる上限までに限る"
+  intent "見出しの後ろの zlib ストリームを伸長して返す。宣言された大きさと一致しなければ Corrupt。pack には圧縮後の長さが書かれていないので、64 KiB の窓から始め、ストリームが窓の末尾で切れていたら窓を 4 倍にして読み直す。窓の上限は宣言された大きさから決まる値（大きさ + 1/8 + 256 byte。zlib が書く最悪の場合は固定 Huffman の 9 bit/文字 = 9/8 倍）で、それでも切れていれば Corrupt"
   requires none
   ensures none
   effects fs
 {
   let end = ps.pack_size - hash_len();
-  let mut window = e.size + e.size / 8 + 256;
-  if e.data_off + window > end {
-    window = end - e.data_off;
+  let mut cap = e.size + e.size / 8 + 256;
+  if e.data_off + cap > end {
+    cap = end - e.data_off;
   }
-  if window < 6 {
+  if cap < 6 {
     return Err(GitError.Corrupt("pack entry data is truncated"));
   }
-  let z = read_range(&pack, e.data_off, window)?;
-  let r = inflate_zlib(&z, 0, e.size)?;
-  if r.data.len() != e.size {
-    return Err(GitError.Corrupt("pack entry size does not match its data"));
+  let mut window = 65536;
+  if window > cap {
+    window = cap;
   }
-  return Ok(r.data);
+  while true {
+    let z = read_range(&pack, e.data_off, window)?;
+    match inflate_zlib(&z, 0, e.size) {
+      Ok(r) => {
+        if r.data.len() != e.size {
+          return Err(GitError.Corrupt("pack entry size does not match its data"));
+        }
+        return Ok(r.data);
+      }
+      Err(err) => {
+        if window >= cap || !is_corrupt(&err) {
+          return Err(err);
+        }
+        window = window * 4;
+        if window > cap {
+          window = cap;
+        }
+      }
+    }
+  }
+  return Err(GitError.Corrupt("pack entry data is truncated"));
 }
 
 fn read_varint(d: &Bytes, cur: &mut Cur) -> Result<Int, GitError>

@@ -296,6 +296,12 @@ pub fn commit_first_parent(repo: &Repo, packs: &List<PackStore>, commit_id: &Str
   effects fs
 {
   let o = odb_read_in(&repo, &packs, &commit_id)?;
+  match o.obj_type {
+    ObjectType.Commit => {}
+    _ => {
+      return Err(GitError.TypeMismatch("expected a commit"));
+    }
+  }
   let c = decode_commit(&o.content)?;
   let ps = commit_parents(&c);
   return match ps.get(0) {

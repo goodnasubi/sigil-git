@@ -496,6 +496,25 @@ fn test_deltas(dir: &String) -> Bool
       }
     }
   }
+  // 圧縮後が最初の窓 (64 KiB) より大きいオブジェクトは、窓を広げて読み直す
+  let mut large = Bytes.new();
+  let mut li = 0;
+  while li < 70000 {
+    large.push((li * 7 + li / 256) % 256);
+    li = li + 1;
+  }
+  let mut lb = new_builder();
+  let _ = add_base(&mut lb, &ObjectType.Blob, 3, &large);
+  match install(&join_path(&dir, &"large"), &"b", &finish(&lb)) {
+    Err(_) => {
+      return fail(&"install large");
+    }
+    Ok(lp) => {
+      if content_of(&lp, &blob_id(&large)) != large {
+        return fail(&"read an object larger than the first window");
+      }
+    }
+  }
   let missing = "1111111111111111111111111111111111111111111111111111111111111111";
   if read_kind(&idx_path, &missing) != "none" {
     return fail(&"missing id is none");
