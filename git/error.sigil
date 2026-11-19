@@ -11,6 +11,11 @@ pub enum GitError {
   InvalidPath(String),
   InvalidRefName(String),
   TypeMismatch(String),
+  Locked(String),
+  Io(String),
+  NotFound(String),
+  AlreadyExists(String),
+  RefMismatch(String),
 }
 
 pub fn error_kind_name(err: &GitError) -> String
@@ -26,6 +31,11 @@ pub fn error_kind_name(err: &GitError) -> String
     GitError.InvalidPath(_) => "InvalidPath",
     GitError.InvalidRefName(_) => "InvalidRefName",
     GitError.TypeMismatch(_) => "TypeMismatch",
+    GitError.Locked(_) => "Locked",
+    GitError.Io(_) => "Io",
+    GitError.NotFound(_) => "NotFound",
+    GitError.AlreadyExists(_) => "AlreadyExists",
+    GitError.RefMismatch(_) => "RefMismatch",
   };
 }
 
@@ -42,6 +52,11 @@ pub fn error_message(err: &GitError) -> String
     GitError.InvalidPath(msg) => msg.clone(),
     GitError.InvalidRefName(msg) => msg.clone(),
     GitError.TypeMismatch(msg) => msg.clone(),
+    GitError.Locked(msg) => msg.clone(),
+    GitError.Io(msg) => msg.clone(),
+    GitError.NotFound(msg) => msg.clone(),
+    GitError.AlreadyExists(msg) => msg.clone(),
+    GitError.RefMismatch(msg) => msg.clone(),
   };
 }
 
@@ -113,6 +128,66 @@ pub fn is_type_mismatch(err: &GitError) -> Bool
 {
   return match err {
     GitError.TypeMismatch(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_locked(err: &GitError) -> Bool
+  intent "Locked エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.Locked(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_io(err: &GitError) -> Bool
+  intent "Io エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.Io(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_not_found(err: &GitError) -> Bool
+  intent "NotFound エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.NotFound(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_already_exists(err: &GitError) -> Bool
+  intent "AlreadyExists エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.AlreadyExists(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_ref_mismatch(err: &GitError) -> Bool
+  intent "RefMismatch エラーかどうか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.RefMismatch(_) => true,
     _ => false,
   };
 }

@@ -6,6 +6,7 @@ use tests.test_commit.run_commit_tests;
 use tests.test_fixture.run_fixture_tests;
 use tests.test_limits.run_limits_tests;
 use tests.test_object.run_object_tests;
+use tests.test_repo.run_repo_tests;
 use tests.test_tag.run_tag_tests;
 use tests.test_tree.run_tree_tests;
 use tests.test_validate.run_validate_tests;
@@ -14,7 +15,7 @@ pub fn main() -> Int
   intent "すべてのテストを実行し、全合格なら 0、不合格なら 1 以上のコードを返す"
   requires none
   ensures none
-  effects console
+  effects console, fs, random
 {
   console.log(&"Running tests: limits");
   if !run_limits_tests() {
@@ -56,6 +57,12 @@ pub fn main() -> Int
   if !run_fixture_tests() {
     console.log(&"FAIL: fixture tests");
     return 7;
+  }
+
+  console.log(&"Running tests: zlib, init, objects, refs (filesystem)");
+  if !run_repo_tests() {
+    console.log(&"FAIL: repo tests");
+    return 8;
   }
 
   console.log(&"ALL TESTS PASSED SUCCESSFULLY");

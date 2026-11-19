@@ -111,3 +111,30 @@ pub fn max_tag_message_size() -> Int
 {
   return 1048576;
 }
+
+pub fn max_refs() -> Int
+  intent "参照の数の上限 (100,000) を返す"
+  requires none
+  ensures result == 100000
+  effects none
+{
+  return 100000;
+}
+
+pub fn max_packed_refs_size() -> Int
+  intent "packed-refs の大きさの上限 (64 MiB = 67108864 byte) を返す"
+  requires none
+  ensures result == 67108864
+  effects none
+{
+  return 67108864;
+}
+
+pub fn max_work_memory() -> Int
+  intent "核の作業メモリの上限 (256 MiB = 268435456 byte) を返す"
+  requires none
+  ensures result == 268435456
+  effects none
+{
+  return 268435456;
+}

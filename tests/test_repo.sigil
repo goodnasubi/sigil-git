@@ -1,0 +1,512 @@
+module tests.test_repo
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.file_exists;
+use git.fsio.join_path;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.fsio.read_file_opt;
+use git.fsio.remove_file_if_exists;
+use git.object.ObjectType;
+use git.odb.object_path;
+use git.odb.odb_has;
+use git.odb.odb_info;
+use git.odb.odb_write;
+use git.refs.ExpectOld;
+use git.refs.HeadState;
+use git.refs.RefEntry;
+use git.refs.create_branch;
+use git.refs.create_tag;
+use git.refs.delete_branch;
+use git.refs.delete_tag;
+use git.refs.list_branches;
+use git.refs.list_tags;
+use git.refs.parse_packed_refs;
+use git.refs.read_head;
+use git.refs.read_packed;
+use git.refs.read_ref;
+use git.refs.serialize_packed_refs;
+use git.refs.set_head_detached;
+use git.refs.set_head_symbolic;
+use git.refs.update_ref;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.repo.open_repo;
+use git.zlib.adler32;
+use git.zlib.zlib_decode_stored;
+use git.zlib.zlib_stored;
+
+fn kind_of(r: &Result<Bool, GitError>) -> String
+  intent "結果が成功なら ok、失敗ならエラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn kind_of_repo(r: &Result<Repo, GitError>) -> String
+  intent "Repo を返す結果が成功なら ok、失敗ならエラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn kind_of_str(r: &Result<String, GitError>) -> String
+  intent "String を返す結果が成功なら ok、失敗ならエラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn expect(ok: Bool, label: &String) -> Bool
+  intent "条件が偽ならラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  if !ok {
+    console.log(&cat3(&"  FAILED: ", &label, &""));
+  }
+  return ok;
+}
+
+fn write_text(path: &String, text: &String) -> Bool
+  intent "テスト用にファイルを作る（既にあれば失敗）"
+  requires none
+  ensures none
+  effects fs
+{
+  return match create_synced_file(&path, &text.as_bytes()) {
+    Ok(_) => true,
+    Err(_) => false,
+  };
+}
+
+fn id_or_empty(r: &Result<String, GitError>) -> String
+  intent "成功なら識別子、失敗なら空文字列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(s) => s.clone(),
+    Err(_) => "",
+  };
+}
+
+fn opt_str(r: &Result<Option<String>, GitError>) -> String
+  intent "参照の値を返す。無ければ none、エラーなら error"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Err(_) => "error",
+    Ok(o) => match o {
+      None => "none",
+      Some(s) => s.clone(),
+    },
+  };
+}
+
+fn test_zlib() -> Bool
+  intent "zlib の stored ブロックの符号化・復号・Adler-32 を試す"
+  requires none
+  ensures none
+  effects console
+{
+  let mut ok = true;
+  ok = expect(adler32(&"Wikipedia".as_bytes()) == 300286872, &"adler32 Wikipedia") && ok;
+  let data = "hello zlib".as_bytes();
+  let z = zlib_stored(&data);
+  match zlib_decode_stored(&z, 1000, true) {
+    Ok(d) => {
+      ok = expect(d == data, &"stored round trip") && ok;
+    }
+    Err(_) => {
+      ok = expect(false, &"stored round trip error") && ok;
+    }
+  }
+  // 末尾の検査値を壊す
+  let mut bad = zlib_stored(&data);
+  let n = bad.len();
+  let mut broken = Bytes.new();
+  let mut i = 0;
+  while i < n {
+    let b = bad.get(i).unwrap_or(0);
+    if i == n - 1 {
+      broken.push((b + 1) % 256);
+    } else {
+      broken.push(b);
+    }
+    i = i + 1;
+  }
+  let r = zlib_decode_stored(&broken, 1000, true);
+  ok = expect(match r {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == "Corrupt",
+  }, &"bad adler32 is Corrupt") && ok;
+  // 上限
+  let r2 = zlib_decode_stored(&z, 3, true);
+  ok = expect(match r2 {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == "LimitExceeded",
+  }, &"decode limit") && ok;
+  // 実際の Git が書く固定 Huffman ブロック（"a"）は未対応として拒否する
+  let mut huff = Bytes.new();
+  huff.push(120);
+  huff.push(156);
+  huff.push(75);
+  huff.push(4);
+  huff.push(0);
+  huff.push(0);
+  huff.push(98);
+  huff.push(0);
+  huff.push(98);
+  let r3 = zlib_decode_stored(&huff, 1000, true);
+  ok = expect(match r3 {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == "UnsupportedFormat",
+  }, &"huffman block is UnsupportedFormat") && ok;
+  return ok;
+}
+
+fn test_init(base: &String) -> Bool
+  intent "init（通常・bare）と open_repo の拒否条件を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let normal = join_path(&base, &"normal");
+  let bare = join_path(&base, &"bare.git");
+  let r = init_repo(&normal, false, &"main");
+  ok = expect(kind_of_repo(&r) == "ok", &"init normal") && ok;
+  let r2 = init_repo(&bare, true, &"trunk");
+  ok = expect(kind_of_repo(&r2) == "ok", &"init bare") && ok;
+  ok = expect(kind_of_repo(&init_repo(&normal, false, &"main")) == "AlreadyExists", &"init twice") && ok;
+  ok = expect(kind_of_repo(&init_repo(&join_path(&base, &"badname"), false, &"a..b")) == "InvalidRefName", &"bad initial branch") && ok;
+  ok = expect(kind_of_repo(&open_repo(&normal)) == "ok", &"open normal") && ok;
+  ok = expect(kind_of_repo(&open_repo(&bare)) == "ok", &"open bare") && ok;
+  match open_repo(&bare) {
+    Ok(repo) => {
+      match read_head(&repo) {
+        Ok(HeadState.Symbolic(s)) => {
+          ok = expect(s == "refs/heads/trunk", &"bare HEAD symbolic") && ok;
+        }
+        _ => {
+          ok = expect(false, &"bare HEAD state") && ok;
+        }
+      }
+    }
+    Err(_) => {}
+  }
+  // 設定ファイルを書き換えて拒否条件を確認する
+  let sha1 = join_path(&base, &"sha1.git");
+  ok = expect(kind_of_repo(&init_repo(&sha1, true, &"main")) == "ok", &"init for sha1 case") && ok;
+  let cfg = join_path(&sha1, &"config");
+  let _ = remove_file_if_exists(&cfg);
+  ok = expect(write_text(&cfg, &"[core]\n\trepositoryformatversion = 0\n"), &"write sha1 config") && ok;
+  ok = expect(kind_of_repo(&open_repo(&sha1)) == "UnsupportedFormat", &"sha1 repo rejected") && ok;
+  let reft = join_path(&base, &"reftable.git");
+  ok = expect(kind_of_repo(&init_repo(&reft, true, &"main")) == "ok", &"init for reftable case") && ok;
+  let cfg2 = join_path(&reft, &"config");
+  let _ = remove_file_if_exists(&cfg2);
+  ok = expect(write_text(&cfg2, &"[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n\trefstorage = reftable\n"), &"write reftable config") && ok;
+  ok = expect(kind_of_repo(&open_repo(&reft)) == "UnsupportedFormat", &"reftable repo rejected") && ok;
+  let alt = join_path(&base, &"alt.git");
+  ok = expect(kind_of_repo(&init_repo(&alt, true, &"main")) == "ok", &"init for alternates case") && ok;
+  let _ = make_dirs(&join_path(&join_path(&alt, &"objects"), &"info"));
+  ok = expect(write_text(&join_path(&join_path(&join_path(&alt, &"objects"), &"info"), &"alternates"), &"/x\n"), &"write alternates") && ok;
+  ok = expect(kind_of_repo(&open_repo(&alt)) == "UnsupportedFormat", &"alternates rejected") && ok;
+  let sh = join_path(&base, &"shallow.git");
+  ok = expect(kind_of_repo(&init_repo(&sh, true, &"main")) == "ok", &"init for shallow case") && ok;
+  ok = expect(write_text(&join_path(&sh, &"shallow"), &"x\n"), &"write shallow") && ok;
+  ok = expect(kind_of_repo(&open_repo(&sh)) == "UnsupportedFormat", &"shallow rejected") && ok;
+  ok = expect(kind_of_repo(&open_repo(&join_path(&base, &"missing"))) == "NotFound", &"missing repo is NotFound") && ok;
+  return ok;
+}
+
+fn test_odb(repo: &Repo) -> Bool
+  intent "オブジェクトの書き込み・存在確認・型と長さの照会・重複書き込みを試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let content = "hello world\n".as_bytes();
+  let r = odb_write(&repo, &ObjectType.Blob, &content);
+  let id = id_or_empty(&r);
+  ok = expect(id.len() == 64, &"blob id length") && ok;
+  ok = expect(match odb_has(&repo, &id) {
+    Ok(b) => b,
+    Err(_) => false,
+  }, &"blob exists") && ok;
+  match odb_info(&repo, &id) {
+    Ok(info) => {
+      ok = expect(info.size == 12, &"blob size") && ok;
+      ok = expect(match info.obj_type {
+        ObjectType.Blob => true,
+        _ => false,
+      }, &"blob type") && ok;
+    }
+    Err(_) => {
+      ok = expect(false, &"odb_info") && ok;
+    }
+  }
+  let r2 = odb_write(&repo, &ObjectType.Blob, &content);
+  ok = expect(id_or_empty(&r2) == id, &"rewrite returns same id") && ok;
+  ok = expect(kind_of_str(&odb_write(&repo, &ObjectType.Blob, &Bytes.new())) == "ok", &"empty blob") && ok;
+  let missing = "0000000000000000000000000000000000000000000000000000000000000000";
+  ok = expect(match odb_has(&repo, &missing) {
+    Ok(b) => !b,
+    Err(_) => false,
+  }, &"missing object") && ok;
+  ok = expect(match odb_info(&repo, &missing) {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == "NotFound",
+  }, &"odb_info missing is NotFound") && ok;
+  ok = expect(match odb_has(&repo, &"XYZ") {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == "Corrupt",
+  }, &"bad id is Corrupt") && ok;
+  // 名前と内容が食い違う既存ファイルは書き込みで拒否する
+  match object_path(&repo, &id) {
+    Ok(p) => {
+      let _ = remove_file_if_exists(&p);
+      let other = zlib_stored(&"blob 3\u{0}abc".as_bytes());
+      ok = expect(match create_synced_file(&p, &other) {
+        Ok(_) => true,
+        Err(_) => false,
+      }, &"plant mismatching object") && ok;
+      ok = expect(kind_of_str(&odb_write(&repo, &ObjectType.Blob, &content)) == "Corrupt", &"mismatching existing object is Corrupt") && ok;
+    }
+    Err(_) => {
+      ok = expect(false, &"object_path") && ok;
+    }
+  }
+  return ok;
+}
+
+fn commit_bytes(tree_id: &String, msg: &String) -> Bytes
+  intent "テスト用の最小の commit 本体を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.extend(&cat3(&"tree ", &tree_id, &"\n").as_bytes());
+  b.extend(&"author T <t@example.com> 0 +0000\n".as_bytes());
+  b.extend(&"committer T <t@example.com> 0 +0000\n\n".as_bytes());
+  b.extend(&msg.as_bytes());
+  return b;
+}
+
+fn names_of(l: &Result<List<RefEntry>, GitError>) -> String
+  intent "参照の一覧の名前を空白で連結した文字列を返す。エラーなら error"
+  requires none
+  ensures none
+  effects none
+{
+  return match l {
+    Err(_) => "error",
+    Ok(items) => join_names(&items),
+  };
+}
+
+fn join_names(items: &List<RefEntry>) -> String
+  intent "RefEntry の名前を空白区切りで連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      Some(e) => {
+        out.extend(&e.name.as_bytes());
+        out.push(32);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("invalid");
+}
+
+fn test_refs(repo: &Repo) -> Bool
+  intent "HEAD・ブランチ・タグの作成・更新（CAS）・削除・一覧・ロックを試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let tree = id_or_empty(&odb_write(&repo, &ObjectType.Tree, &Bytes.new()));
+  let c1 = id_or_empty(&odb_write(&repo, &ObjectType.Commit, &commit_bytes(&tree, &"one\n")));
+  let c2 = id_or_empty(&odb_write(&repo, &ObjectType.Commit, &commit_bytes(&tree, &"two\n")));
+  let blob = id_or_empty(&odb_write(&repo, &ObjectType.Blob, &"x".as_bytes()));
+  ok = expect(c1.len() == 64 && c2.len() == 64 && c1 != c2, &"commits written") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"main", &c1)) == "ok", &"create branch") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/heads/main")) == c1, &"read branch") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"main", &c2)) == "RefMismatch", &"create existing branch") && ok;
+  ok = expect(kind_of(&update_ref(&repo, &"refs/heads/main", &c2, ExpectOld.Is(c2.clone()))) == "RefMismatch", &"CAS mismatch") && ok;
+  ok = expect(kind_of(&update_ref(&repo, &"refs/heads/main", &c2, ExpectOld.Is(c1.clone()))) == "ok", &"CAS update") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/heads/main")) == c2, &"updated value") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"blobby", &blob)) == "TypeMismatch", &"branch to blob is TypeMismatch") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"ghost", &"1111111111111111111111111111111111111111111111111111111111111111")) == "NotFound", &"branch to missing object") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"bad..name", &c1)) == "InvalidRefName", &"bad branch name") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"feature/x", &c1)) == "ok", &"nested branch") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"feature", &c1)) == "AlreadyExists", &"D/F conflict (feature vs feature/x)") && ok;
+  ok = expect(kind_of(&create_branch(&repo, &"main/sub", &c1)) == "AlreadyExists", &"D/F conflict (main/sub under file main)") && ok;
+  ok = expect(kind_of(&create_tag(&repo, &"v1", &blob)) == "ok", &"lightweight tag to blob") && ok;
+  ok = expect(kind_of(&create_tag(&repo, &"v2", &c1)) == "ok", &"tag to commit") && ok;
+  ok = expect(names_of(&list_branches(&repo)) == "refs/heads/feature/x refs/heads/main ", &"list branches") && ok;
+  ok = expect(names_of(&list_tags(&repo)) == "refs/tags/v1 refs/tags/v2 ", &"list tags") && ok;
+  // HEAD
+  ok = expect(kind_of(&set_head_symbolic(&repo, &"refs/heads/main")) == "ok", &"set HEAD symbolic") && ok;
+  ok = expect(kind_of(&set_head_detached(&repo, &c1)) == "ok", &"set HEAD detached") && ok;
+  ok = expect(match read_head(&repo) {
+    Ok(HeadState.Detached(d)) => d == c1,
+    _ => false,
+  }, &"read detached HEAD") && ok;
+  ok = expect(kind_of(&set_head_symbolic(&repo, &"refs/heads/main")) == "ok", &"restore HEAD") && ok;
+  // ロック: 既存の .lock があれば Locked で、自動では消さない
+  let lock = join_path(&repo.git_dir, &"refs/heads/main.lock");
+  ok = expect(write_text(&lock, &"stale"), &"plant lock") && ok;
+  ok = expect(kind_of(&update_ref(&repo, &"refs/heads/main", &c1, ExpectOld.Any)) == "Locked", &"stale lock is Locked") && ok;
+  ok = expect(match file_exists(&lock) {
+    Ok(b) => b,
+    Err(_) => false,
+  }, &"stale lock is kept") && ok;
+  ok = expect(kind_of(&delete_branch(&repo, &"main", ExpectOld.Any)) == "Locked", &"delete with lock is Locked") && ok;
+  let _ = remove_file_if_exists(&lock);
+  // 削除
+  ok = expect(kind_of(&delete_branch(&repo, &"main", ExpectOld.Is(c1.clone()))) == "RefMismatch", &"delete CAS mismatch") && ok;
+  ok = expect(kind_of(&delete_branch(&repo, &"main", ExpectOld.Is(c2.clone()))) == "ok", &"delete branch") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/heads/main")) == "none", &"deleted branch is gone") && ok;
+  ok = expect(kind_of(&delete_branch(&repo, &"main", ExpectOld.Any)) == "NotFound", &"delete missing branch") && ok;
+  ok = expect(kind_of(&delete_tag(&repo, &"v1", ExpectOld.Any)) == "ok", &"delete tag") && ok;
+  return ok;
+}
+
+fn test_packed(repo: &Repo) -> Bool
+  intent "packed-refs の読み取り・シリアライズ・packed 側を含む削除を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let tree = id_or_empty(&odb_write(&repo, &ObjectType.Tree, &Bytes.new()));
+  let c1 = id_or_empty(&odb_write(&repo, &ObjectType.Commit, &commit_bytes(&tree, &"p1\n")));
+  let c2 = id_or_empty(&odb_write(&repo, &ObjectType.Commit, &commit_bytes(&tree, &"p2\n")));
+  let header = "# pack-refs with: peeled fully-peeled sorted \n";
+  let mut body = Bytes.new();
+  body.extend(&header.as_bytes());
+  body.extend(&cat3(&c1, &" refs/heads/old\n", &"").as_bytes());
+  body.extend(&cat3(&c2, &" refs/heads/stay\n", &"").as_bytes());
+  body.extend(&cat3(&c1, &" refs/tags/t1\n", &"").as_bytes());
+  body.extend(&cat3(&"^", &c2, &"\n").as_bytes());
+  let ppath = join_path(&repo.git_dir, &"packed-refs");
+  ok = expect(match create_synced_file(&ppath, &body) {
+    Ok(_) => true,
+    Err(_) => false,
+  }, &"write packed-refs") && ok;
+  ok = expect(match parse_packed_refs(&body) {
+    Ok(p) => p.refs.len() == 3 && serialize_packed_refs(&p) == body,
+    Err(_) => false,
+  }, &"parse and serialize round trip") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/heads/old")) == c1, &"packed ref is readable") && ok;
+  ok = expect(names_of(&list_branches(&repo)) == "refs/heads/feature/x refs/heads/old refs/heads/stay ", &"list includes packed") && ok;
+  // 緩い参照が packed より優先される
+  ok = expect(kind_of(&update_ref(&repo, &"refs/heads/old", &c2, ExpectOld.Is(c1.clone()))) == "ok", &"update packed ref writes loose") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/heads/old")) == c2, &"loose beats packed") && ok;
+  // 削除は packed 側も消し、復活しない
+  ok = expect(kind_of(&delete_branch(&repo, &"old", ExpectOld.Is(c2.clone()))) == "ok", &"delete loose+packed branch") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/heads/old")) == "none", &"packed branch does not resurrect") && ok;
+  ok = expect(kind_of(&delete_tag(&repo, &"t1", ExpectOld.Any)) == "ok", &"delete packed-only tag") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/tags/t1")) == "none", &"packed tag does not resurrect") && ok;
+  ok = expect(match read_packed(&repo) {
+    Ok(p) => p.refs.len() == 1 && !p.header.is_empty(),
+    Err(_) => false,
+  }, &"packed-refs keeps header and other entries") && ok;
+  ok = expect(match read_file_opt(&ppath, 100000, false) {
+    Ok(Some(d)) => d == cat3(&header, &cat3(&c2, &" refs/heads/stay\n", &""), &"").as_bytes(),
+    _ => false,
+  }, &"packed-refs content after deletes") && ok;
+  // packed-refs.lock があれば Locked
+  let plock = join_path(&repo.git_dir, &"packed-refs.lock");
+  ok = expect(write_text(&plock, &"x"), &"plant packed-refs.lock") && ok;
+  ok = expect(kind_of(&delete_branch(&repo, &"stay", ExpectOld.Any)) == "Locked", &"packed-refs.lock is Locked") && ok;
+  ok = expect(opt_str(&read_ref(&repo, &"refs/heads/stay")) == c2, &"failed delete keeps the ref") && ok;
+  let _ = remove_file_if_exists(&plock);
+  ok = expect(kind_of(&delete_branch(&repo, &"stay", ExpectOld.Any)) == "ok", &"delete after unlock") && ok;
+  // 未知のヘッダ特性は拒否する
+  let mut weird = Bytes.new();
+  weird.extend(&"# pack-refs with: unknowntrait \n".as_bytes());
+  ok = expect(match parse_packed_refs(&weird) {
+    Ok(_) => false,
+    Err(e) => error_kind_name(&e) == "UnsupportedFormat",
+  }, &"unknown packed-refs trait") && ok;
+  return ok;
+}
+
+pub fn run_repo_tests() -> Bool
+  intent "リポジトリ・オブジェクト保存・参照の全テストを実行し全合格なら true を返す。作業用ディレクトリは tmp/ の下に作る"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  console.log(&"  zlib");
+  ok = test_zlib() && ok;
+  let suffix = match random_hex(6) {
+    Ok(s) => s,
+    Err(_) => "fallback",
+  };
+  let base = cat3(&"tmp/t_", &suffix, &"");
+  match make_dirs(&base) {
+    Err(_) => {
+      console.log(&"  FAILED: cannot create the work directory");
+      return false;
+    }
+    Ok(_) => {}
+  }
+  console.log(&"  init / open");
+  ok = test_init(&base) && ok;
+  let repo_path = join_path(&base, &"work");
+  match init_repo(&repo_path, true, &"main") {
+    Err(_) => {
+      console.log(&"  FAILED: cannot init the test repository");
+      return false;
+    }
+    Ok(repo) => {
+      console.log(&"  odb");
+      ok = test_odb(&repo) && ok;
+      console.log(&"  refs");
+      ok = test_refs(&repo) && ok;
+      console.log(&"  packed-refs");
+      ok = test_packed(&repo) && ok;
+    }
+  }
+  return ok;
+}

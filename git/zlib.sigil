@@ -1,0 +1,169 @@
+module git.zlib
+  targets server
+  trust none
+
+use git.error.GitError;
+
+// ADR 0047 決定 1「保存形式」: 緩い形式は zlib で圧縮する。
+// 書き込みは有効な zlib であれば Git が受理するので、初版は非圧縮 (stored) ブロックの zlib を出力する。
+// 読み取りの inflate（固定・動的 Huffman）は圧縮の契約 ADR の確定後に別の Issue で実装する。
+// ここにある復号は stored ブロックだけを扱い、Huffman ブロックに当たったら UnsupportedFormat で拒否する。
+
+fn max_stored_block() -> Int
+  intent "stored ブロック 1 つが持てる最大の長さ (65535 byte) を返す"
+  requires none
+  ensures result == 65535
+  effects none
+{
+  return 65535;
+}
+
+pub fn adler32(data: &Bytes) -> Int
+  intent "Adler-32 検査値 (zlib の末尾 4 byte) を計算する"
+  requires none
+  ensures result >= 0
+  effects none
+{
+  let mut a = 1;
+  let mut b = 0;
+  let n = data.len();
+  let mut i = 0;
+  while i < n {
+    a = (a + data.get(i).unwrap_or(0)) % 65521;
+    b = (b + a) % 65521;
+    i = i + 1;
+  }
+  return b * 65536 + a;
+}
+
+fn push_be32(out: &mut Bytes, v: Int)
+  intent "32 bit の値を big endian で追記する"
+  requires v >= 0
+  ensures none
+  effects none
+{
+  out.push(v / 16777216 % 256);
+  out.push(v / 65536 % 256);
+  out.push(v / 256 % 256);
+  out.push(v % 256);
+}
+
+pub fn zlib_stored(data: &Bytes) -> Bytes
+  intent "data を stored ブロックだけの zlib ストリーム（ヘッダ 78 01、Adler-32 付き）にする。圧縮率は問わない"
+  requires none
+  ensures result.len() >= data.len() + 7
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push(120);
+  out.push(1);
+  let n = data.len();
+  let mut pos = 0;
+  let mut done = false;
+  while !done {
+    let mut chunk = n - pos;
+    if chunk > max_stored_block() {
+      chunk = max_stored_block();
+    }
+    let last = pos + chunk >= n;
+    if last {
+      out.push(1);
+    } else {
+      out.push(0);
+    }
+    out.push(chunk % 256);
+    out.push(chunk / 256);
+    let nlen = 65535 - chunk;
+    out.push(nlen % 256);
+    out.push(nlen / 256);
+    if chunk > 0 {
+      out.extend(&data.slice(pos, pos + chunk).unwrap_or(Bytes.new()));
+    }
+    pos = pos + chunk;
+    if last {
+      done = true;
+    }
+  }
+  push_be32(&mut out, adler32(&data));
+  return out;
+}
+
+pub fn zlib_decode_stored(z: &Bytes, limit: Int, verify_tail: Bool) -> Result<Bytes, GitError>
+  intent "stored ブロックだけの zlib ストリームを復号する。limit byte を超えて出力しない（verify_tail なら limit を超えたら LimitExceeded、そうでなければ limit で打ち切る）。Huffman ブロックは UnsupportedFormat"
+  requires limit >= 0
+  ensures none
+  effects none
+{
+  let n = z.len();
+  if n < 2 {
+    return Err(GitError.Corrupt("zlib stream too short"));
+  }
+  let cmf = z.get(0).unwrap_or(0);
+  let flg = z.get(1).unwrap_or(0);
+  if cmf % 16 != 8 || cmf / 16 > 7 {
+    return Err(GitError.Corrupt("invalid zlib header (not deflate)"));
+  }
+  if (cmf * 256 + flg) % 31 != 0 {
+    return Err(GitError.Corrupt("invalid zlib header check"));
+  }
+  if flg / 32 % 2 == 1 {
+    return Err(GitError.UnsupportedFormat("zlib preset dictionary is not supported"));
+  }
+  let mut out = Bytes.new();
+  let mut pos = 2;
+  let mut finished = false;
+  let mut cut = false;
+  while !finished && !cut {
+    if pos >= n {
+      return Err(GitError.Corrupt("zlib stream ended before the final block"));
+    }
+    let head = z.get(pos).unwrap_or(0);
+    let bfinal = head % 2;
+    let btype = head / 2 % 4;
+    if btype != 0 {
+      if btype == 3 {
+        return Err(GitError.Corrupt("invalid deflate block type"));
+      }
+      return Err(GitError.UnsupportedFormat("deflate Huffman block: inflate is not implemented yet"));
+    }
+    if head / 8 != 0 {
+      return Err(GitError.Corrupt("stored block has non-zero padding bits"));
+    }
+    if pos + 5 > n {
+      return Err(GitError.Corrupt("truncated stored block header"));
+    }
+    let len = z.get(pos + 1).unwrap_or(0) + z.get(pos + 2).unwrap_or(0) * 256;
+    let nlen = z.get(pos + 3).unwrap_or(0) + z.get(pos + 4).unwrap_or(0) * 256;
+    if len + nlen != 65535 {
+      return Err(GitError.Corrupt("stored block length check failed"));
+    }
+    if pos + 5 + len > n {
+      return Err(GitError.Corrupt("truncated stored block data"));
+    }
+    let mut take = len;
+    if out.len() + take > limit {
+      if verify_tail {
+        return Err(GitError.LimitExceeded("decompressed data exceeds the limit"));
+      }
+      take = limit - out.len();
+      cut = true;
+    }
+    if take > 0 {
+      out.extend(&z.slice(pos + 5, pos + 5 + take).unwrap_or(Bytes.new()));
+    }
+    pos = pos + 5 + len;
+    if bfinal == 1 {
+      finished = true;
+    }
+  }
+  if verify_tail && finished {
+    if pos + 4 != n {
+      return Err(GitError.Corrupt("zlib stream has trailing bytes or a missing checksum"));
+    }
+    let want = z.get(pos).unwrap_or(0) * 16777216 + z.get(pos + 1).unwrap_or(0) * 65536 + z.get(pos + 2).unwrap_or(0) * 256 + z.get(pos + 3).unwrap_or(0);
+    if want != adler32(&out) {
+      return Err(GitError.Corrupt("zlib Adler-32 mismatch"));
+    }
+  }
+  return Ok(out);
+}

@@ -1,0 +1,544 @@
+module git.fsio
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.hash.bytes_to_hex;
+
+// ADR 0047 決定 2: 永続化の共通部品（排他的作成・同期・同一ディレクトリ内の rename・親ディレクトリの同期）。
+// 公開 std.fs だけを使い、raw.*／unchecked は使わない（ADR 0044 決定 4）。
+
+pub fn cat2(a: &String, b: &String) -> String
+  intent "2 つの文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut x = a.as_bytes();
+  x.extend(&b.as_bytes());
+  return x.to_string_utf8().unwrap_or("");
+}
+
+pub fn cat3(a: &String, b: &String, c: &String) -> String
+  intent "3 つの文字列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut x = a.as_bytes();
+  x.extend(&b.as_bytes());
+  x.extend(&c.as_bytes());
+  return x.to_string_utf8().unwrap_or("");
+}
+
+pub fn join_path(dir: &String, name: &String) -> String
+  intent "ディレクトリと名前を / で連結した文字列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut x = dir.as_bytes();
+  if x.len() > 0 && x.get(x.len() - 1).unwrap_or(0) != 47 {
+    x.push(47);
+  }
+  x.extend(&name.as_bytes());
+  return x.to_string_utf8().unwrap_or("");
+}
+
+pub fn bytes_starts_with(b: &Bytes, prefix: &Bytes) -> Bool
+  intent "b が prefix で始まるかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  if b.len() < prefix.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < prefix.len() {
+    if b.get(i).unwrap_or(0) != prefix.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn string_starts_with(s: &String, prefix: &String) -> Bool
+  intent "s が prefix で始まるかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return bytes_starts_with(&s.as_bytes(), &prefix.as_bytes());
+}
+
+pub fn string_ends_with(s: &String, suffix: &String) -> Bool
+  intent "s が suffix で終わるかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let sb = s.as_bytes();
+  let xb = suffix.as_bytes();
+  if sb.len() < xb.len() {
+    return false;
+  }
+  return bytes_starts_with(&sb.slice(sb.len() - xb.len(), sb.len()).unwrap_or(Bytes.new()), &xb);
+}
+
+pub fn string_slice(s: &String, from: Int, to: Int) -> String
+  intent "s のバイト範囲 [from, to) を文字列として返す（範囲外や UTF-8 でなければ空）"
+  requires none
+  ensures none
+  effects none
+{
+  return s.as_bytes().slice(from, to).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+}
+
+pub fn map_io(e: &IoError, what: &String) -> GitError
+  intent "IoError を GitError に写す。内容や認証情報は含めず、操作の説明だけを載せる"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    IoError.NotFound(_) => GitError.NotFound(what.clone()),
+    IoError.AlreadyExists(_) => GitError.AlreadyExists(what.clone()),
+    IoError.LimitExceeded(_) => GitError.LimitExceeded(what.clone()),
+    _ => GitError.Io(what.clone()),
+  };
+}
+
+fn io_is_not_found(e: &IoError) -> Bool
+  intent "IoError が NotFound かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    IoError.NotFound(_) => true,
+    _ => false,
+  };
+}
+
+fn io_is_already_exists(e: &IoError) -> Bool
+  intent "IoError が AlreadyExists かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    IoError.AlreadyExists(_) => true,
+    _ => false,
+  };
+}
+
+pub fn file_exists(path: &String) -> Result<Bool, GitError>
+  intent "path に何か（ファイルまたはディレクトリ）があるかを返す。symlink は追わない"
+  requires none
+  ensures none
+  effects fs
+{
+  let opts = fs.open_options().read(true);
+  match opts.open(&Path.new(&path)) {
+    Ok(f) => {
+      let _ = f.close();
+      return Ok(true);
+    }
+    Err(e) => {
+      if io_is_not_found(&e) {
+        return Ok(false);
+      }
+      return match e {
+        IoError.IsADirectory(_) => Ok(true),
+        IoError.PermissionDenied(_) => Err(GitError.Io("path is a symlink or not readable")),
+        _ => Err(GitError.Io("failed to check path")),
+      };
+    }
+  }
+}
+
+pub fn dir_exists(path: &String) -> Result<Bool, GitError>
+  intent "path がディレクトリとして開けるかを返す。無ければ false"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.open_dir(&Path.new(&path)) {
+    Ok(d) => {
+      let _ = d.close();
+      return Ok(true);
+    }
+    Err(e) => {
+      if io_is_not_found(&e) {
+        return Ok(false);
+      }
+      return match e {
+        IoError.NotADirectory(_) => Ok(false),
+        _ => Err(GitError.Io("failed to open directory")),
+      };
+    }
+  }
+}
+
+fn io_is_dir(e: &IoError) -> Bool
+  intent "IoError が IsADirectory か NotADirectory かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    IoError.IsADirectory(_) => true,
+    IoError.NotADirectory(_) => true,
+    _ => false,
+  };
+}
+
+pub fn read_file_opt(path: &String, max: Int, dir_as_none: Bool) -> Result<Option<Bytes>, GitError>
+  intent "path を max byte までで読む。無ければ None（dir_as_none ならディレクトリ・親がファイルの場合も None）、max を超えれば LimitExceeded"
+  requires max >= 0
+  ensures none
+  effects fs.read
+{
+  match fs.read_bytes(&Path.new(&path), max) {
+    Ok(b) => {
+      return Ok(Some(b));
+    }
+    Err(e) => {
+      match e {
+        BinaryIoError.Io(io) => {
+          if io_is_not_found(&io) {
+            return Ok(None);
+          }
+          if dir_as_none && io_is_dir(&io) {
+            return Ok(None);
+          }
+          return Err(map_io(&io, &"failed to read file"));
+        }
+        _ => {
+          return Err(GitError.LimitExceeded("file is larger than the limit"));
+        }
+      }
+    }
+  }
+}
+
+pub fn sync_dir(path: &String) -> Result<Bool, GitError>
+  intent "ディレクトリを開いて同期し、閉じる（作成・rename・削除の持続化）"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.open_dir(&Path.new(&path)) {
+    Err(_) => {
+      return Err(GitError.Io("failed to open directory for sync"));
+    }
+    Ok(d) => {
+      let mut failed = false;
+      match d.sync() {
+        Err(_) => {
+          failed = true;
+        }
+        Ok(_) => {}
+      }
+      let _ = d.close();
+      if failed {
+        return Err(GitError.Io("failed to sync directory"));
+      }
+      return Ok(true);
+    }
+  }
+}
+
+pub fn make_dir(path: &String) -> Result<Bool, GitError>
+  intent "ディレクトリを 1 つ作る。既にあれば false、作れば true。作ったら親を同期する"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.create_dir(&Path.new(&path)) {
+    Ok(_) => {
+      match Path.new(&path).parent() {
+        None => {}
+        Some(par) => {
+          let ps = par.as_bytes().to_string_utf8().unwrap_or("");
+          if ps.len() > 0 {
+            sync_dir(&ps)?;
+          } else {
+            sync_dir(&".")?;
+          }
+        }
+      }
+      return Ok(true);
+    }
+    Err(e) => {
+      if io_is_already_exists(&e) {
+        return Ok(false);
+      }
+      return Err(map_io(&e, &"failed to create directory"));
+    }
+  }
+}
+
+pub fn make_dirs(path: &String) -> Result<Bool, GitError>
+  intent "ディレクトリを祖先ごとに作る（無ければ作り、作るたびに親を同期する）"
+  requires none
+  ensures none
+  effects fs
+{
+  if dir_exists(&path)? {
+    return Ok(true);
+  }
+  match Path.new(&path).parent() {
+    None => {}
+    Some(par) => {
+      let ps = par.as_bytes().to_string_utf8().unwrap_or("");
+      if ps.len() > 0 {
+        make_dirs(&ps)?;
+      }
+    }
+  }
+  make_dir(&path)?;
+  return Ok(true);
+}
+
+pub fn create_synced_file(path: &String, data: &Bytes) -> Result<Bool, GitError>
+  intent "path を排他的に作成して data を書き、ファイルの内容を同期して閉じる。既にあれば AlreadyExists"
+  requires none
+  ensures none
+  effects fs
+{
+  let opts = fs.open_options().write(true).create_new(true);
+  match opts.open(&Path.new(&path)) {
+    Err(e) => {
+      return Err(map_io(&e, &"failed to create file exclusively"));
+    }
+    Ok(f) => {
+      let mut file = f;
+      if data.len() > 0 {
+        match file.write_all(&data) {
+          Err(_) => {
+            let _ = file.close();
+            return Err(GitError.Io("failed to write file"));
+          }
+          Ok(_) => {}
+        }
+      }
+      match file.sync_all() {
+        Err(_) => {
+          let _ = file.close();
+          return Err(GitError.Io("failed to sync file"));
+        }
+        Ok(_) => {}
+      }
+      match file.close() {
+        Err(_) => {
+          return Err(GitError.Io("failed to close file"));
+        }
+        Ok(_) => {}
+      }
+      return Ok(true);
+    }
+  }
+}
+
+pub fn rename_file(from: &String, to: &String) -> Result<Bool, GitError>
+  intent "同一ファイルシステム内で from を to へ原子的に置換する"
+  requires none
+  ensures none
+  effects fs
+{
+  return match fs.rename(&Path.new(&from), &Path.new(&to)) {
+    Err(e) => Err(map_io(&e, &"failed to rename file")),
+    Ok(_) => Ok(true),
+  };
+}
+
+pub fn remove_file_if_exists(path: &String) -> Result<Bool, GitError>
+  intent "ファイルを削除する。無ければ false、消せば true"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.remove_file(&Path.new(&path)) {
+    Ok(_) => {
+      return Ok(true);
+    }
+    Err(e) => {
+      if io_is_not_found(&e) {
+        return Ok(false);
+      }
+      return Err(map_io(&e, &"failed to remove file"));
+    }
+  }
+}
+
+pub fn random_hex(n: Int) -> Result<String, GitError>
+  intent "n byte の乱数を小文字 hex にした文字列を返す。乱数が得られなければ Io"
+  requires n > 0
+  ensures none
+  effects random
+{
+  return match random.bytes(n) {
+    None => Err(GitError.Io("no entropy available for a temporary name")),
+    Some(b) => Ok(bytes_to_hex(&b)),
+  };
+}
+
+pub struct DirItem {
+  name: String,
+  is_dir: Bool,
+  is_file: Bool,
+  is_symlink: Bool,
+}
+
+pub fn list_items(dir: &String, max: Int) -> Result<List<DirItem>, GitError>
+  intent "ディレクトリのエントリ（名前と種別）を最大 max 件まで列挙する。超えたら LimitExceeded、無ければ NotFound"
+  requires max >= 0
+  ensures none
+  effects fs
+{
+  match fs.open_dir(&Path.new(&dir)) {
+    Err(e) => {
+      return Err(map_io(&e, &"failed to open directory"));
+    }
+    Ok(d) => {
+      let mut items = List.new();
+      let mut more = true;
+      let mut failed = 0;
+      while more {
+        match d.read_entries(256) {
+          Err(_) => {
+            failed = 1;
+            more = false;
+          }
+          Ok(entries) => {
+            if entries.len() == 0 {
+              more = false;
+            } else {
+              let mut i = 0;
+              while i < entries.len() {
+                match entries.get(i) {
+                  None => {}
+                  Some(en) => {
+                    if items.len() >= max {
+                      failed = 2;
+                      more = false;
+                    } else {
+                      items.push(DirItem { name: en.name(), is_dir: en.is_dir(), is_file: en.is_file(), is_symlink: en.is_symlink() });
+                    }
+                  }
+                }
+                i = i + 1;
+              }
+            }
+          }
+        }
+      }
+      let _ = d.close();
+      if failed == 1 {
+        return Err(GitError.Io("failed to list directory"));
+      }
+      if failed == 2 {
+        return Err(GitError.LimitExceeded("too many directory entries"));
+      }
+      return Ok(items);
+    }
+  }
+}
+
+pub fn list_names(dir: &String, max: Int) -> Result<List<String>, GitError>
+  intent "ディレクトリのエントリ名を最大 max 件まで列挙する"
+  requires max >= 0
+  ensures none
+  effects fs
+{
+  let items = list_items(&dir, max)?;
+  let mut names = List.new();
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        names.push(it.name.clone());
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(names);
+}
+
+pub fn lock_create(path: &String) -> Result<File, GitError>
+  intent "ロックファイル path を排他的に作成して開く。既にあれば Locked（古いロックは自動では消さない）"
+  requires none
+  ensures none
+  effects fs
+{
+  let opts = fs.open_options().write(true).create_new(true);
+  match opts.open(&Path.new(&path)) {
+    Ok(f) => {
+      return Ok(f);
+    }
+    Err(e) => {
+      if io_is_already_exists(&e) {
+        return Err(GitError.Locked("lock file already exists"));
+      }
+      return Err(map_io(&e, &"failed to create lock file"));
+    }
+  }
+}
+
+pub fn lock_publish(f: File, data: &Bytes, lock_path: &String, final_path: &String, parent_dir: &String) -> Result<Bool, GitError>
+  intent "取得済みのロックファイルに data を書き、同期して閉じ、final_path へ rename し、親ディレクトリを同期する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut file = f;
+  if data.len() > 0 {
+    match file.write_all(&data) {
+      Err(_) => {
+        let _ = file.close();
+        return Err(GitError.Io("failed to write lock file"));
+      }
+      Ok(_) => {}
+    }
+  }
+  match file.sync_all() {
+    Err(_) => {
+      let _ = file.close();
+      return Err(GitError.Io("failed to sync lock file"));
+    }
+    Ok(_) => {}
+  }
+  match file.close() {
+    Err(_) => {
+      return Err(GitError.Io("failed to close lock file"));
+    }
+    Ok(_) => {}
+  }
+  rename_file(&lock_path, &final_path)?;
+  sync_dir(&parent_dir)?;
+  return Ok(true);
+}
+
+pub fn parent_of(path: &String) -> String
+  intent "パスの親ディレクトリを文字列で返す。単一成分は \".\""
+  requires none
+  ensures none
+  effects none
+{
+  match Path.new(&path).parent() {
+    None => {
+      return ".";
+    }
+    Some(par) => {
+      let ps = par.as_bytes().to_string_utf8().unwrap_or("");
+      if ps.len() == 0 {
+        return ".";
+      }
+      return ps;
+    }
+  }
+}

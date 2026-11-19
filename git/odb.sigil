@@ -1,0 +1,154 @@
+module git.odb
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.file_exists;
+use git.fsio.join_path;
+use git.fsio.make_dir;
+use git.fsio.random_hex;
+use git.fsio.read_file_opt;
+use git.fsio.rename_file;
+use git.fsio.string_slice;
+use git.fsio.sync_dir;
+use git.hash.bytes_to_hex;
+use git.hash.compute_raw_object_id;
+use git.hash.hex_to_bytes;
+use git.hash.is_valid_hex_id;
+use git.limits.max_object_size;
+use git.object.ObjectType;
+use git.object.encode_raw_object;
+use git.object.header_obj_type;
+use git.object.header_size;
+use git.object.verify_object_bytes;
+use git.repo.Repo;
+use git.zlib.zlib_decode_stored;
+use git.zlib.zlib_stored;
+
+// ADR 0047 決定 2「オブジェクトの書き込み」: 緩い形式 objects/<先頭 2 文字>/<残り>。
+// 追記のみ。公開後に書き換えない。内容の取得（inflate を伴う読み取り）は圧縮の契約 ADR の確定後の後続 Issue。
+// 本モジュールの復号は stored ブロックの zlib だけを扱う（zlib_decode_stored）。Huffman 圧縮の既存オブジェクトは
+// 内容を検証できないので、存在の確認（odb_has）はできても、型・長さの取得と書き込み時の重複判定は UnsupportedFormat で拒否する。
+
+pub struct ObjectInfo {
+  obj_type: ObjectType,
+  size: Int,
+}
+
+fn raw_limit() -> Int
+  intent "1 オブジェクトの展開後（ヘッダ付き）の最大長を返す。ヘッダの余裕として 64 byte を足す"
+  requires none
+  ensures none
+  effects none
+{
+  return max_object_size() + 64;
+}
+
+fn file_limit() -> Int
+  intent "緩いオブジェクトのファイルを読む上限を返す。stored ブロックの枠・zlib のヘッダと検査値の余裕を足す"
+  requires none
+  ensures none
+  effects none
+{
+  return raw_limit() + 16384;
+}
+
+pub fn object_dir(repo: &Repo, id_hex: &String) -> Result<String, GitError>
+  intent "識別子（64 桁の小文字 hex）の fan-out ディレクトリ objects/xx を返す。不正な識別子は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  if !is_valid_hex_id(&id_hex) {
+    return Err(GitError.Corrupt("invalid object id (expected 64 lowercase hex digits)"));
+  }
+  return Ok(join_path(&join_path(&repo.git_dir, &"objects"), &string_slice(&id_hex, 0, 2)));
+}
+
+pub fn object_path(repo: &Repo, id_hex: &String) -> Result<String, GitError>
+  intent "識別子に対する緩いオブジェクトのファイルのパスを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let dir = object_dir(&repo, &id_hex)?;
+  return Ok(join_path(&dir, &string_slice(&id_hex, 2, 64)));
+}
+
+pub fn odb_has(repo: &Repo, id_hex: &String) -> Result<Bool, GitError>
+  intent "識別子の緩いオブジェクトのファイルがあるかを返す（内容は検証しない）。pack は単位 3 の範囲"
+  requires none
+  ensures none
+  effects fs
+{
+  let path = object_path(&repo, &id_hex)?;
+  return file_exists(&path);
+}
+
+fn load_verified_raw(repo: &Repo, id_hex: &String) -> Result<Option<Bytes>, GitError>
+  intent "緩いオブジェクトを読み、stored の zlib を復号し、識別子の再計算が名前と一致することを検証した生オブジェクトを返す。無ければ None"
+  requires none
+  ensures none
+  effects fs.read
+{
+  let path = object_path(&repo, &id_hex)?;
+  match read_file_opt(&path, file_limit(), false)? {
+    None => {
+      return Ok(None);
+    }
+    Some(z) => {
+      let rawobj = zlib_decode_stored(&z, raw_limit(), true)?;
+      let want = hex_to_bytes(&id_hex)?;
+      verify_object_bytes(&rawobj, &want)?;
+      return Ok(Some(rawobj));
+    }
+  }
+}
+
+pub fn odb_info(repo: &Repo, id_hex: &String) -> Result<ObjectInfo, GitError>
+  intent "識別子のオブジェクトの型と長さを返す（識別子を再計算して検証する）。無ければ NotFound、Huffman 圧縮は UnsupportedFormat"
+  requires none
+  ensures none
+  effects fs.read
+{
+  match load_verified_raw(&repo, &id_hex)? {
+    None => {
+      return Err(GitError.NotFound("object does not exist"));
+    }
+    Some(rawobj) => {
+      let want = hex_to_bytes(&id_hex)?;
+      let hdr = verify_object_bytes(&rawobj, &want)?;
+      return Ok(ObjectInfo { obj_type: header_obj_type(&hdr), size: header_size(&hdr) });
+    }
+  }
+}
+
+pub fn odb_write(repo: &Repo, obj_type: &ObjectType, content: &Bytes) -> Result<String, GitError>
+  intent "オブジェクトを緩い形式で書き、識別子（hex）を返す。一時ファイルに書いて同期し、rename で公開し、親ディレクトリを同期してから成功を返す。既にあれば既存の内容を検証し、書き込みを省略する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if content.len() > max_object_size() {
+    return Err(GitError.LimitExceeded("object exceeds the 64 MiB limit"));
+  }
+  let rawobj = encode_raw_object(&obj_type, &content);
+  let id = compute_raw_object_id(&rawobj);
+  let id_hex = bytes_to_hex(&id);
+  match load_verified_raw(&repo, &id_hex)? {
+    Some(_) => {
+      return Ok(id_hex);
+    }
+    None => {}
+  }
+  let dir = object_dir(&repo, &id_hex)?;
+  make_dir(&dir)?;
+  let final_path = object_path(&repo, &id_hex)?;
+  let tmp = join_path(&dir, &cat3(&"tmp_obj_", &random_hex(8)?, &""));
+  create_synced_file(&tmp, &zlib_stored(&rawobj))?;
+  rename_file(&tmp, &final_path)?;
+  sync_dir(&dir)?;
+  return Ok(id_hex);
+}

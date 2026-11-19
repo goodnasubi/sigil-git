@@ -1,0 +1,1014 @@
+module git.refs
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.error.is_not_found;
+use git.fsio.DirItem;
+use git.fsio.cat3;
+use git.fsio.dir_exists;
+use git.fsio.file_exists;
+use git.fsio.join_path;
+use git.fsio.list_items;
+use git.fsio.list_names;
+use git.fsio.lock_create;
+use git.fsio.lock_publish;
+use git.fsio.make_dirs;
+use git.fsio.parent_of;
+use git.fsio.read_file_opt;
+use git.fsio.remove_file_if_exists;
+use git.fsio.string_ends_with;
+use git.fsio.string_slice;
+use git.fsio.string_starts_with;
+use git.fsio.sync_dir;
+use git.hash.is_valid_hex_id;
+use git.limits.max_packed_refs_size;
+use git.limits.max_ref_name_len;
+use git.limits.max_refs;
+use git.object.ObjectType;
+use git.odb.odb_info;
+use git.repo.Repo;
+use git.validate.validate_ref_name;
+
+// ADR 0047 決定 1「参照」・決定 2「参照の更新」「参照の削除」。
+// 書き込みは緩い参照のファイルと packed-refs からの削除（ファイル全体の書き換え）だけ。packed-refs への追加や pack-refs はしない。
+
+pub enum ExpectOld {
+  Any,
+  Absent,
+  Is(String),
+}
+
+pub enum HeadState {
+  Symbolic(String),
+  Detached(String),
+}
+
+pub struct RefEntry {
+  name: String,
+  id: String,
+}
+
+pub struct PackedRef {
+  name: String,
+  id: String,
+  peeled: String,
+}
+
+pub struct PackedRefs {
+  header: String,
+  refs: List<PackedRef>,
+}
+
+fn loose_ref_max() -> Int
+  intent "緩い参照ファイルを読む上限 (4 KiB) を返す"
+  requires none
+  ensures result == 4096
+  effects none
+{
+  return 4096;
+}
+
+fn walk_limit() -> Int
+  intent "1 ディレクトリで列挙する参照ファイル数の上限を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 100000;
+}
+
+// ---------------------------------------------------------------------------
+// 参照名の検査
+// ---------------------------------------------------------------------------
+
+pub fn check_ref_name(name: &String) -> Result<Bool, GitError>
+  intent "参照名が check-ref-format の規則を満たし、refs/heads/ か refs/tags/ の下にあることを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  validate_ref_name(&name)?;
+  if !string_starts_with(&name, &"refs/heads/") && !string_starts_with(&name, &"refs/tags/") {
+    return Err(GitError.InvalidRefName("only refs/heads/* and refs/tags/* can be written"));
+  }
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+// packed-refs の読み取りと直列化
+// ---------------------------------------------------------------------------
+
+fn empty_packed() -> PackedRef
+  intent "空の PackedRef を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return PackedRef { name: "", id: "", peeled: "" };
+}
+
+fn packed_at_list(l: &List<PackedRef>, i: Int) -> PackedRef
+  intent "リストの i 番目の PackedRef の複製を返す（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(e) => PackedRef { name: e.name.clone(), id: e.id.clone(), peeled: e.peeled.clone() },
+    None => empty_packed(),
+  };
+}
+
+fn packed_at(p: &PackedRefs, i: Int) -> PackedRef
+  intent "packed-refs の i 番目のエントリの複製を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return packed_at_list(&p.refs, i);
+}
+
+fn entry_at(l: &List<RefEntry>, i: Int) -> RefEntry
+  intent "リストの i 番目の RefEntry の複製を返す（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(e) => RefEntry { name: e.name.clone(), id: e.id.clone() },
+    None => RefEntry { name: "", id: "" },
+  };
+}
+
+fn str_at(l: &List<String>, i: Int) -> String
+  intent "リストの i 番目の文字列の複製を返す（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(s) => s.clone(),
+    None => "",
+  };
+}
+
+fn min_int(a: Int, b: Int) -> Int
+  intent "小さい方を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+fn header_traits_ok(line: &String) -> Bool
+  intent "packed-refs のヘッダの特性が peeled・fully-peeled・sorted だけかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let prefix = "# pack-refs with:";
+  if !string_starts_with(&line, &prefix) {
+    return false;
+  }
+  let lb = line.as_bytes();
+  let mut i = prefix.len();
+  while i < lb.len() {
+    while i < lb.len() && lb.get(i).unwrap_or(0) == 32 {
+      i = i + 1;
+    }
+    let mut j = i;
+    while j < lb.len() && lb.get(j).unwrap_or(0) != 32 {
+      j = j + 1;
+    }
+    if j > i {
+      let t = string_slice(&line, i, j);
+      if t != "peeled" && t != "fully-peeled" && t != "sorted" {
+        return false;
+      }
+    }
+    i = j;
+  }
+  return true;
+}
+
+pub fn parse_packed_refs(data: &Bytes) -> Result<PackedRefs, GitError>
+  intent "packed-refs を解析する。ヘッダの特性は peeled・fully-peeled・sorted だけを許し、未知の特性・不正な行・重複・refs/replace は拒否する。件数と名前の長さの上限も検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let n = data.len();
+  let mut header = "";
+  let mut refs = List.new();
+  let mut have = false;
+  let mut cur_name = "";
+  let mut cur_id = "";
+  let mut cur_peeled = "";
+  let mut pos = 0;
+  let mut first = true;
+  if n > 0 && data.get(n - 1).unwrap_or(0) != 10 {
+    return Err(GitError.Corrupt("packed-refs does not end with a newline"));
+  }
+  while pos < n {
+    let mut end = pos;
+    while end < n && data.get(end).unwrap_or(0) != 10 {
+      end = end + 1;
+    }
+    let line_b = data.slice(pos, end).unwrap_or(Bytes.new());
+    let line = line_b.to_string_utf8().unwrap_or("");
+    if line.len() != line_b.len() {
+      return Err(GitError.Corrupt("packed-refs line is not valid UTF-8"));
+    }
+    pos = end + 1;
+    if line.len() > 0 && line_b.get(0).unwrap_or(0) == 35 {
+      if !first {
+        return Err(GitError.Corrupt("unexpected comment line in packed-refs"));
+      }
+      if !header_traits_ok(&line) {
+        return Err(GitError.UnsupportedFormat("unknown packed-refs header trait"));
+      }
+      header = cat3(&line, &"\n", &"");
+    } else if line.len() > 0 && line_b.get(0).unwrap_or(0) == 94 {
+      if !have {
+        return Err(GitError.Corrupt("peeled line without a preceding reference"));
+      }
+      let pid = string_slice(&line, 1, line.len());
+      if !is_valid_hex_id(&pid) {
+        return Err(GitError.Corrupt("invalid peeled object id in packed-refs"));
+      }
+      if cur_peeled != "" {
+        return Err(GitError.Corrupt("duplicate peeled line in packed-refs"));
+      }
+      cur_peeled = pid;
+    } else {
+      if line.len() < 66 || line_b.get(64).unwrap_or(0) != 32 {
+        return Err(GitError.Corrupt("malformed packed-refs entry"));
+      }
+      let id = string_slice(&line, 0, 64);
+      let name = string_slice(&line, 65, line.len());
+      if !is_valid_hex_id(&id) {
+        return Err(GitError.Corrupt("invalid object id in packed-refs"));
+      }
+      if name.len() > max_ref_name_len() {
+        return Err(GitError.LimitExceeded("ref name length exceeds 1024 limit"));
+      }
+      validate_ref_name(&name)?;
+      if !string_starts_with(&name, &"refs/") {
+        return Err(GitError.Corrupt("packed-refs entry outside refs/"));
+      }
+      if string_starts_with(&name, &"refs/replace/") {
+        return Err(GitError.UnsupportedFormat("replace refs are not supported"));
+      }
+      if have {
+        refs.push(PackedRef { name: cur_name.clone(), id: cur_id.clone(), peeled: cur_peeled.clone() });
+      }
+      if refs.len() >= max_refs() {
+        return Err(GitError.LimitExceeded("too many references"));
+      }
+      let mut k = 0;
+      while k < refs.len() {
+        if packed_at_list(&refs, k).name == name {
+          return Err(GitError.Corrupt("duplicate reference in packed-refs"));
+        }
+        k = k + 1;
+      }
+      have = true;
+      cur_name = name;
+      cur_id = id;
+      cur_peeled = "";
+    }
+    first = false;
+  }
+  if have {
+    refs.push(PackedRef { name: cur_name.clone(), id: cur_id.clone(), peeled: cur_peeled.clone() });
+  }
+  return Ok(PackedRefs { header: header, refs: refs });
+}
+
+pub fn serialize_packed_refs(p: &PackedRefs) -> Bytes
+  intent "packed-refs を直列化する。ヘッダと各エントリ（peeled の行を含む）を読み取った順のまま書く"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = p.header.as_bytes();
+  let mut i = 0;
+  while i < p.refs.len() {
+    let e = packed_at(&p, i);
+    out.extend(&e.id.as_bytes());
+    out.push(32);
+    out.extend(&e.name.as_bytes());
+    out.push(10);
+    if e.peeled != "" {
+      out.push(94);
+      out.extend(&e.peeled.as_bytes());
+      out.push(10);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn packed_path(repo: &Repo) -> String
+  intent "packed-refs のパスを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return join_path(&repo.git_dir, &"packed-refs");
+}
+
+pub fn read_packed(repo: &Repo) -> Result<PackedRefs, GitError>
+  intent "packed-refs を読む。無ければ空。64 MiB を超えれば LimitExceeded"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_file_opt(&packed_path(&repo), max_packed_refs_size(), false)? {
+    None => Ok(PackedRefs { header: "", refs: List.new() }),
+    Some(b) => parse_packed_refs(&b),
+  };
+}
+
+fn find_packed(p: &PackedRefs, name: &String) -> Option<String>
+  intent "packed-refs から name の識別子を探す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < p.refs.len() {
+    let e = packed_at(&p, i);
+    if e.name == name {
+      return Some(e.id);
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+// ---------------------------------------------------------------------------
+// 緩い参照の読み取り
+// ---------------------------------------------------------------------------
+
+fn ref_path(repo: &Repo, name: &String) -> String
+  intent "参照の緩いファイルのパスを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return join_path(&repo.git_dir, &name);
+}
+
+fn parse_id_line(b: &Bytes) -> Result<String, GitError>
+  intent "64 桁の小文字 hex と、あれば末尾の改行 1 つだけからなる内容を識別子として読む"
+  requires none
+  ensures none
+  effects none
+{
+  let mut body = b.clone();
+  if body.len() > 0 && body.get(body.len() - 1).unwrap_or(0) == 10 {
+    body = body.slice(0, body.len() - 1).unwrap_or(Bytes.new());
+  }
+  let s = body.to_string_utf8().unwrap_or("");
+  if s.len() != body.len() || !is_valid_hex_id(&s) {
+    return Err(GitError.Corrupt("reference file does not contain a SHA-256 object id"));
+  }
+  return Ok(s);
+}
+
+fn read_loose(repo: &Repo, name: &String) -> Result<Option<String>, GitError>
+  intent "緩い参照ファイルの識別子を返す。無ければ None。シンボリック参照や不正な内容は Corrupt"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_file_opt(&ref_path(&repo, &name), loose_ref_max(), true)? {
+    None => Ok(None),
+    Some(b) => Ok(Some(parse_id_line(&b)?)),
+  };
+}
+
+pub fn read_ref(repo: &Repo, name: &String) -> Result<Option<String>, GitError>
+  intent "参照の識別子を返す。緩い参照が packed-refs より優先される（Git と同じ）。無ければ None"
+  requires none
+  ensures none
+  effects fs.read
+{
+  check_ref_name(&name)?;
+  match read_loose(&repo, &name)? {
+    Some(id) => {
+      return Ok(Some(id));
+    }
+    None => {}
+  }
+  let packed = read_packed(&repo)?;
+  return Ok(find_packed(&packed, &name));
+}
+
+fn matches_expect(current: &Option<String>, expect: &ExpectOld) -> Bool
+  intent "現在の値が期待する旧値と一致するかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match expect {
+    ExpectOld.Any => true,
+    ExpectOld.Absent => match current {
+      None => true,
+      Some(_) => false,
+    },
+    ExpectOld.Is(want) => match current {
+      None => false,
+      Some(have) => have == want,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// HEAD
+// ---------------------------------------------------------------------------
+
+pub fn read_head(repo: &Repo) -> Result<HeadState, GitError>
+  intent "HEAD を読む。シンボリック参照（refs/heads/ 以下）または分離 HEAD（SHA-256 の識別子）"
+  requires none
+  ensures none
+  effects fs.read
+{
+  match read_file_opt(&join_path(&repo.git_dir, &"HEAD"), loose_ref_max(), false)? {
+    None => {
+      return Err(GitError.NotFound("HEAD is missing"));
+    }
+    Some(b) => {
+      let mut body = b.clone();
+      if body.len() > 0 && body.get(body.len() - 1).unwrap_or(0) == 10 {
+        body = body.slice(0, body.len() - 1).unwrap_or(Bytes.new());
+      }
+      let s = body.to_string_utf8().unwrap_or("");
+      if s.len() != body.len() {
+        return Err(GitError.Corrupt("HEAD is not valid UTF-8"));
+      }
+      if string_starts_with(&s, &"ref: ") {
+        let target = string_slice(&s, 5, s.len());
+        validate_ref_name(&target)?;
+        if !string_starts_with(&target, &"refs/heads/") {
+          return Err(GitError.UnsupportedFormat("HEAD must point to refs/heads/*"));
+        }
+        return Ok(HeadState.Symbolic(target));
+      }
+      if !is_valid_hex_id(&s) {
+        return Err(GitError.Corrupt("HEAD is neither a symbolic ref nor a SHA-256 object id"));
+      }
+      return Ok(HeadState.Detached(s));
+    }
+  }
+}
+
+fn publish_locked(path: &String, data: &Bytes) -> Result<Bool, GitError>
+  intent "path.lock を排他的に作成し、data を書いて同期し、rename で path を置き換え、親ディレクトリを同期する。ロックが既にあれば Locked。失敗時は自分が作ったロックだけを消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let lock_path = cat3(&path, &".lock", &"");
+  let parent = parent_of(&path);
+  make_dirs(&parent)?;
+  let f = lock_create(&lock_path)?;
+  match lock_publish(f, &data, &lock_path, &path, &parent) {
+    Err(e) => {
+      let _ = remove_file_if_exists(&lock_path);
+      return Err(e);
+    }
+    Ok(_) => {
+      return Ok(true);
+    }
+  }
+}
+
+pub fn set_head_symbolic(repo: &Repo, branch_ref: &String) -> Result<Bool, GitError>
+  intent "HEAD を refs/heads/* へのシンボリック参照にする（ブランチがまだ無くてもよい）。HEAD.lock で原子的に置き換える"
+  requires none
+  ensures none
+  effects fs
+{
+  validate_ref_name(&branch_ref)?;
+  if !string_starts_with(&branch_ref, &"refs/heads/") {
+    return Err(GitError.InvalidRefName("HEAD can only point to refs/heads/*"));
+  }
+  let body = cat3(&"ref: ", &branch_ref, &"\n");
+  return publish_locked(&join_path(&repo.git_dir, &"HEAD"), &body.as_bytes());
+}
+
+pub fn set_head_detached(repo: &Repo, id: &String) -> Result<Bool, GitError>
+  intent "HEAD を commit の識別子に向ける（分離 HEAD）。commit が永続化済みであることを確かめてから、HEAD.lock で原子的に置き換える"
+  requires none
+  ensures none
+  effects fs
+{
+  let info = odb_info(&repo, &id)?;
+  match info.obj_type {
+    ObjectType.Commit => {}
+    _ => {
+      return Err(GitError.TypeMismatch("detached HEAD must point to a commit"));
+    }
+  }
+  let body = cat3(&id, &"\n", &"");
+  return publish_locked(&join_path(&repo.git_dir, &"HEAD"), &body.as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// 参照の更新
+// ---------------------------------------------------------------------------
+
+fn conflicts_with_packed(packed: &PackedRefs, name: &String) -> Bool
+  intent "name が packed-refs の参照と、ディレクトリ／ファイルの関係で衝突するかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let as_dir = cat3(&name, &"/", &"");
+  let mut i = 0;
+  while i < packed.refs.len() {
+    let e = packed_at(&packed, i);
+    if string_starts_with(&e.name, &as_dir) || string_starts_with(&name, &cat3(&e.name, &"/", &"")) {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn conflicts_with_loose(repo: &Repo, name: &String) -> Result<Bool, GitError>
+  intent "name が緩い参照と、ディレクトリ／ファイルの関係で衝突するかを返す。name 自体が中身のあるディレクトリ（feature/x があるときの feature）、または name の上位が参照ファイル（main があるときの main/x）なら true"
+  requires none
+  ensures none
+  effects fs
+{
+  let path = ref_path(&repo, &name);
+  if dir_exists(&path)? {
+    let inner = list_names(&path, max_refs())?;
+    if inner.len() > 0 {
+      return Ok(true);
+    }
+  }
+  let nb = name.as_bytes();
+  let mut i = 0;
+  while i < nb.len() {
+    if nb.get(i).unwrap_or(0) == 47 && i > 11 {
+      let upper = string_slice(&name, 0, i);
+      if file_exists(&ref_path(&repo, &upper))? {
+        return Ok(true);
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(false);
+}
+
+fn current_value(repo: &Repo, name: &String, packed: &PackedRefs) -> Result<Option<String>, GitError>
+  intent "参照の現在の値（緩い参照を優先し、無ければ packed-refs）を返す"
+  requires none
+  ensures none
+  effects fs.read
+{
+  match read_loose(&repo, &name)? {
+    Some(id) => {
+      return Ok(Some(id));
+    }
+    None => {}
+  }
+  return Ok(find_packed(&packed, &name));
+}
+
+fn update_locked(f: File, name: &String, new_id: &String, expect: &ExpectOld, packed: &PackedRefs, repo: &Repo, path: &String, lock_path: &String, parent: &String) -> Result<Bool, GitError>
+  intent "取得済みの <参照>.lock の下で旧値を比較し、新しい識別子と改行を書いて同期し、rename で公開する。エラーで戻るとき f は破棄時に閉じられる"
+  requires none
+  ensures none
+  effects fs
+{
+  let current = current_value(&repo, &name, &packed)?;
+  if !matches_expect(&current, &expect) {
+    return Err(GitError.RefMismatch("reference does not have the expected old value"));
+  }
+  let body = cat3(&new_id, &"\n", &"");
+  return lock_publish(f, &body.as_bytes(), &lock_path, &path, &parent);
+}
+
+pub fn update_ref(repo: &Repo, name: &String, new_id: &String, expect: ExpectOld) -> Result<Bool, GitError>
+  intent "refs/heads/* か refs/tags/* を new_id に更新する（compare-and-swap）。new_id が永続化済みであることを先に確かめ（ブランチは commit のみ）、<参照>.lock を排他的に作成して旧値を比較し、新しい識別子と改行を同期して rename で置き換え、親ディレクトリを同期する。ロックが既にあれば Locked（自動では消さない）、旧値が違えば RefMismatch"
+  requires none
+  ensures none
+  effects fs
+{
+  check_ref_name(&name)?;
+  if !is_valid_hex_id(&new_id) {
+    return Err(GitError.Corrupt("invalid object id (expected 64 lowercase hex digits)"));
+  }
+  let info = odb_info(&repo, &new_id)?;
+  if string_starts_with(&name, &"refs/heads/") {
+    match info.obj_type {
+      ObjectType.Commit => {}
+      _ => {
+        return Err(GitError.TypeMismatch("a branch must point to a commit"));
+      }
+    }
+  }
+  let packed = read_packed(&repo)?;
+  if conflicts_with_packed(&packed, &name) || conflicts_with_loose(&repo, &name)? {
+    return Err(GitError.AlreadyExists("reference name conflicts with an existing reference"));
+  }
+  let path = ref_path(&repo, &name);
+  let lock_path = cat3(&path, &".lock", &"");
+  let parent = parent_of(&path);
+  make_dirs(&parent)?;
+  let f = lock_create(&lock_path)?;
+  match update_locked(f, &name, &new_id, &expect, &packed, &repo, &path, &lock_path, &parent) {
+    Err(e) => {
+      release(&lock_path);
+      return Err(e);
+    }
+    Ok(_) => {
+      return Ok(true);
+    }
+  }
+}
+
+pub fn create_branch(repo: &Repo, branch: &String, commit_id: &String) -> Result<Bool, GitError>
+  intent "ブランチを作る（既にあれば RefMismatch）"
+  requires none
+  ensures none
+  effects fs
+{
+  return update_ref(&repo, &cat3(&"refs/heads/", &branch, &""), &commit_id, ExpectOld.Absent);
+}
+
+pub fn create_tag(repo: &Repo, tag: &String, target_id: &String) -> Result<Bool, GitError>
+  intent "軽量タグを作る（既にあれば RefMismatch）"
+  requires none
+  ensures none
+  effects fs
+{
+  return update_ref(&repo, &cat3(&"refs/tags/", &tag, &""), &target_id, ExpectOld.Absent);
+}
+
+// ---------------------------------------------------------------------------
+// 参照の削除
+// ---------------------------------------------------------------------------
+
+fn release(lock_path: &String)
+  intent "自分が作ったロックファイルを消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let _ = remove_file_if_exists(&lock_path);
+}
+
+fn without_ref(p: &PackedRefs, name: &String) -> PackedRefs
+  intent "name のエントリ（と、その peeled の行）だけを除いた packed-refs を返す。ヘッダと他のエントリは変えない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut kept = List.new();
+  let mut i = 0;
+  while i < p.refs.len() {
+    let e = packed_at(&p, i);
+    if e.name != name {
+      kept.push(e);
+    }
+    i = i + 1;
+  }
+  return PackedRefs { header: p.header.clone(), refs: kept };
+}
+
+fn rewrite_packed_locked(pf: File, repo: &Repo, name: &String, expect: &ExpectOld, ppath: &String) -> Result<Bool, GitError>
+  intent "取得済みの packed-refs.lock の下で packed-refs を読み直し、旧値を確かめ、name を除いた全体を書いて同期し、rename で置き換えて親ディレクトリを同期する"
+  requires none
+  ensures none
+  effects fs
+{
+  let locked_view = read_packed(&repo)?;
+  let current = current_value(&repo, &name, &locked_view)?;
+  if !matches_expect(&current, &expect) {
+    return Err(GitError.RefMismatch("reference does not have the expected old value"));
+  }
+  let rewritten = serialize_packed_refs(&without_ref(&locked_view, &name));
+  let plock_path = cat3(&ppath, &".lock", &"");
+  return lock_publish(pf, &rewritten, &plock_path, &ppath, &repo.git_dir);
+}
+
+fn delete_packed_side(repo: &Repo, name: &String, expect: &ExpectOld, ppath: &String) -> Result<Bool, GitError>
+  intent "packed-refs.lock を取って packed 側から name を消す。失敗時は自分が作った packed-refs.lock だけを消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let plock_path = cat3(&ppath, &".lock", &"");
+  let pf = lock_create(&plock_path)?;
+  match rewrite_packed_locked(pf, &repo, &name, &expect, &ppath) {
+    Err(e) => {
+      release(&plock_path);
+      return Err(e);
+    }
+    Ok(_) => {
+      return Ok(true);
+    }
+  }
+}
+
+fn delete_locked(repo: &Repo, name: &String, expect: &ExpectOld, path: &String, parent: &String) -> Result<Bool, GitError>
+  intent "<参照>.lock を保持したまま、packed 側（あれば）→ 緩い参照の順に消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let first_look = read_packed(&repo)?;
+  let in_packed = match find_packed(&first_look, &name) {
+    None => false,
+    Some(_) => true,
+  };
+  let loose = read_loose(&repo, &name)?;
+  if in_packed {
+    delete_packed_side(&repo, &name, &expect, &packed_path(&repo))?;
+  } else {
+    if !matches_expect(&loose, &expect) {
+      return Err(GitError.RefMismatch("reference does not have the expected old value"));
+    }
+    match loose {
+      None => {
+        return Err(GitError.NotFound("reference does not exist"));
+      }
+      Some(_) => {}
+    }
+  }
+  remove_file_if_exists(&path)?;
+  sync_dir(&parent)?;
+  return Ok(true);
+}
+
+pub fn delete_ref(repo: &Repo, name: &String, expect: ExpectOld) -> Result<Bool, GitError>
+  intent "refs/heads/* か refs/tags/* を削除する。packed-refs にも同名があるときは、<参照>.lock と packed-refs.lock の両方を取り、ロックの下で packed-refs を読み直して旧値を確かめ、packed 側を先に消して同期・rename・親の同期をしてから緩い参照を消す。中断しても参照は復活しない"
+  requires none
+  ensures none
+  effects fs
+{
+  check_ref_name(&name)?;
+  let path = ref_path(&repo, &name);
+  let lock_path = cat3(&path, &".lock", &"");
+  let parent = parent_of(&path);
+  if !dir_exists(&parent)? {
+    return Err(GitError.NotFound("reference does not exist"));
+  }
+  let rf = lock_create(&lock_path)?;
+  let _ = rf.close();
+  match delete_locked(&repo, &name, &expect, &path, &parent) {
+    Err(e) => {
+      release(&lock_path);
+      return Err(e);
+    }
+    Ok(_) => {
+      release(&lock_path);
+      return Ok(true);
+    }
+  }
+}
+
+pub fn delete_branch(repo: &Repo, branch: &String, expect: ExpectOld) -> Result<Bool, GitError>
+  intent "ブランチを削除する"
+  requires none
+  ensures none
+  effects fs
+{
+  return delete_ref(&repo, &cat3(&"refs/heads/", &branch, &""), expect);
+}
+
+pub fn delete_tag(repo: &Repo, tag: &String, expect: ExpectOld) -> Result<Bool, GitError>
+  intent "タグを削除する"
+  requires none
+  ensures none
+  effects fs
+{
+  return delete_ref(&repo, &cat3(&"refs/tags/", &tag, &""), expect);
+}
+
+// ---------------------------------------------------------------------------
+// 一覧
+// ---------------------------------------------------------------------------
+
+fn less_than(a: &String, b: &String) -> Bool
+  intent "文字列をバイト列として辞書順に比較し a < b かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let ab = a.as_bytes();
+  let bb = b.as_bytes();
+  let mut i = 0;
+  while i < ab.len() && i < bb.len() {
+    let x = ab.get(i).unwrap_or(0);
+    let y = bb.get(i).unwrap_or(0);
+    if x != y {
+      return x < y;
+    }
+    i = i + 1;
+  }
+  return ab.len() < bb.len();
+}
+
+fn copy_entries(items: &List<RefEntry>) -> List<RefEntry>
+  intent "RefEntry のリストを複製する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < items.len() {
+    out.push(entry_at(&items, i));
+    i = i + 1;
+  }
+  return out;
+}
+
+fn sort_entries(items: &List<RefEntry>) -> List<RefEntry>
+  intent "参照を名前の辞書順に整列する（下から上へのマージソート）"
+  requires none
+  ensures none
+  effects none
+{
+  let n = items.len();
+  let mut cur = copy_entries(&items);
+  let mut width = 1;
+  while width < n {
+    let mut next = List.new();
+    let mut start = 0;
+    while start < n {
+      let mid = min_int(start + width, n);
+      let end = min_int(start + width * 2, n);
+      let mut i = start;
+      let mut j = mid;
+      while i < mid || j < end {
+        let mut left = false;
+        if i < mid && j < end {
+          left = !less_than(&entry_at(&cur, j).name, &entry_at(&cur, i).name);
+        } else if i < mid {
+          left = true;
+        }
+        if left {
+          next.push(entry_at(&cur, i));
+          i = i + 1;
+        } else {
+          next.push(entry_at(&cur, j));
+          j = j + 1;
+        }
+      }
+      start = start + width * 2;
+    }
+    cur = next;
+    width = width * 2;
+  }
+  return cur;
+}
+
+fn collect_dir(repo: &Repo, rel: &String, items: &List<DirItem>, queue: &mut List<String>, out: &mut List<RefEntry>) -> Result<Bool, GitError>
+  intent "1 ディレクトリ分のエントリを処理する。ディレクトリは queue に積み、ファイル（*.lock 以外）は参照として読む。symlink は拒否する"
+  requires none
+  ensures none
+  effects fs.read
+{
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        let child = cat3(&rel, &"/", &it.name);
+        if it.is_symlink {
+          return Err(GitError.UnsupportedFormat("symbolic links under refs/ are not supported"));
+        }
+        if it.is_dir {
+          queue.push(child);
+        } else if it.is_file && !string_ends_with(&it.name, &".lock") {
+          validate_ref_name(&child)?;
+          match read_loose(&repo, &child)? {
+            None => {}
+            Some(id) => {
+              if out.len() >= max_refs() {
+                return Err(GitError.LimitExceeded("too many references"));
+              }
+              out.push(RefEntry { name: child, id: id });
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn collect_loose(repo: &Repo, prefix_dir: &String, out: &mut List<RefEntry>) -> Result<Bool, GitError>
+  intent "git ディレクトリ配下の prefix_dir（例 refs/heads）以下の緩い参照を幅優先で列挙する。*.lock は無視し、symlink は拒否する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut queue = List.new();
+  queue.push(prefix_dir.clone());
+  let mut qi = 0;
+  while qi < queue.len() {
+    let rel = str_at(&queue, qi);
+    qi = qi + 1;
+    let dir = join_path(&repo.git_dir, &rel);
+    match list_items(&dir, walk_limit()) {
+      Err(e) => {
+        if !(is_not_found(&e) && qi == 1) {
+          return Err(e);
+        }
+      }
+      Ok(items) => {
+        collect_dir(&repo, &rel, &items, &mut queue, &mut out)?;
+      }
+    }
+  }
+  return Ok(true);
+}
+
+pub fn list_refs(repo: &Repo, prefix: &String) -> Result<List<RefEntry>, GitError>
+  intent "prefix（refs/heads または refs/tags）以下の参照を名前順に返す。緩い参照が同名の packed-refs より優先される"
+  requires none
+  ensures none
+  effects fs
+{
+  if prefix != "refs/heads" && prefix != "refs/tags" {
+    return Err(GitError.InvalidRefName("prefix must be refs/heads or refs/tags"));
+  }
+  let mut loose = List.new();
+  collect_loose(&repo, &prefix, &mut loose)?;
+  let loose_sorted = sort_entries(&loose);
+  let packed = read_packed(&repo)?;
+  let mut from_packed = List.new();
+  let dir_prefix = cat3(&prefix, &"/", &"");
+  let mut k = 0;
+  while k < packed.refs.len() {
+    let e = packed_at(&packed, k);
+    if string_starts_with(&e.name, &dir_prefix) {
+      from_packed.push(RefEntry { name: e.name, id: e.id });
+    }
+    k = k + 1;
+  }
+  let packed_sorted = sort_entries(&from_packed);
+  let mut out = List.new();
+  let mut i = 0;
+  let mut j = 0;
+  while i < loose_sorted.len() || j < packed_sorted.len() {
+    if i >= loose_sorted.len() {
+      out.push(entry_at(&packed_sorted, j));
+      j = j + 1;
+    } else if j >= packed_sorted.len() {
+      out.push(entry_at(&loose_sorted, i));
+      i = i + 1;
+    } else {
+      let l = entry_at(&loose_sorted, i);
+      let p = entry_at(&packed_sorted, j);
+      if l.name == p.name {
+        out.push(l);
+        i = i + 1;
+        j = j + 1;
+      } else if less_than(&l.name, &p.name) {
+        out.push(l);
+        i = i + 1;
+      } else {
+        out.push(p);
+        j = j + 1;
+      }
+    }
+  }
+  if out.len() > max_refs() {
+    return Err(GitError.LimitExceeded("too many references"));
+  }
+  return Ok(out);
+}
+
+pub fn list_branches(repo: &Repo) -> Result<List<RefEntry>, GitError>
+  intent "ブランチの一覧を名前順に返す"
+  requires none
+  ensures none
+  effects fs
+{
+  return list_refs(&repo, &"refs/heads");
+}
+
+pub fn list_tags(repo: &Repo) -> Result<List<RefEntry>, GitError>
+  intent "タグの一覧を名前順に返す"
+  requires none
+  ensures none
+  effects fs
+{
+  return list_refs(&repo, &"refs/tags");
+}
