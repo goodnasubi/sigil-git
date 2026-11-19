@@ -467,6 +467,20 @@ fn test_packed(repo: &Repo) -> Bool
     Ok(_) => false,
     Err(e) => error_kind_name(&e) == "UnsupportedFormat",
   }, &"unknown packed-refs trait") && ok;
+  // マルチバイトの参照名（packed-refs の行と HEAD）
+  let mut mb = Bytes.new();
+  mb.extend(&cat3(&c1, &" refs/heads/日本語\n", &"").as_bytes());
+  mb.extend(&cat3(&c2, &" refs/tags/タグ\n", &"").as_bytes());
+  mb.extend(&cat3(&"^", &c1, &"\n").as_bytes());
+  ok = expect(match parse_packed_refs(&mb) {
+    Ok(p) => p.refs.len() == 2 && serialize_packed_refs(&p) == mb,
+    Err(_) => false,
+  }, &"packed-refs with multibyte ref names") && ok;
+  ok = expect(kind_of(&set_head_symbolic(&repo, &"refs/heads/日本語")) == "ok", &"set HEAD to a multibyte branch") && ok;
+  ok = expect(match read_head(&repo) {
+    Ok(HeadState.Symbolic(r)) => r == "refs/heads/日本語",
+    _ => false,
+  }, &"read HEAD with a multibyte branch") && ok;
   return ok;
 }
 

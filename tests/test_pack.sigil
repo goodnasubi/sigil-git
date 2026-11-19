@@ -458,6 +458,14 @@ fn test_deltas(dir: &String) -> Bool
   if open_kind(&idx_path) != "ok" {
     return fail(&"open valid pack");
   }
+  // ディレクトリ名がマルチバイトでも、.idx から .pack のパスを正しく作る
+  let mb_path = install_or_empty(&join_path(&dir, &"日本語"), &"a", &built);
+  if mb_path == "" {
+    return fail(&"install into a multibyte directory");
+  }
+  if open_kind(&mb_path) != "ok" {
+    return fail(&"open a pack in a multibyte directory");
+  }
   if content_of(&idx_path, &base_id) != base {
     return fail(&"read base");
   }
