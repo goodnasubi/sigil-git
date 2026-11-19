@@ -223,10 +223,10 @@ pub fn merge_lines(base: &Bytes, ours: &Bytes, theirs: &Bytes) -> Result<Option<
               cursor = append_edit(&mut out, &base, cursor, &l);
               i = i + 1;
               j = j + 1;
-            } else if l.end <= r.start {
+            } else if l.end < r.start {
               cursor = append_edit(&mut out, &base, cursor, &l);
               i = i + 1;
-            } else if r.end <= l.start {
+            } else if r.end < l.start {
               cursor = append_edit(&mut out, &base, cursor, &r);
               j = j + 1;
             } else {

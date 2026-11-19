@@ -189,7 +189,36 @@ test "$(tail -n1 "$W/output")" = 1
 grep -qx 'error:MultipleMergeBases' "$W/output"
 test "$(g rev-parse HEAD)" = "$cross_left"
 
-# 隣接行の変更を合成し、同じ位置に挿入した同一行は一度だけ反映する。
+# Git と同じコミットから併合し、衝突時は stage 2 と Sigil が保持した blob を比較する。
+compare_text_merge() {
+  local ours=$1 theirs=$2 expected=$3 git_status=0
+  g checkout -q -B text-merge-check "$ours"
+  g -c merge.renames=false merge --no-ff --no-edit -q "$theirs" || git_status=$?
+  if [[ "$expected" == conflict ]]; then
+    test "$git_status" = 1
+    g cat-file blob :2:merge.txt >"$W/expected-blob"
+    g merge --abort
+  else
+    test "$git_status" = 0
+    g cat-file blob HEAD:merge.txt >"$W/expected-blob"
+    g checkout -q -B text-merge-check "$ours"
+  fi
+
+  run merge "$theirs"
+  if [[ "$expected" == conflict ]]; then
+    printf 'Text\tmerge.txt\n' >"$W/expected"
+    cmp "$W/output" "$W/expected"
+    test "$(g rev-parse HEAD)" = "$ours"
+    test -z "$(g status --porcelain)"
+  else
+    test "$(cat "$W/output")" = "$(g rev-parse HEAD)"
+    test "$(g show -s --format=%P)" = "$ours $theirs"
+  fi
+  g cat-file blob HEAD:merge.txt >"$W/actual-blob"
+  cmp "$W/expected-blob" "$W/actual-blob"
+}
+
+# 隣接行の変更は衝突する。
 g checkout -qb adjacent-left "$base"
 printf 'ONE\ntwo\nthree\nfour\ninserted\nfive\n' >"$R/merge.txt"
 g commit -qam adjacent-left
@@ -198,16 +227,26 @@ g checkout -qb adjacent-right "$base"
 printf 'one\nTWO\nthree\nfour\ninserted\nfive\n' >"$R/merge.txt"
 g commit -qam adjacent-right
 adjacent_right=$(g rev-parse HEAD)
-g branch adjacent-reverse
-g checkout -q adjacent-left
-printf 'ONE\nTWO\nthree\nfour\ninserted\nfive\n' >"$W/expected-blob"
-run merge "$adjacent_right"
-cmp "$W/expected-blob" "$R/merge.txt"
-test "$(g show -s --format=%P)" = "$adjacent_left $adjacent_right"
-g checkout -q adjacent-reverse
-run merge "$adjacent_left"
-cmp "$W/expected-blob" "$R/merge.txt"
-test "$(g show -s --format=%P)" = "$adjacent_right $adjacent_left"
+compare_text_merge "$adjacent_left" "$adjacent_right" conflict
+compare_text_merge "$adjacent_right" "$adjacent_left" conflict
+
+# 同じ位置の挿入と置換は衝突する。
+g checkout -qb insert-only "$base"
+printf 'one\ntwo\nthree\nfour\ninserted\nfive\n' >"$R/merge.txt"
+g commit -qam insert-only
+insert_only=$(g rev-parse HEAD)
+g checkout -qb replace-at-insert "$base"
+printf 'one\ntwo\nthree\nfour\nFIVE\n' >"$R/merge.txt"
+g commit -qam replace-at-insert
+replace_at_insert=$(g rev-parse HEAD)
+compare_text_merge "$insert_only" "$replace_at_insert" conflict
+compare_text_merge "$replace_at_insert" "$insert_only" conflict
+
+# 同じ位置への同じ挿入は一度だけ反映する。
+g checkout -qb matching-insert "$base"
+printf 'one\ntwo\nTHREE\nfour\ninserted\nfive\n' >"$R/merge.txt"
+g commit -qam matching-insert
+compare_text_merge "$adjacent_left" "$(g rev-parse HEAD)" clean
 
 # 同じ位置に挿入した行が異なるときは衝突する。
 g checkout -qb insert-conflict "$base"
