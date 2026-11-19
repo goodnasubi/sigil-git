@@ -1,0 +1,428 @@
+module git.apply
+  targets server
+  trust none
+
+use git.checkout.flatten_commit;
+use git.diff.read_blob;
+use git.error.GitError;
+use git.index.find_entry;
+use git.limits.max_object_size;
+use git.limits.max_work_memory;
+use git.lines.bytes_match;
+use git.odb.open_packs;
+use git.repo.Repo;
+use git.validate.validate_path;
+
+pub struct AppliedFile {
+  mode: Int,
+  content: Bytes,
+}
+
+struct Number {
+  value: Int,
+  end: Int,
+}
+
+struct Range {
+  start: Int,
+  count: Int,
+  end: Int,
+}
+
+fn starts(data: &Bytes, pos: Int, text: &String) -> Bool
+  intent "位置 pos で ASCII の構文を照合する"
+  requires none
+  ensures none
+  effects none
+{
+  let prefix = text.as_bytes();
+  return bytes_match(&data, pos, &prefix, 0, prefix.len());
+}
+
+fn next_line(data: &Bytes, pos: Int) -> Int
+  intent "次の行の開始位置を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut end = pos;
+  while end < data.len() {
+    end = end + 1;
+    if data.get(end - 1).unwrap_or(0) == 10 {
+      return end;
+    }
+  }
+  return end;
+}
+
+fn number(data: &Bytes, pos: Int) -> Result<Number, GitError>
+  intent "作業上限の範囲で十進整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = pos;
+  let mut value = 0;
+  while i < data.len() {
+    let digit = data.get(i).unwrap_or(0) - 48;
+    if digit < 0 || digit > 9 {
+      if i > pos {
+        return Ok(Number { value: value, end: i });
+      }
+      return Err(GitError.Corrupt("patch number is missing"));
+    }
+    if value > (max_object_size() - digit) / 10 {
+      return Err(GitError.LimitExceeded("patch number exceeds limit"));
+    }
+    value = value * 10 + digit;
+    i = i + 1;
+  }
+  return Err(GitError.Corrupt("unterminated patch number"));
+}
+
+fn parse_range(data: &Bytes, pos: Int) -> Result<Range, GitError>
+  intent "統一差分の開始行と行数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let first = number(&data, pos)?;
+  let mut count = 1;
+  let mut end = first.end;
+  if data.get(end).unwrap_or(0) == 44 {
+    let n = number(&data, end + 1)?;
+    count = n.value;
+    end = n.end;
+  }
+  let mut start = first.value;
+  if count > 0 {
+    if start == 0 {
+      return Err(GitError.Corrupt("nonempty patch range starts at line zero"));
+    }
+    start = start - 1;
+  }
+  return Ok(Range { start: start, count: count, end: end });
+}
+
+fn mode_at(data: &Bytes, pos: Int, end: Int) -> Result<Int, GitError>
+  intent "通常ファイルまたは symlink のパッチモードを読む"
+  requires none
+  ensures none
+  effects none
+{
+  let mode = number(&data, pos)?;
+  if mode.end + 1 != end {
+    return Err(GitError.Corrupt("invalid patch mode header"));
+  }
+  if mode.value != 100644 && mode.value != 100755 && mode.value != 120000 {
+    return Err(GitError.UnsupportedEntry("unsupported patch mode"));
+  }
+  return Ok(mode.value);
+}
+
+fn append_range(out: &mut Bytes, data: &Bytes, start: Int, end: Int) -> Result<Bool, GitError>
+  intent "結果の上限を確かめてからバイトを追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if end - start > max_object_size() - out.len() {
+    return Err(GitError.LimitExceeded("patched file exceeds object size limit"));
+  }
+  out.extend(&data.slice(start, end).unwrap_or(Bytes.new()));
+  return Ok(true);
+}
+
+pub fn apply_file_patch(prior: &Bytes, prior_mode: Int, patch: &Bytes) -> Result<AppliedFile, GitError>
+  intent "単一ファイルの統一差分を元の内容とモードに適用する。パスの選択や作業木への書き込みは行わない"
+  requires none
+  ensures none
+  effects none
+{
+  if prior.len() > max_object_size() || patch.len() > max_object_size() {
+    return Err(GitError.LimitExceeded("patch input exceeds size limit"));
+  }
+  let mut out = Bytes.new();
+  let mut mode = prior_mode;
+  let mut pos = 0;
+  let mut cursor = 0;
+  let mut old_line = 0;
+  let mut new_line = 0;
+  let mut section = false;
+  let mut saw_hunk = false;
+  let mut saw_header = false;
+  while pos < patch.len() {
+    let end = next_line(&patch, pos);
+    if patch.get(end - 1).unwrap_or(0) != 10 {
+      return Err(GitError.Corrupt("unterminated patch line"));
+    }
+    if starts(&patch, pos, &"@@ -") {
+      let a = parse_range(&patch, pos + 4)?;
+      if !starts(&patch, a.end, &" +") {
+        return Err(GitError.Corrupt("missing target hunk range"));
+      }
+      let b = parse_range(&patch, a.end + 2)?;
+      if !starts(&patch, b.end, &" @@") || a.start < old_line || b.start < new_line || a.start - old_line != b.start - new_line {
+        return Err(GitError.Corrupt("invalid hunk coordinates"));
+      }
+      saw_hunk = true;
+      let skipped = cursor;
+      while old_line < a.start {
+        if cursor >= prior.len() {
+          return Err(GitError.Conflict("patch starts past end of input"));
+        }
+        cursor = next_line(&prior, cursor);
+        old_line = old_line + 1;
+        new_line = new_line + 1;
+      }
+      append_range(&mut out, &prior, skipped, cursor)?;
+      pos = end;
+      let mut left = a.count;
+      let mut right = b.count;
+      while left > 0 || right > 0 {
+        if pos >= patch.len() {
+          return Err(GitError.Corrupt("truncated hunk"));
+        }
+        let kind = patch.get(pos).unwrap_or(0);
+        let line_end = next_line(&patch, pos);
+        if patch.get(line_end - 1).unwrap_or(0) != 10 || (kind != 32 && kind != 43 && kind != 45) {
+          return Err(GitError.Corrupt("invalid hunk body"));
+        }
+        let mut content_end = line_end;
+        let mut following = line_end;
+        if starts(&patch, following, &"\\ No newline at end of file\n") {
+          content_end = content_end - 1;
+          following = next_line(&patch, following);
+        }
+        if kind != 43 {
+          let length = content_end - pos - 1;
+          if left == 0 || cursor >= prior.len() || next_line(&prior, cursor) - cursor != length || !bytes_match(&prior, cursor, &patch, pos + 1, length) {
+            return Err(GitError.Conflict("patch context does not match input"));
+          }
+          cursor = cursor + length;
+          left = left - 1;
+          old_line = old_line + 1;
+        }
+        if kind != 45 {
+          if right == 0 {
+            return Err(GitError.Corrupt("hunk target range is too short"));
+          }
+          append_range(&mut out, &patch, pos + 1, content_end)?;
+          right = right - 1;
+          new_line = new_line + 1;
+        }
+        pos = following;
+      }
+    } else {
+      if starts(&patch, pos, &"diff --git ") && !section && !saw_hunk && pos == 0 {
+        section = true;
+      } else if saw_hunk {
+        return Err(GitError.Corrupt("unexpected line after hunk"));
+      } else if starts(&patch, pos, &"new file mode ") {
+        if prior_mode != 0 {
+          return Err(GitError.Conflict("patch destination already exists"));
+        }
+        mode = mode_at(&patch, pos + 14, end)?;
+      } else if starts(&patch, pos, &"deleted file mode ") {
+        if prior_mode != mode_at(&patch, pos + 18, end)? {
+          return Err(GitError.Conflict("patch source mode differs"));
+        }
+        mode = 0;
+      } else if starts(&patch, pos, &"old mode ") {
+        if prior_mode != mode_at(&patch, pos + 9, end)? {
+          return Err(GitError.Conflict("patch source mode differs"));
+        }
+      } else if starts(&patch, pos, &"new mode ") {
+        mode = mode_at(&patch, pos + 9, end)?;
+      } else if starts(&patch, pos, &"--- ") && !saw_header {
+        saw_header = true;
+        if starts(&patch, pos, &"--- /dev/null\n") {
+          if prior_mode != 0 {
+            return Err(GitError.Conflict("patch destination already exists"));
+          }
+          if mode == 0 {
+            mode = 100644;
+          }
+        }
+      } else if starts(&patch, pos, &"+++ ") && saw_header {
+        if starts(&patch, pos, &"+++ /dev/null\n") {
+          mode = 0;
+        }
+      } else if starts(&patch, pos, &"Binary files ") || starts(&patch, pos, &"GIT binary patch") {
+        return Err(GitError.UnsupportedFormat("binary patch has no supported text body"));
+      } else if !starts(&patch, pos, &"index ") {
+        return Err(GitError.Corrupt("unsupported patch header"));
+      }
+      pos = end;
+    }
+  }
+  append_range(&mut out, &prior, cursor, prior.len())?;
+  if mode == 0 && out.len() != 0 {
+    return Err(GitError.Conflict("deleted patch file has remaining content"));
+  }
+  return Ok(AppliedFile { mode: mode, content: out });
+}
+
+pub struct PatchedPath {
+  path: String,
+  file: AppliedFile,
+}
+
+fn path_byte(escaped: Int) -> Int
+  intent "Git の引用パスの一文字エスケープを復号する"
+  requires none
+  ensures none
+  effects none
+{
+  return match escaped {
+    34 => 34,
+    92 => 92,
+    97 => 7,
+    98 => 8,
+    116 => 9,
+    110 => 10,
+    118 => 11,
+    102 => 12,
+    114 => 13,
+    _ => -1,
+  };
+}
+
+fn decode_path(data: &Bytes, start: Int, stop: Int, quoted: Bool) -> Result<String, GitError>
+  intent "パッチの引用パスを復号して検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if stop - start > 16384 {
+    return Err(GitError.LimitExceeded("quoted patch path exceeds length limit"));
+  }
+  let mut path_bytes = Bytes.new();
+  let mut i = start;
+  while i < stop {
+    let byte = data.get(i).unwrap_or(0);
+    if quoted && byte == 92 {
+      i = i + 1;
+      let escape = data.get(i).unwrap_or(0);
+      let value = path_byte(escape);
+      if value >= 0 {
+        path_bytes.push(value);
+      } else {
+        let a = escape - 48;
+        let b = data.get(i + 1).unwrap_or(0) - 48;
+        let c = data.get(i + 2).unwrap_or(0) - 48;
+        if i + 2 >= stop || a < 0 || a > 3 || b < 0 || b > 7 || c < 0 || c > 7 {
+          return Err(GitError.Corrupt("invalid quoted patch path"));
+        }
+        path_bytes.push(a * 64 + b * 8 + c);
+        i = i + 2;
+      }
+    } else {
+      path_bytes.push(byte);
+    }
+    i = i + 1;
+  }
+  match path_bytes.to_string_utf8() {
+    Err(_) => {
+      return Err(GitError.InvalidPath("patch path is not UTF-8"));
+    }
+    Ok(path) => {
+      validate_path(&path)?;
+      return Ok(path);
+    }
+  }
+}
+
+fn patch_path(patch: &Bytes, pos: Int, end: Int) -> Result<String, GitError>
+  intent "標準の a/ と b/ を使う、改名なし Git パッチのパスを読む"
+  requires none
+  ensures none
+  effects none
+{
+  let first = pos + 11;
+  let body = end - first - 1;
+  if body < 7 || body % 2 != 1 || patch.get(end - 1).unwrap_or(0) != 10 {
+    return Err(GitError.Corrupt("invalid diff --git header"));
+  }
+  let width = body / 2;
+  let second = first + width + 1;
+  if patch.get(second - 1).unwrap_or(0) != 32 {
+    return Err(GitError.UnsupportedFormat("patch paths must match"));
+  }
+  if starts(&patch, first, &"a/") && starts(&patch, second, &"b/") && bytes_match(&patch, first + 2, &patch, second + 2, width - 2) {
+    return decode_path(&patch, first + 2, second - 1, false);
+  }
+  if width >= 5 && starts(&patch, first, &"\"a/") && starts(&patch, second, &"\"b/") && patch.get(end - 2).unwrap_or(0) == 34 && bytes_match(&patch, first + 3, &patch, second + 3, width - 3) {
+    return decode_path(&patch, first + 3, second - 2, true);
+  }
+  return Err(GitError.UnsupportedFormat("patch paths must match and use a/ and b/ prefixes"));
+}
+
+pub fn apply_patch(repo: &Repo, commit_id: &String, patch: &Bytes) -> Result<List<PatchedPath>, GitError>
+  intent "コミットの木に対して Git の統一差分を適用し、作業木を変更せず変更されたパス・モード・内容を返す。削除のモードは 0"
+  requires none
+  ensures none
+  effects fs
+{
+  if patch.len() > max_object_size() {
+    return Err(GitError.LimitExceeded("patch exceeds size limit"));
+  }
+  let packs = open_packs(&repo)?;
+  let entries = flatten_commit(&repo, &packs, &commit_id)?;
+  let mut out: List<PatchedPath> = List.new();
+  let mut retained = 0;
+  let mut pos = 0;
+  while pos < patch.len() {
+    if !starts(&patch, pos, &"diff --git ") {
+      return Err(GitError.Corrupt("expected diff --git header"));
+    }
+    let line = next_line(&patch, pos);
+    let path = patch_path(&patch, pos, line)?;
+    let mut follows_delete = false;
+    let mut i = 0;
+    while i < out.len() {
+      match out.get(i) {
+        None => {}
+        Some(previous) => {
+          if previous.path == path {
+            if i != out.len() - 1 || previous.file.mode != 0 {
+              return Err(GitError.UnsupportedFormat("multiple patches for one path"));
+            }
+            follows_delete = true;
+          }
+        }
+      }
+      i = i + 1;
+    }
+    let mut end = line;
+    while end < patch.len() && !starts(&patch, end, &"diff --git ") {
+      end = next_line(&patch, end);
+    }
+    let mut mode = 0;
+    let mut prior = Bytes.new();
+    if !follows_delete {
+      match entries.get(find_entry(&entries, &path)) {
+        None => {}
+        Some(item) => {
+          mode = item.mode;
+          prior = read_blob(&repo, &packs, &item.id)?;
+        }
+      }
+    }
+    if end - pos + prior.len() + retained > max_work_memory() / 4 {
+      return Err(GitError.LimitExceeded("patch working memory limit exceeded"));
+    }
+    let section = patch.slice(pos, end).unwrap_or(Bytes.new());
+    let file = apply_file_patch(&prior, mode, &section)?;
+    if follows_delete && file.mode == 0 {
+      return Err(GitError.Corrupt("file type change is missing an addition"));
+    }
+    retained = retained + file.content.len() + path.as_bytes().len() + 128;
+    if retained > max_work_memory() / 4 {
+      return Err(GitError.LimitExceeded("patch output exceeds working memory limit"));
+    }
+    out.push(PatchedPath { path: path, file: file });
+    pos = end;
+  }
+  return Ok(out);
+}

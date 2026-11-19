@@ -1,0 +1,242 @@
+module git.lines
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.limits.max_work_memory;
+
+pub struct Edit {
+  start: Int,
+  end: Int,
+  content: Bytes,
+}
+
+pub fn bytes_match(a: &Bytes, start: Int, b: &Bytes, offset: Int, count: Int) -> Bool
+  intent "指定されたバイト範囲を比較する"
+  requires none
+  ensures none
+  effects none
+{
+  if start < 0 || offset < 0 || count < 0 || count > a.len() - start || count > b.len() - offset {
+    return false;
+  }
+  let mut i = 0;
+  while i < count {
+    if a.get(start + i).unwrap_or(0) != b.get(offset + i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn offsets(data: &Bytes) -> Result<List<Int>, GitError>
+  intent "行の開始位置と末尾の位置を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  out.push(0);
+  let mut i = 0;
+  while i < data.len() {
+    if data.get(i).unwrap_or(0) == 10 || i + 1 == data.len() {
+      if out.len() >= max_work_memory() / 1024 {
+        return Err(GitError.LimitExceeded("line offsets exceed working memory limit"));
+      }
+      out.push(i + 1);
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+pub fn int_at(values: &List<Int>, index: Int) -> Int
+  intent "整数の一覧から位置を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match values.get(index) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+fn same_line(a: &Bytes, ax: &List<Int>, i: Int, b: &Bytes, bx: &List<Int>, j: Int) -> Bool
+  intent "改行を含めて二つの行を比較する"
+  requires none
+  ensures none
+  effects none
+{
+  let x = int_at(&ax, i);
+  let y = int_at(&bx, j);
+  let n = int_at(&ax, i + 1) - x;
+  return n == int_at(&bx, j + 1) - y && bytes_match(&a, x, &b, y, n);
+}
+
+fn put_cell(matrix: &mut Bytes, index: Int, value: Int)
+  intent "最長共通部分列の長さを行列へ記録する"
+  requires none
+  ensures none
+  effects none
+{
+  let pos = index * 4;
+  let _ = matrix.set(pos, value / 16777216);
+  let _ = matrix.set(pos + 1, value / 65536 % 256);
+  let _ = matrix.set(pos + 2, value / 256 % 256);
+  let _ = matrix.set(pos + 3, value % 256);
+}
+
+fn cell(matrix: &Bytes, index: Int) -> Int
+  intent "最長共通部分列の長さを行列から取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return matrix.read_u32_be(index * 4).unwrap_or(0);
+}
+
+fn edits(a: &Bytes, b: &Bytes) -> Result<List<Edit>, GitError>
+  intent "最長共通部分列を使って、元の行単位の置換範囲を求める"
+  requires none
+  ensures none
+  effects none
+{
+  let ax = offsets(&a)?;
+  let bx = offsets(&b)?;
+  let rows = ax.len();
+  let cols = bx.len();
+  let mut prefix = 0;
+  while prefix + 1 < rows && prefix + 1 < cols && same_line(&a, &ax, prefix, &b, &bx, prefix) {
+    prefix = prefix + 1;
+  }
+  let mut tail_a = rows - 1;
+  let mut tail_b = cols - 1;
+  while tail_a > prefix && tail_b > prefix && same_line(&a, &ax, tail_a - 1, &b, &bx, tail_b - 1) {
+    tail_a = tail_a - 1;
+    tail_b = tail_b - 1;
+  }
+  let width = tail_b - prefix + 1;
+  let height = tail_a - prefix + 1;
+  if height > max_work_memory() / 16 / width {
+    return Err(GitError.LimitExceeded("line comparison exceeds working memory limit"));
+  }
+  let mut matrix = Bytes.new();
+  let mut size = height * width * 4;
+  while size > 0 {
+    matrix.push(0);
+    size = size - 1;
+  }
+  let mut i = height - 2;
+  while i >= 0 {
+    let mut j = width - 2;
+    while j >= 0 {
+      let k = i * width + j;
+      let mut best = cell(&matrix, k + width);
+      let right = cell(&matrix, k + 1);
+      if right > best {
+        best = right;
+      }
+      if same_line(&a, &ax, i + prefix, &b, &bx, j + prefix) {
+        best = cell(&matrix, k + width + 1) + 1;
+      }
+      put_cell(&mut matrix, k, best);
+      j = j - 1;
+    }
+    i = i - 1;
+  }
+  let mut out = List.new();
+  let mut x = prefix;
+  let mut y = prefix;
+  while x < tail_a || y < tail_b {
+    let start = x;
+    let from = y;
+    while (x < tail_a || y < tail_b) && !(x < tail_a && y < tail_b && same_line(&a, &ax, x, &b, &bx, y)) {
+      let k = (x - prefix) * width + y - prefix;
+      if x == tail_a || (y < tail_b && cell(&matrix, k + 1) > cell(&matrix, k + width)) {
+        y = y + 1;
+      } else {
+        x = x + 1;
+      }
+    }
+    if start != x || from != y {
+      out.push(Edit { start: int_at(&ax, start), end: int_at(&ax, x), content: b.slice(int_at(&bx, from), int_at(&bx, y)).unwrap_or(Bytes.new()) });
+    }
+    if x < tail_a && y < tail_b {
+      x = x + 1;
+      y = y + 1;
+    }
+  }
+  return Ok(out);
+}
+
+fn append_edit(out: &mut Bytes, base: &Bytes, cursor: Int, change: &Edit) -> Int
+  intent "元の未変更部分と置換内容を出力へ足す"
+  requires none
+  ensures none
+  effects none
+{
+  out.extend(&base.slice(cursor, change.start).unwrap_or(Bytes.new()));
+  out.extend(&change.content);
+  return change.end;
+}
+
+pub fn merge_lines(base: &Bytes, ours: &Bytes, theirs: &Bytes) -> Result<Option<Bytes>, GitError>
+  intent "重ならない行の変更を合成する。衝突なら None"
+  requires none
+  ensures none
+  effects none
+{
+  if base.len() + ours.len() + theirs.len() > max_work_memory() / 4 {
+    return Err(GitError.LimitExceeded("merge input exceeds working memory limit"));
+  }
+  let left = edits(&base, &ours)?;
+  let right = edits(&base, &theirs)?;
+  let mut i = 0;
+  let mut j = 0;
+  let mut cursor = 0;
+  let mut out = Bytes.new();
+  while i < left.len() || j < right.len() {
+    match left.get(i) {
+      None => {
+        match right.get(j) {
+          None => {}
+          Some(r) => {
+            cursor = append_edit(&mut out, &base, cursor, &r);
+          }
+        }
+        j = j + 1;
+      }
+      Some(l) => {
+        match right.get(j) {
+          None => {
+            cursor = append_edit(&mut out, &base, cursor, &l);
+            i = i + 1;
+          }
+          Some(r) => {
+            // 同じ位置への挿入も含め、同じ範囲への変更は内容が一致するときだけ一度適用する。
+            if l.start == r.start && l.end == r.end {
+              if l.content.len() != r.content.len() || !bytes_match(&l.content, 0, &r.content, 0, l.content.len()) {
+                return Ok(None);
+              }
+              cursor = append_edit(&mut out, &base, cursor, &l);
+              i = i + 1;
+              j = j + 1;
+            } else if l.end < r.start {
+              cursor = append_edit(&mut out, &base, cursor, &l);
+              i = i + 1;
+            } else if r.end < l.start {
+              cursor = append_edit(&mut out, &base, cursor, &r);
+              j = j + 1;
+            } else {
+              return Ok(None);
+            }
+          }
+        }
+      }
+    }
+  }
+  out.extend(&base.slice(cursor, base.len()).unwrap_or(Bytes.new()));
+  return Ok(Some(out));
+}

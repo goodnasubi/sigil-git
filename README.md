@@ -78,6 +78,24 @@ SHA-256 のリポジトリで、`add` → `commit` → `checkout` の一連が�
 - `add` に symlink を明示すると `UnsupportedEntry`、ディレクトリを再帰するときの symlink・特殊ファイルは読み飛ばします。
 - 実 Git との確認は `interop_ops.sh`（fsck・log・ls-tree・diff・cat-file、実 Git の clone/checkout、衝突、悪意のある tree）。
 
+## 第5段「log・diff・merge・スナップショット」（ADR 0047 単位5）
+
+- `git.walk.log` はコミット ID から到達可能な履歴を位相順で返します。
+- `git.diff.diff_trees`／`diff_commits`／`diff_worktree` は変更パス、Git と同じ状態コード（A・D・M・T）、変更前後のモード、統一差分を返します。バイナリ差分には本文がありません。作業木差分は索引で追跡しているパスを対象にします。
+- `git.apply.apply_patch` はコミットに対する Git の統一差分を読み、変更パスと結果の内容・モードを適用順に返します。削除はモード 0 です。種別変更は削除と追加になります。`apply_file_patch` はファイル単位の適用で、パスは呼び出し元が指定します。
+- `git.merge.merge` は指定コミットを現在のブランチに三方向併合します。併合が成立したら二親コミットを書き、作業木・索引・参照を更新します。すでに取り込み済みなら `AlreadyUpToDate`、交差する最良共通祖先があれば `MultipleMergeBases` を返します。内容の衝突ではパスと種類を返し、作業木・索引・参照・オブジェクトを変更しません。
+- `git.snapshot.snapshot` はコミットの木のパス・モード・blob ID を `git ls-tree -r` 順に返します。`read_snapshot_blob` は選んだ blob を読みます。どちらも作業木への書き込みはありません。
+
+| 条件 | 動作 |
+|---|---|
+| 改名と編集が競合する | 改名前のパスを削除／変更の衝突として返す。Git が改名検出で併合できる場合がある |
+| バイナリ差分 | 差異を報告し、本文の生成・適用は対象外 |
+| 作業木上の symlink | `UnsupportedEntry`。リンク文字列を読む標準ライブラリ API は goodnasubi/sigil#632 |
+| コミット木上の symlink | 種別変更と読み取りは対応。併合による作業木への展開は第4段の checkout の規則を適用 |
+| 履歴・木の走査、パッチ、行単位併合が作業メモリを超える | `LimitExceeded`。行単位併合は最長共通部分列の表を使用し、表を確保する前に大きさを検査 |
+
+第5段で使用した Sigil コンパイラの固定 SHA は `33467e3b43238fdc69331c58a788c95f1de393e5` です。相互運用の比較版は Git **2.43.0** です。`interop_history.sh` は履歴・木・blob・差分の比較、テキストパッチの双方向適用、併合の木、衝突時の無変更、および上限エラーを検査します。
+
 ## テストの実行
 
 前提として、Sigil コンパイラ（固定版コミット `33467e3b43238fdc69331c58a788c95f1de393e5`）が利用可能である必要があります。
@@ -95,4 +113,5 @@ sigil run --root . test_runner.sigil main
 ```bash
 SIGIL=/path/to/sigil ./interop.sh        # 第2段: init・書き込み・参照
 SIGIL=/path/to/sigil ./interop_pack.sh   # 第3段: gc 済みの pack の読み取り（オブジェクト・log --topo-order・ls-tree -r・diff）
+SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_history.sh  # 第5段
 ```

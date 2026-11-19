@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=== 1. Checking format (sigil fmt --check) ==="
-$SIGIL fmt --check git/*.sigil tests/*.sigil test_runner.sigil interop_make.sigil interop_delete.sigil interop_read.sigil interop_ops.sigil
+$SIGIL fmt --check git/*.sigil tests/*.sigil test_runner.sigil interop_make.sigil interop_delete.sigil interop_read.sigil interop_ops.sigil interop_history.sigil
 
 echo "=== 2. Type checking (sigil check) ==="
 $SIGIL check --root . test_runner.sigil
@@ -27,6 +27,7 @@ $SIGIL check --root . interop_make.sigil
 $SIGIL check --root . interop_delete.sigil
 $SIGIL check --root . interop_read.sigil
 $SIGIL check --root . interop_ops.sigil
+$SIGIL check --root . interop_history.sigil
 for f in git/*.sigil tests/*.sigil; do
   $SIGIL check --root . "$f"
 done
@@ -59,5 +60,6 @@ echo "=== 5. Interop with real Git (SHA-256) ==="
 SIGIL="$SIGIL" ./interop.sh
 SIGIL="$SIGIL" ./interop_pack.sh
 SIGIL="$SIGIL" ./interop_ops.sh
+SIGIL="$SIGIL" ./interop_history.sh
 
 echo "=== All tests passed successfully! ==="

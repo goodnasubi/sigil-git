@@ -1,0 +1,181 @@
+module interop_history
+  targets server
+  trust none
+
+use git.apply.apply_patch;
+use git.diff.FileDiff;
+use git.diff.diff_commits;
+use git.diff.diff_worktree;
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat2;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.read_file_opt;
+use git.hash.int_to_str;
+use git.merge.ConflictKind;
+use git.merge.MergeResult;
+use git.merge.merge;
+use git.ops.new_ident;
+use git.repo.Repo;
+use git.repo.open_repo;
+use git.snapshot.read_snapshot_blob;
+use git.snapshot.snapshot;
+use git.walk.log;
+
+fn argument(args: &List<String>, i: Int) -> String
+  intent "テストの引数を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return match args.get(i) {
+    Some(value) => value.clone(),
+    None => "",
+  };
+}
+
+fn read_input(path: &String) -> Result<Bytes, GitError>
+  intent "相互運用テストの入力を読む"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_file_opt(&path, 67108864, false)? {
+    Some(bytes) => Ok(bytes),
+    None => Err(GitError.NotFound("missing test input")),
+  };
+}
+
+fn emit_diff(changes: &List<FileDiff>) -> Result<Bool, GitError>
+  intent "差分の状態を表示し、全パッチをテスト用ファイルへ書く"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut patch = Bytes.new();
+  let mut i = 0;
+  while i < changes.len() {
+    match changes.get(i) {
+      None => {}
+      Some(change) => {
+        console.log(&cat3(&change.status, &"\t", &change.path));
+        patch.extend(&change.patch);
+      }
+    }
+    i = i + 1;
+  }
+  return create_synced_file(&"tmp/interop_history/patch.out", &patch);
+}
+
+fn run(repo: &Repo, args: &List<String>) -> Result<Bool, GitError>
+  intent "第5段の API を本物の Git と比較するテストを実行する"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let a = argument(&args, 1);
+  let b = argument(&args, 2);
+  if argument(&args, 0) == "log" {
+    let ids = log(&repo, &a)?;
+    let mut i = 0;
+    while i < ids.len() {
+      console.log(&argument(&ids, i));
+      i = i + 1;
+    }
+  } else if argument(&args, 0) == "snapshot" {
+    let view = snapshot(&repo, &a)?;
+    let mut i = 0;
+    while i < view.entries.len() {
+      match view.entries.get(i) {
+        None => {}
+        Some(entry) => {
+          let blob = read_snapshot_blob(&repo, &view, i)?;
+          console.log(&cat3(&int_to_str(entry.mode), &" blob ", &cat3(&entry.id, &"\t", &entry.path)));
+          create_synced_file(&cat2(&"tmp/interop_history/blob.", &int_to_str(i)), &blob)?;
+        }
+      }
+      i = i + 1;
+    }
+  } else if argument(&args, 0) == "diff" {
+    emit_diff(&diff_commits(&repo, &a, &b)?)?;
+  } else if argument(&args, 0) == "worktree" {
+    emit_diff(&diff_worktree(&repo, &a)?)?;
+  } else if argument(&args, 0) == "merge" {
+    let ident = new_ident("T", "t@example.com", 1700000000, "+0000");
+    match merge(&repo, &a, &ident, &ident, &"merge\n".as_bytes())? {
+      MergeResult.AlreadyUpToDate(id) => {
+        console.log(&id);
+      }
+      MergeResult.Committed(id) => {
+        console.log(&id);
+      }
+      MergeResult.Conflicts(conflicts) => {
+        let mut i = 0;
+        while i < conflicts.len() {
+          match conflicts.get(i) {
+            None => {}
+            Some(c) => {
+              let kind = match c.kind {
+                ConflictKind.Text => "Text",
+                ConflictKind.Binary => "Binary",
+                ConflictKind.Mode => "Mode",
+                ConflictKind.AddAdd => "AddAdd",
+                ConflictKind.DeleteModify => "DeleteModify",
+                ConflictKind.FileDirectory => "FileDirectory",
+              };
+              console.log(&cat3(&kind, &"\t", &c.path));
+            }
+          }
+          i = i + 1;
+        }
+      }
+    }
+  } else if argument(&args, 0) == "apply" {
+    let patch = read_input(&"tmp/interop_history/patch.in")?;
+    let files = apply_patch(&repo, &a, &patch)?;
+    let mut i = 0;
+    while i < files.len() {
+      match files.get(i) {
+        None => {}
+        Some(item) => {
+          console.log(&cat3(&int_to_str(item.file.mode), &"\t", &item.path));
+          create_synced_file(&cat2(&"tmp/interop_history/applied.", &int_to_str(i)), &item.file.content)?;
+        }
+      }
+      i = i + 1;
+    }
+  } else {
+    return Err(GitError.Corrupt("unknown test command"));
+  }
+  return Ok(true);
+}
+
+fn run_test() -> Result<Bool, GitError>
+  intent "テスト入力とリポジトリを開いてコマンドを実行する"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let input = read_input(&"tmp/interop_history/command")?;
+  let args = input.to_string_utf8().unwrap_or("").lines();
+  let repo = open_repo(&"tmp/interop_history/repo")?;
+  return run(&repo, &args);
+}
+
+pub fn main() -> Int
+  intent "相互運用テストの成功または構造化エラーを表示する"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  match run_test() {
+    Ok(_) => {
+      return 0;
+    }
+    Err(e) => {
+      console.log(&cat2(&"error:", &error_kind_name(&e)));
+      return 1;
+    }
+  }
+}

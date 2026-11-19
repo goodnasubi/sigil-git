@@ -130,6 +130,15 @@ pub fn max_packed_refs_size() -> Int
   return 67108864;
 }
 
+pub fn max_history_ids() -> Int
+  intent "履歴走査で保持する識別子の数の上限を返す"
+  requires none
+  ensures result == 16777216
+  effects none
+{
+  return 16777216;
+}
+
 pub fn max_work_memory() -> Int
   intent "核の作業メモリの上限 (256 MiB = 268435456 byte) を返す"
   requires none

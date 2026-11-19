@@ -89,7 +89,7 @@ fn has_forbidden(s: &String) -> Bool
   return false;
 }
 
-fn format_ident(who: &Ident) -> Result<Bytes, GitError>
+pub fn format_ident(who: &Ident) -> Result<Bytes, GitError>
   intent "署名を `名前 <メール> 秒 タイムゾーン` の形にする。名前・メールに < > 改行 CR NUL があれば、時刻が負、タイムゾーンが符号付き 4 桁でなければ Corrupt"
   requires none
   ensures none
@@ -516,7 +516,7 @@ fn sort_tree_range(src: &List<TreeEntry>, lo: Int, hi: Int) -> List<TreeEntry>
   return merge_tree_entries(&left, &right);
 }
 
-fn build_tree(repo: &Repo, entries: &List<IndexEntry>, lo: Int, hi: Int, plen: Int) -> Result<String, GitError>
+pub fn build_tree(repo: &Repo, entries: &List<IndexEntry>, lo: Int, hi: Int, plen: Int) -> Result<String, GitError>
   intent "整列済みの索引の [lo, hi)（先頭の plen byte が共通のディレクトリ）から tree オブジェクトを書き、識別子を返す。サブディレクトリは先に再帰して書く"
   requires none
   ensures none
