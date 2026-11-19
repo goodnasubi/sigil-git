@@ -1,0 +1,391 @@
+module git.walk
+  targets server
+  trust none
+
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.error.GitError;
+use git.fsio.cat3;
+use git.hash.bytes_to_hex;
+use git.object.ObjectType;
+use git.odb.odb_read_in;
+use git.pack.PackStore;
+use git.repo.Repo;
+use git.tree.decode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.tree.entry_name;
+
+// ADR 0047 決定 6-1 の「履歴・ls-tree -r・diff --name-status」を本物の Git と比べるための、読み取り専用の走査。
+// 履歴は git log --topo-order と同じ並び（子より先に親を出さない。LIFO）、tree の展開は git ls-tree -r と同じ並び、
+// tree エントリの mode は 8 進の見かけの数字を 10 進の整数にしたもの（100644 など。第 1 段の TreeEntry の表現）。
+// 差分は git diff-tree -r --name-status --no-renames と同じ形（A/D/M/T）。名前変更の検出はしない。
+
+pub struct FlatEntry {
+  path: String,
+  mode: Int,
+  id: String,
+}
+
+fn walk_limit() -> Int
+  intent "走査する commit・tree エントリ数の上限 (20000) を返す"
+  requires none
+  ensures result == 20000
+  effects none
+{
+  return 20000;
+}
+
+fn at(l: &List<Int>, i: Int) -> Int
+  intent "整数のリストの i 番目を返す（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+fn index_of(ids: &List<String>, id: &String) -> Int
+  intent "ids の中の id の番号を返す。無ければ -1"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < ids.len() {
+    match ids.get(i) {
+      None => {}
+      Some(x) => {
+        if x == id {
+          return i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn zeros(n: Int) -> Bytes
+  intent "n byte の 0 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < n {
+    b.push(0);
+    i = i + 1;
+  }
+  return b;
+}
+
+fn put32(b: &mut Bytes, slot: Int, v: Int)
+  intent "b の slot 番目の 4 byte に v を書く"
+  requires none
+  ensures none
+  effects none
+{
+  let _ = b.set(slot * 4, v / 16777216 % 256);
+  let _ = b.set(slot * 4 + 1, v / 65536 % 256);
+  let _ = b.set(slot * 4 + 2, v / 256 % 256);
+  let _ = b.set(slot * 4 + 3, v % 256);
+}
+
+fn get32(b: &Bytes, slot: Int) -> Int
+  intent "b の slot 番目の 4 byte を読む"
+  requires none
+  ensures none
+  effects none
+{
+  return b.read_u32_be(slot * 4).unwrap_or(0);
+}
+
+pub fn topo_order(repo: &Repo, packs: &List<PackStore>, tip: &String) -> Result<List<String>, GitError>
+  intent "tip から辿れる commit を git log --topo-order と同じ並びで返す（子より先に親を出さない。LIFO で、親は書かれた順に積む）。commit が 20000 を超えたら LimitExceeded"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut ids = List.new();
+  let mut parent_ids = List.new();
+  ids.push(tip.clone());
+  let mut i = 0;
+  while i < ids.len() {
+    if ids.len() > walk_limit() {
+      return Err(GitError.LimitExceeded("too many commits to walk"));
+    }
+    let cid = match ids.get(i) {
+      Some(x) => x.clone(),
+      None => "",
+    };
+    let o = odb_read_in(&repo, &packs, &cid)?;
+    match o.obj_type {
+      ObjectType.Commit => {}
+      _ => {
+        return Err(GitError.TypeMismatch("expected a commit"));
+      }
+    }
+    let c = decode_commit(&o.content)?;
+    let ps = commit_parents(&c);
+    parent_ids.push(ps.clone());
+    let mut k = 0;
+    while k < ps.len() {
+      match ps.get(k) {
+        None => {}
+        Some(p) => {
+          if index_of(&ids, &p) < 0 {
+            ids.push(p.clone());
+          }
+        }
+      }
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  let n = ids.len();
+  let mut indeg = zeros(n * 4);
+  let mut a = 0;
+  while a < n {
+    match parent_ids.get(a) {
+      None => {}
+      Some(ps) => {
+        let mut k = 0;
+        while k < ps.len() {
+          let pi = match ps.get(k) {
+            Some(p) => index_of(&ids, &p),
+            None => -1,
+          };
+          if pi >= 0 {
+            let cur_in = get32(&indeg, pi);
+            put32(&mut indeg, pi, cur_in + 1);
+          }
+          k = k + 1;
+        }
+      }
+    }
+    a = a + 1;
+  }
+  let mut stack = zeros(n * 4 + 4);
+  let mut sp = 0;
+  put32(&mut stack, 0, 0);
+  sp = 1;
+  let mut out = List.new();
+  while sp > 0 {
+    sp = sp - 1;
+    let c = get32(&stack, sp);
+    out.push(match ids.get(c) {
+      Some(x) => x.clone(),
+      None => "",
+    });
+    match parent_ids.get(c) {
+      None => {}
+      Some(ps) => {
+        let mut k = 0;
+        while k < ps.len() {
+          let pi = match ps.get(k) {
+            Some(p) => index_of(&ids, &p),
+            None => -1,
+          };
+          if pi >= 0 {
+            let left = get32(&indeg, pi) - 1;
+            put32(&mut indeg, pi, left);
+            if left == 0 {
+              put32(&mut stack, sp, pi);
+              sp = sp + 1;
+            }
+          }
+          k = k + 1;
+        }
+      }
+    }
+  }
+  return Ok(out);
+}
+
+fn join_rel(prefix: &String, name: &String) -> String
+  intent "prefix と name を / でつなぐ（prefix が空なら name）"
+  requires none
+  ensures none
+  effects none
+{
+  if prefix == "" {
+    return name.clone();
+  }
+  return cat3(&prefix, &"/", &name);
+}
+
+fn flatten_into(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: &String, out: &mut List<FlatEntry>, depth: Int) -> Result<Bool, GitError>
+  intent "tree を再帰的に展開し、ディレクトリ以外のエントリを tree の並びで out に積む"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 64 {
+    return Err(GitError.LimitExceeded("tree is nested too deeply"));
+  }
+  let o = odb_read_in(&repo, &packs, &tree_id)?;
+  match o.obj_type {
+    ObjectType.Tree => {}
+    _ => {
+      return Err(GitError.TypeMismatch("expected a tree"));
+    }
+  }
+  let entries = decode_tree(&o.content)?;
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      None => {}
+      Some(e) => {
+        let name = entry_name(&e).to_string_utf8().unwrap_or("");
+        let path = join_rel(&prefix, &name);
+        let mode = entry_mode(&e);
+        let id = bytes_to_hex(&entry_id(&e));
+        if mode == 40000 {
+          flatten_into(&repo, &packs, &id, &path, &mut out, depth + 1)?;
+        } else {
+          if out.len() > walk_limit() {
+            return Err(GitError.LimitExceeded("too many tree entries to list"));
+          }
+          out.push(FlatEntry { path: path, mode: mode, id: id });
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+pub fn flatten_tree(repo: &Repo, packs: &List<PackStore>, tree_id: &String) -> Result<List<FlatEntry>, GitError>
+  intent "tree を git ls-tree -r と同じ並びで展開する（ディレクトリは展開し、blob・symlink・gitlink を返す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut out = List.new();
+  flatten_into(&repo, &packs, &tree_id, &"", &mut out, 0)?;
+  return Ok(out);
+}
+
+pub fn commit_tree(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<String, GitError>
+  intent "commit の tree の識別子を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let o = odb_read_in(&repo, &packs, &commit_id)?;
+  match o.obj_type {
+    ObjectType.Commit => {}
+    _ => {
+      return Err(GitError.TypeMismatch("expected a commit"));
+    }
+  }
+  let c = decode_commit(&o.content)?;
+  return Ok(commit_tree_id(&c));
+}
+
+pub fn commit_first_parent(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<Option<String>, GitError>
+  intent "commit の最初の親を返す。無ければ None"
+  requires none
+  ensures none
+  effects fs
+{
+  let o = odb_read_in(&repo, &packs, &commit_id)?;
+  match o.obj_type {
+    ObjectType.Commit => {}
+    _ => {
+      return Err(GitError.TypeMismatch("expected a commit"));
+    }
+  }
+  let c = decode_commit(&o.content)?;
+  let ps = commit_parents(&c);
+  return match ps.get(0) {
+    Some(p) => Ok(Some(p.clone())),
+    None => Ok(None),
+  };
+}
+
+fn path_less(a: &String, b: &String) -> Bool
+  intent "パスをバイト列として辞書順に比較し a < b かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let ab = a.as_bytes();
+  let bb = b.as_bytes();
+  let mut i = 0;
+  while i < ab.len() && i < bb.len() {
+    let x = ab.get(i).unwrap_or(0);
+    let y = bb.get(i).unwrap_or(0);
+    if x != y {
+      return x < y;
+    }
+    i = i + 1;
+  }
+  return ab.len() < bb.len();
+}
+
+fn flat_at(l: &List<FlatEntry>, i: Int) -> FlatEntry
+  intent "リストの i 番目の FlatEntry の複製を返す（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(e) => FlatEntry { path: e.path.clone(), mode: e.mode, id: e.id.clone() },
+    None => FlatEntry { path: "", mode: 0, id: "" },
+  };
+}
+
+fn status_line(code: &String, path: &String) -> String
+  intent "git diff --name-status の 1 行（コードと TAB とパス）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return cat3(&code, &"\t", &path);
+}
+
+pub fn diff_name_status(a: &List<FlatEntry>, b: &List<FlatEntry>) -> List<String>
+  intent "展開した 2 つの tree の差を git diff-tree -r --name-status --no-renames と同じ形で返す（A 追加・D 削除・M 変更・T 種別変更）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  let mut j = 0;
+  while i < a.len() || j < b.len() {
+    if i >= a.len() {
+      out.push(status_line(&"A", &flat_at(&b, j).path));
+      j = j + 1;
+    } else if j >= b.len() {
+      out.push(status_line(&"D", &flat_at(&a, i).path));
+      i = i + 1;
+    } else {
+      let x = flat_at(&a, i);
+      let y = flat_at(&b, j);
+      if x.path == y.path {
+        if x.mode / 10000 != y.mode / 10000 {
+          out.push(status_line(&"T", &x.path));
+        } else if x.mode != y.mode || x.id != y.id {
+          out.push(status_line(&"M", &x.path));
+        }
+        i = i + 1;
+        j = j + 1;
+      } else if path_less(&x.path, &y.path) {
+        out.push(status_line(&"D", &x.path));
+        i = i + 1;
+      } else {
+        out.push(status_line(&"A", &y.path));
+        j = j + 1;
+      }
+    }
+  }
+  return out;
+}

@@ -1,0 +1,192 @@
+module interop_read
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.error.error_message;
+use git.fsio.cat3;
+use git.fsio.read_file_opt;
+use git.hash.bytes_to_hex;
+use git.hash.compute_sha256;
+use git.hash.int_to_str;
+use git.object.object_type_name;
+use git.odb.odb_read_in;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.refs.HeadState;
+use git.refs.read_head;
+use git.refs.read_ref;
+use git.repo.Repo;
+use git.repo.open_repo;
+use git.walk.commit_first_parent;
+use git.walk.commit_tree;
+use git.walk.diff_name_status;
+use git.walk.flatten_tree;
+use git.walk.topo_order;
+
+fn octal6(mode: Int) -> String
+  intent "mode（8 進の見かけの数字を 10 進の整数にしたもの）を 6 桁以上の文字列にする（git ls-tree と同じ書き方）"
+  requires mode >= 0
+  ensures none
+  effects none
+{
+  let plain = int_to_str(mode);
+  let mut out = Bytes.new();
+  let mut pad = 6 - plain.len();
+  while pad > 0 {
+    out.push(48);
+    pad = pad - 1;
+  }
+  out.extend(&plain.as_bytes());
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn mode_type(mode: Int) -> String
+  intent "mode から ls-tree の型の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if mode == 160000 {
+    return "commit";
+  }
+  return "blob";
+}
+
+fn print_objects(repo: &Repo, packs: &List<PackStore>, ids_path: &String) -> Result<Bool, GitError>
+  intent "ids_path の各行の識別子を odb_read_in で読み、型・長さ・内容の SHA-256 を出力する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut data = Bytes.new();
+  match read_file_opt(&ids_path, 10000000, false)? {
+    Some(d) => {
+      data = d;
+    }
+    None => {
+      return Err(GitError.NotFound("ids file is missing"));
+    }
+  }
+  let mut at = 0;
+  while at + 64 <= data.len() {
+    let id = data.slice(at, at + 64).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+    let o = odb_read_in(&repo, &packs, &id)?;
+    let size = int_to_str(o.content.len());
+    let sum = bytes_to_hex(&compute_sha256(&o.content));
+    console.log(&cat3(&cat3(&"OBJ ", &id, &" "), &cat3(&object_type_name(&o.obj_type), &" ", &size), &cat3(&" ", &sum, &"")));
+    at = at + 65;
+  }
+  return Ok(true);
+}
+
+fn head_commit(repo: &Repo) -> Result<String, GitError>
+  intent "HEAD が指す commit の識別子を返す"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_head(&repo)? {
+    HeadState.Detached(id) => Ok(id),
+    HeadState.Symbolic(name) => match read_ref(&repo, &name)? {
+      Some(id) => Ok(id),
+      None => Err(GitError.NotFound("HEAD points to an unborn branch")),
+    },
+  };
+}
+
+fn print_history(repo: &Repo, packs: &List<PackStore>) -> Result<Bool, GitError>
+  intent "HEAD から topo 順の履歴、HEAD の ls-tree -r、各 commit の（最初の親との）name-status を出力する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let head = head_commit(&repo)?;
+  let order = topo_order(&repo, &packs, &head)?;
+  let mut i = 0;
+  while i < order.len() {
+    match order.get(i) {
+      None => {}
+      Some(c) => {
+        console.log(&cat3(&"LOG ", &c, &""));
+      }
+    }
+    i = i + 1;
+  }
+  let head_tree = commit_tree(&repo, &packs, &head)?;
+  let flat = flatten_tree(&repo, &packs, &head_tree)?;
+  let mut t = 0;
+  while t < flat.len() {
+    match flat.get(t) {
+      None => {}
+      Some(e) => {
+        console.log(&cat3(&cat3(&"TREE ", &octal6(e.mode), &" "), &cat3(&mode_type(e.mode), &" ", &e.id), &cat3(&"\t", &e.path, &"")));
+      }
+    }
+    t = t + 1;
+  }
+  let mut k = 0;
+  while k < order.len() {
+    match order.get(k) {
+      None => {}
+      Some(c) => {
+        console.log(&cat3(&"DIFF ", &c, &""));
+        let new_tree = commit_tree(&repo, &packs, &c)?;
+        let new_flat = flatten_tree(&repo, &packs, &new_tree)?;
+        let mut old_flat = List.new();
+        match commit_first_parent(&repo, &packs, &c)? {
+          None => {}
+          Some(p) => {
+            let old_tree = commit_tree(&repo, &packs, &p)?;
+            old_flat = flatten_tree(&repo, &packs, &old_tree)?;
+          }
+        }
+        let d = diff_name_status(&old_flat, &new_flat);
+        let mut j = 0;
+        while j < d.len() {
+          match d.get(j) {
+            None => {}
+            Some(line) => {
+              console.log(&line);
+            }
+          }
+          j = j + 1;
+        }
+      }
+    }
+    k = k + 1;
+  }
+  return Ok(true);
+}
+
+fn run() -> Result<Bool, GitError>
+  intent "tmp/pk/repo（実 Git が作って gc したリポジトリ）を読み、オブジェクト・履歴・ls-tree・diff を出力する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let repo = open_repo(&"tmp/pk/repo")?;
+  let packs = open_packs(&repo)?;
+  console.log(&cat3(&"PACKS ", &int_to_str(packs.len()), &""));
+  print_objects(&repo, &packs, &"tmp/pk/ids.txt")?;
+  print_history(&repo, &packs)?;
+  return Ok(true);
+}
+
+pub fn main() -> Int
+  intent "実 Git が作ったリポジトリを pack を含めて読み、比較用の出力を標準出力に書く。成功なら 0、失敗ならエラーを出力して 1"
+  requires none
+  ensures none
+  effects console, fs
+{
+  match run() {
+    Ok(_) => {
+      return 0;
+    }
+    Err(e) => {
+      console.log(&cat3(&cat3(&"error: ", &error_kind_name(&e), &": "), &error_message(&e), &""));
+      return 1;
+    }
+  }
+}

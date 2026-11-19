@@ -3,34 +3,41 @@ module git.odb
   trust none
 
 use git.error.GitError;
+use git.error.is_not_found;
 use git.fsio.cat3;
 use git.fsio.create_synced_file;
 use git.fsio.file_exists;
 use git.fsio.join_path;
+use git.fsio.list_names;
 use git.fsio.make_dir;
 use git.fsio.random_hex;
 use git.fsio.read_file_opt;
 use git.fsio.rename_file;
+use git.fsio.string_ends_with;
 use git.fsio.string_slice;
 use git.fsio.sync_dir;
 use git.hash.bytes_to_hex;
 use git.hash.compute_raw_object_id;
 use git.hash.hex_to_bytes;
 use git.hash.is_valid_hex_id;
+use git.inflate.inflate_zlib;
 use git.limits.max_object_size;
 use git.object.ObjectType;
 use git.object.encode_raw_object;
+use git.object.header_len;
 use git.object.header_obj_type;
-use git.object.header_size;
 use git.object.verify_object_bytes;
+use git.pack.PackStore;
+use git.pack.open_pack;
+use git.pack.pack_has;
+use git.pack.pack_read;
 use git.repo.Repo;
-use git.zlib.zlib_decode_stored;
 use git.zlib.zlib_stored;
 
 // ADR 0047 決定 2「オブジェクトの書き込み」: 緩い形式 objects/<先頭 2 文字>/<残り>。
-// 追記のみ。公開後に書き換えない。内容の取得（inflate を伴う読み取り）は圧縮の契約 ADR の確定後の後続 Issue。
-// 本モジュールの復号は stored ブロックの zlib だけを扱う（zlib_decode_stored）。Huffman 圧縮の既存オブジェクトは
-// 内容を検証できないので、存在の確認（odb_has）はできても、型・長さの取得と書き込み時の重複判定は UnsupportedFormat で拒否する。
+// 追記のみ。公開後に書き換えない。
+// 単位 3: 読み取りの入口は緩い形式と pack を一つにまとめる（odb_read）。緩い形式を先に探し、無ければ pack を探す。
+// 緩い形式の復号は git.inflate（stored・固定・動的 Huffman）。どちらも識別子の再計算で検証する。
 
 pub struct ObjectInfo {
   obj_type: ObjectType,
@@ -77,14 +84,74 @@ pub fn object_path(repo: &Repo, id_hex: &String) -> Result<String, GitError>
   return Ok(join_path(&dir, &string_slice(&id_hex, 2, 64)));
 }
 
+pub fn open_packs(repo: &Repo) -> Result<List<PackStore>, GitError>
+  intent "objects/pack の *.idx をすべて開いて検証する（.idx と pack の末尾の検査値を確かめる）。pack が無ければ空のリスト"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = join_path(&join_path(&repo.git_dir, &"objects"), &"pack");
+  let mut out = List.new();
+  let listed = list_names(&dir, 100000);
+  let mut names = List.new();
+  match listed {
+    Ok(n) => {
+      names = n;
+    }
+    Err(e) => {
+      if !is_not_found(&e) {
+        return Err(e);
+      }
+    }
+  }
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      None => {}
+      Some(nm) => {
+        if string_ends_with(&nm, &".idx") {
+          out.push(open_pack(&join_path(&dir, &nm))?);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+fn in_packs(packs: &List<PackStore>, id_hex: &String) -> Result<Bool, GitError>
+  intent "開いた pack のどれかに id があるかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut i = 0;
+  while i < packs.len() {
+    match packs.get(i) {
+      None => {}
+      Some(p) => {
+        if pack_has(&p, &id_hex)? {
+          return Ok(true);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(false);
+}
+
 pub fn odb_has(repo: &Repo, id_hex: &String) -> Result<Bool, GitError>
-  intent "識別子の緩いオブジェクトのファイルがあるかを返す（内容は検証しない）。pack は単位 3 の範囲"
+  intent "識別子のオブジェクトが緩い形式のファイルか pack にあるかを返す（緩い形式は存在だけを見て内容は検証しない）"
   requires none
   ensures none
   effects fs
 {
   let path = object_path(&repo, &id_hex)?;
-  return file_exists(&path);
+  if file_exists(&path)? {
+    return Ok(true);
+  }
+  let packs = open_packs(&repo)?;
+  return in_packs(&packs, &id_hex);
 }
 
 fn load_verified_raw(repo: &Repo, id_hex: &String) -> Result<Option<Bytes>, GitError>
@@ -99,7 +166,11 @@ fn load_verified_raw(repo: &Repo, id_hex: &String) -> Result<Option<Bytes>, GitE
       return Ok(None);
     }
     Some(z) => {
-      let rawobj = zlib_decode_stored(&z, raw_limit(), true)?;
+      let inflated = inflate_zlib(&z, 0, raw_limit())?;
+      if inflated.consumed != z.len() {
+        return Err(GitError.Corrupt("loose object has trailing data after the zlib stream"));
+      }
+      let rawobj = inflated.data;
       let want = hex_to_bytes(&id_hex)?;
       verify_object_bytes(&rawobj, &want)?;
       return Ok(Some(rawobj));
@@ -107,22 +178,63 @@ fn load_verified_raw(repo: &Repo, id_hex: &String) -> Result<Option<Bytes>, GitE
   }
 }
 
-pub fn odb_info(repo: &Repo, id_hex: &String) -> Result<ObjectInfo, GitError>
-  intent "識別子のオブジェクトの型と長さを返す（識別子を再計算して検証する）。無ければ NotFound、Huffman 圧縮は UnsupportedFormat"
+pub struct ObjectData {
+  obj_type: ObjectType,
+  content: Bytes,
+}
+
+pub fn odb_read_in(repo: &Repo, packs: &List<PackStore>, id_hex: &String) -> Result<ObjectData, GitError>
+  intent "識別子のオブジェクトを読んで型と内容を返す。緩い形式を先に、無ければ開いた pack を探す。どちらも識別子を再計算して検証する。無ければ NotFound"
   requires none
   ensures none
-  effects fs.read
+  effects fs
 {
   match load_verified_raw(&repo, &id_hex)? {
-    None => {
-      return Err(GitError.NotFound("object does not exist"));
-    }
     Some(rawobj) => {
       let want = hex_to_bytes(&id_hex)?;
       let hdr = verify_object_bytes(&rawobj, &want)?;
-      return Ok(ObjectInfo { obj_type: header_obj_type(&hdr), size: header_size(&hdr) });
+      let hl = header_len(&hdr);
+      let content = rawobj.slice(hl, rawobj.len()).unwrap_or(Bytes.new());
+      return Ok(ObjectData { obj_type: header_obj_type(&hdr), content: content });
     }
+    None => {}
   }
+  let mut i = 0;
+  while i < packs.len() {
+    match packs.get(i) {
+      None => {}
+      Some(p) => {
+        match pack_read(&p, &id_hex)? {
+          Some(o) => {
+            return Ok(ObjectData { obj_type: o.obj_type, content: o.content });
+          }
+          None => {}
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Err(GitError.NotFound("object does not exist"));
+}
+
+pub fn odb_read(repo: &Repo, id_hex: &String) -> Result<ObjectData, GitError>
+  intent "識別子のオブジェクトを読む（pack は毎回開いて検証する。多数を読むなら open_packs と odb_read_in を使う）"
+  requires none
+  ensures none
+  effects fs
+{
+  let packs = open_packs(&repo)?;
+  return odb_read_in(&repo, &packs, &id_hex);
+}
+
+pub fn odb_info(repo: &Repo, id_hex: &String) -> Result<ObjectInfo, GitError>
+  intent "識別子のオブジェクトの型と長さを返す（識別子を再計算して検証する）。無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  let o = odb_read(&repo, &id_hex)?;
+  return Ok(ObjectInfo { obj_type: o.obj_type, size: o.content.len() });
 }
 
 pub fn odb_write(repo: &Repo, obj_type: &ObjectType, content: &Bytes) -> Result<String, GitError>
@@ -142,6 +254,10 @@ pub fn odb_write(repo: &Repo, obj_type: &ObjectType, content: &Bytes) -> Result<
       return Ok(id_hex);
     }
     None => {}
+  }
+  let packs = open_packs(&repo)?;
+  if in_packs(&packs, &id_hex)? {
+    return Ok(id_hex);
   }
   let dir = object_dir(&repo, &id_hex)?;
   make_dir(&dir)?;

@@ -1,0 +1,912 @@
+module tests.test_pack
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.join_path;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.hash.compute_sha256;
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.object.object_type_name;
+use git.odb.odb_has;
+use git.odb.odb_info;
+use git.odb.odb_read;
+use git.odb.odb_write;
+use git.pack.open_pack;
+use git.pack.pack_count;
+use git.pack.pack_id_at;
+use git.pack.pack_read;
+use git.pack.pack_read_index;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.repo.open_repo;
+use git.zlib.zlib_stored;
+
+// 手で組み立てた pack と pack index (v2) で、読み取りの正常系・差分の解決・拒否条件・上限を試す。
+// 実 Git が作った pack との一致は interop_pack.sh で確かめる。
+
+struct Built {
+  pack: Bytes,
+  idx: Bytes,
+}
+
+struct Builder {
+  body: Bytes,
+  ids: List<String>,
+  offs: List<Int>,
+}
+
+fn id_str(l: &List<String>, i: Int) -> String
+  intent "文字列のリストの i 番目の複製を返す（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v.clone(),
+    None => "",
+  };
+}
+
+fn int_at(l: &List<Int>, i: Int) -> Int
+  intent "整数のリストの i 番目を返す（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+fn new_builder() -> Builder
+  intent "空の pack の組み立て器を作る（先頭の 12 byte は finish で付ける）"
+  requires none
+  ensures none
+  effects none
+{
+  return Builder { body: Bytes.new(), ids: List.new(), offs: List.new() };
+}
+
+fn cur_offset(b: &Builder) -> Int
+  intent "次に書く entry の pack 内の位置（先頭の 12 byte を含む）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 12 + b.body.len();
+}
+
+fn entry_header(kind: Int, size: Int) -> Bytes
+  intent "pack の entry の見出し（型と大きさの可変長整数）を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut rest = size / 16;
+  let mut first = kind * 16 + size % 16;
+  if rest > 0 {
+    first = first + 128;
+  }
+  out.push(first);
+  while rest > 0 {
+    let mut c = rest % 128;
+    rest = rest / 128;
+    if rest > 0 {
+      c = c + 128;
+    }
+    out.push(c);
+  }
+  return out;
+}
+
+fn ofs_encoding(rel: Int) -> Bytes
+  intent "OFS_DELTA の基点までの距離の符号化（Git の write_ofs_delta と同じ）を作る"
+  requires rel > 0
+  ensures none
+  effects none
+{
+  let mut rev = Bytes.new();
+  let mut v = rel;
+  rev.push(v % 128);
+  v = v / 128;
+  while v > 0 {
+    v = v - 1;
+    rev.push(128 + v % 128);
+    v = v / 128;
+  }
+  let mut out = Bytes.new();
+  let mut i = rev.len();
+  while i > 0 {
+    i = i - 1;
+    out.push(rev.get(i).unwrap_or(0));
+  }
+  return out;
+}
+
+fn add_entry(b: &mut Builder, id_hex: &String, head: &Bytes, payload: &Bytes) -> Int
+  intent "見出しと zlib の本体を追記し、その entry の位置を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let off = 12 + b.body.len();
+  b.body.extend(&head);
+  b.body.extend(&zlib_stored(&payload));
+  b.ids.push(id_hex.clone());
+  b.offs.push(off);
+  return off;
+}
+
+fn add_base(b: &mut Builder, obj_type: &ObjectType, kind: Int, content: &Bytes) -> Int
+  intent "基になるオブジェクトを追記し、位置を返す。識別子は内容から計算する"
+  requires none
+  ensures none
+  effects none
+{
+  let id = bytes_to_hex(&compute_object_id(&object_type_name(&obj_type), &content));
+  return add_entry(&mut b, &id, &entry_header(kind, content.len()), &content);
+}
+
+fn add_ofs_delta(b: &mut Builder, base_off: Int, delta: &Bytes, result_id: &String) -> Int
+  intent "OFS_DELTA を追記し、位置を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let rel = cur_offset(&b) - base_off;
+  let mut head = entry_header(6, delta.len());
+  head.extend(&ofs_encoding(rel));
+  return add_entry(&mut b, &result_id, &head, &delta);
+}
+
+fn add_ref_delta(b: &mut Builder, base_id: &String, delta: &Bytes, result_id: &String) -> Int
+  intent "REF_DELTA を追記し、位置を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut head = entry_header(7, delta.len());
+  head.extend(&hex_to_bytes(&base_id).unwrap_or(Bytes.new()));
+  return add_entry(&mut b, &result_id, &head, &delta);
+}
+
+fn varint(v: Int) -> Bytes
+  intent "差分の大きさの可変長整数を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut rest = v;
+  let mut more = true;
+  while more {
+    let mut c = rest % 128;
+    rest = rest / 128;
+    if rest > 0 {
+      c = c + 128;
+    } else {
+      more = false;
+    }
+    out.push(c);
+  }
+  return out;
+}
+
+// 基の先頭 keep byte を copy し、続けて tail を insert する差分
+fn delta_keep_then_insert(base_len: Int, keep: Int, tail: &Bytes) -> Bytes
+  intent "base の先頭 keep byte を copy して tail を insert する差分を作る（keep は 1 以上 255 以下、tail は 1 以上 127 以下）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut d = Bytes.new();
+  d.extend(&varint(base_len));
+  d.extend(&varint(keep + tail.len()));
+  d.push(128 + 16);
+  d.push(keep);
+  d.push(tail.len());
+  d.extend(&tail);
+  return d;
+}
+
+fn finish(b: &Builder) -> Built
+  intent "pack の全体（見出し・本体・SHA-256 の末尾）と、識別子順の pack index v2 を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let n = b.ids.len();
+  let mut pack = Bytes.new();
+  pack.extend(&"PACK".as_bytes());
+  pack.push_u32_be(2);
+  pack.push_u32_be(n);
+  pack.extend(&b.body);
+  let pack_sum = compute_sha256(&pack);
+  pack.extend(&pack_sum);
+  // 識別子の昇順に並べる（選択ソート）
+  let mut order = List.new();
+  let mut used = Bytes.new();
+  let mut z = 0;
+  while z < n {
+    used.push(0);
+    z = z + 1;
+  }
+  let mut round = 0;
+  while round < n {
+    let mut best = -1;
+    let mut j = 0;
+    while j < n {
+      if used.get(j).unwrap_or(1) == 0 {
+        if best < 0 {
+          best = j;
+        } else if id_str(&b.ids, j) < id_str(&b.ids, best) {
+          best = j;
+        }
+      }
+      j = j + 1;
+    }
+    let _ = used.set(best, 1);
+    order.push(best);
+    round = round + 1;
+  }
+  let mut idx = Bytes.new();
+  idx.push(255);
+  idx.extend(&"tOc".as_bytes());
+  idx.push_u32_be(2);
+  let mut c = 0;
+  while c < 256 {
+    let mut count = 0;
+    let mut k = 0;
+    while k < n {
+      let first = hex_to_bytes(&id_str(&b.ids, k)).unwrap_or(Bytes.new()).get(0).unwrap_or(0);
+      if first <= c {
+        count = count + 1;
+      }
+      k = k + 1;
+    }
+    idx.push_u32_be(count);
+    c = c + 1;
+  }
+  let mut p = 0;
+  while p < n {
+    let i = int_at(&order, p);
+    idx.extend(&hex_to_bytes(&id_str(&b.ids, i)).unwrap_or(Bytes.new()));
+    p = p + 1;
+  }
+  let mut q = 0;
+  while q < n {
+    idx.push_u32_be(0);
+    q = q + 1;
+  }
+  let mut r = 0;
+  while r < n {
+    let i = int_at(&order, r);
+    idx.push_u32_be(int_at(&b.offs, i));
+    r = r + 1;
+  }
+  idx.extend(&pack_sum);
+  let idx_sum = compute_sha256(&idx);
+  idx.extend(&idx_sum);
+  return Built { pack: pack, idx: idx };
+}
+
+fn pack_name(tag: &String) -> String
+  intent "テストごとに別の pack 名を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return cat3(&"pack-", &tag, &"");
+}
+
+fn install(dir: &String, tag: &String, built: &Built) -> Result<String, GitError>
+  intent "built の .pack と .idx を dir に書き、.idx のパスを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  make_dirs(&dir)?;
+  let base = join_path(&dir, &pack_name(&tag));
+  create_synced_file(&cat3(&base, &".pack", &""), &built.pack)?;
+  let idx_path = cat3(&base, &".idx", &"");
+  create_synced_file(&idx_path, &built.idx)?;
+  return Ok(idx_path);
+}
+
+fn install_or_empty(dir: &String, tag: &String, built: &Built) -> String
+  intent "install の結果のパス。失敗なら空文字列"
+  requires none
+  ensures none
+  effects fs
+{
+  return match install(&dir, &tag, &built) {
+    Ok(p) => p,
+    Err(_) => "",
+  };
+}
+
+fn flip(b: &Bytes, at: Int) -> Bytes
+  intent "at 番目の byte を 1 増やした複製を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let v = b.get(i).unwrap_or(0);
+    if i == at {
+      out.push((v + 1) % 256);
+    } else {
+      out.push(v);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn open_kind(idx_path: &String) -> String
+  intent "open_pack の結果が成功なら ok、失敗ならエラー種別を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  return match open_pack(&idx_path) {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn read_kind(idx_path: &String, id_hex: &String) -> String
+  intent "pack を開いて id を読み、成功なら ok、無ければ none、失敗ならエラー種別を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  return match open_pack(&idx_path) {
+    Err(e) => error_kind_name(&e),
+    Ok(ps) => match pack_read(&ps, &id_hex) {
+      Err(e) => error_kind_name(&e),
+      Ok(o) => match o {
+        None => "none",
+        Some(_) => "ok",
+      },
+    },
+  };
+}
+
+fn content_of(idx_path: &String, id_hex: &String) -> Bytes
+  intent "pack から id の内容を読む。失敗や無ければ空"
+  requires none
+  ensures none
+  effects fs
+{
+  return match open_pack(&idx_path) {
+    Err(_) => Bytes.new(),
+    Ok(ps) => match pack_read(&ps, &id_hex) {
+      Err(_) => Bytes.new(),
+      Ok(o) => match o {
+        None => Bytes.new(),
+        Some(x) => x.content,
+      },
+    },
+  };
+}
+
+fn blob_id(content: &Bytes) -> String
+  intent "blob の識別子（hex）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return bytes_to_hex(&compute_object_id(&"blob", &content));
+}
+
+fn fail(label: &String) -> Bool
+  intent "失敗したラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&cat3(&"  FAILED: ", &label, &""));
+  return false;
+}
+
+fn test_deltas(dir: &String) -> Bool
+  intent "基のオブジェクト・OFS_DELTA・REF_DELTA・差分の差分を読めて、識別子が検証されることを試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let base = "0123456789abcdefghij0123456789abcdefghij".as_bytes();
+  let tail1 = "-one".as_bytes();
+  let res1 = "0123456789abcdefghij0123456789-one".as_bytes();
+  let tail2 = "!two!".as_bytes();
+  let res2 = "0123456789abcdefghij0123456789-one!two!".as_bytes();
+  let tail3 = "?".as_bytes();
+  let res3 = "0123456789abcdefghij01234?".as_bytes();
+  let mut b = new_builder();
+  let base_off = add_base(&mut b, &ObjectType.Blob, 3, &base);
+  let base_id = blob_id(&base);
+  // OFS_DELTA: 基の先頭 30 byte + "-one"
+  let d1 = delta_keep_then_insert(base.len(), 30, &tail1);
+  let off1 = add_ofs_delta(&mut b, base_off, &d1, &blob_id(&res1));
+  // 差分の差分（OFS_DELTA の基が OFS_DELTA）
+  let d2 = delta_keep_then_insert(res1.len(), 34, &tail2);
+  let _ = add_ofs_delta(&mut b, off1, &d2, &blob_id(&res2));
+  // REF_DELTA: 基を識別子で指す
+  let d3 = delta_keep_then_insert(base.len(), 25, &tail3);
+  let _ = add_ref_delta(&mut b, &base_id, &d3, &blob_id(&res3));
+  // commit も基にできる
+  let commit = "tree 0000000000000000000000000000000000000000000000000000000000000000\n\nmsg\n".as_bytes();
+  let _ = add_base(&mut b, &ObjectType.Commit, 1, &commit);
+  let built = finish(&b);
+  let idx_path = install_or_empty(&join_path(&dir, &"deltas"), &"a", &built);
+  if idx_path == "" {
+    return fail(&"install deltas");
+  }
+  if open_kind(&idx_path) != "ok" {
+    return fail(&"open valid pack");
+  }
+  if content_of(&idx_path, &base_id) != base {
+    return fail(&"read base");
+  }
+  if content_of(&idx_path, &blob_id(&res1)) != res1 {
+    return fail(&"read OFS_DELTA");
+  }
+  if content_of(&idx_path, &blob_id(&res2)) != res2 {
+    return fail(&"read delta of delta");
+  }
+  if content_of(&idx_path, &blob_id(&res3)) != res3 {
+    return fail(&"read REF_DELTA");
+  }
+  match open_pack(&idx_path) {
+    Err(_) => {
+      return fail(&"open for count");
+    }
+    Ok(ps) => {
+      if pack_count(&ps) != 5 {
+        return fail(&"pack_count");
+      }
+      match pack_id_at(&ps, 0) {
+        Err(_) => {
+          return fail(&"pack_id_at");
+        }
+        Ok(id) => {
+          if id.len() != 64 {
+            return fail(&"pack_id_at length");
+          }
+        }
+      }
+      match pack_read_index(&ps, 4) {
+        Err(_) => {
+          return fail(&"pack_read_index");
+        }
+        Ok(_) => {}
+      }
+    }
+  }
+  // 圧縮後が最初の窓 (64 KiB) より大きいオブジェクトは、窓を広げて読み直す
+  let mut large = Bytes.new();
+  let mut li = 0;
+  while li < 70000 {
+    large.push((li * 7 + li / 256) % 256);
+    li = li + 1;
+  }
+  let mut lb = new_builder();
+  let _ = add_base(&mut lb, &ObjectType.Blob, 3, &large);
+  match install(&join_path(&dir, &"large"), &"b", &finish(&lb)) {
+    Err(_) => {
+      return fail(&"install large");
+    }
+    Ok(lp) => {
+      if content_of(&lp, &blob_id(&large)) != large {
+        return fail(&"read an object larger than the first window");
+      }
+    }
+  }
+  let missing = "1111111111111111111111111111111111111111111111111111111111111111";
+  if read_kind(&idx_path, &missing) != "none" {
+    return fail(&"missing id is none");
+  }
+  if read_kind(&idx_path, &"zz") != "Corrupt" {
+    return fail(&"bad id is Corrupt");
+  }
+  return true;
+}
+
+fn test_rejections(dir: &String) -> Bool
+  intent "壊れた・未対応の pack と .idx、循環、深すぎる連鎖、不正な差分を拒否することを試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let content = "some blob content for rejection tests".as_bytes();
+  let mut b = new_builder();
+  let _ = add_base(&mut b, &ObjectType.Blob, 3, &content);
+  let good = finish(&b);
+  let id = blob_id(&content);
+  // 1. pack の中身を 1 byte 壊す → pack の検査値の不一致
+  let bad_pack = Built { pack: flip(&good.pack, 20), idx: good.idx.clone() };
+  match install(&join_path(&dir, &"bad"), &"pack", &bad_pack) {
+    Err(_) => {
+      return fail(&"install bad pack");
+    }
+    Ok(p) => {
+      if open_kind(&p) != "Corrupt" {
+        return fail(&"corrupt pack body");
+      }
+    }
+  }
+  // 2. .idx を 1 byte 壊す → .idx の検査値の不一致
+  let bad_idx = Built { pack: good.pack.clone(), idx: flip(&good.idx, 1100) };
+  match install(&join_path(&dir, &"bad"), &"idx", &bad_idx) {
+    Err(_) => {
+      return fail(&"install bad idx");
+    }
+    Ok(p) => {
+      if open_kind(&p) != "Corrupt" {
+        return fail(&"corrupt idx body");
+      }
+    }
+  }
+  // 3. .idx v1（先頭の magic が無い）と未知の version
+  let mut v1 = Bytes.new();
+  let mut i = 0;
+  while i < 1100 {
+    v1.push(0);
+    i = i + 1;
+  }
+  match install(&join_path(&dir, &"bad"), &"v1", &Built { pack: good.pack.clone(), idx: v1 }) {
+    Err(_) => {
+      return fail(&"install v1");
+    }
+    Ok(p) => {
+      if open_kind(&p) != "UnsupportedFormat" {
+        return fail(&"idx v1 is UnsupportedFormat");
+      }
+    }
+  }
+  let mut v3 = good.idx.clone();
+  v3 = flip(&v3, 7);
+  match install(&join_path(&dir, &"bad"), &"v3", &Built { pack: good.pack.clone(), idx: v3 }) {
+    Err(_) => {
+      return fail(&"install v3");
+    }
+    Ok(p) => {
+      if open_kind(&p) != "UnsupportedFormat" {
+        return fail(&"idx v3 is UnsupportedFormat");
+      }
+    }
+  }
+  // 3b. オブジェクト数が上限 (2^24) を超える .idx は、大きさの検査より先に LimitExceeded
+  let mut many = Bytes.new();
+  many.push(255);
+  many.extend(&"tOc".as_bytes());
+  many.push_u32_be(2);
+  let mut fo = 0;
+  while fo < 255 {
+    many.push_u32_be(0);
+    fo = fo + 1;
+  }
+  many.push_u32_be(16777217);
+  let mut pad = 0;
+  while pad < 100 {
+    many.push(0);
+    pad = pad + 1;
+  }
+  match install(&join_path(&dir, &"bad"), &"many", &Built { pack: good.pack.clone(), idx: many }) {
+    Err(_) => {
+      return fail(&"install many");
+    }
+    Ok(p) => {
+      if open_kind(&p) != "LimitExceeded" {
+        return fail(&"too many objects is LimitExceeded");
+      }
+    }
+  }
+  // 4. SHA-1 形式の .idx（物体 0 個: 8 + 1024 + 20 + 20 byte）
+  let mut sha1 = Bytes.new();
+  sha1.push(255);
+  sha1.extend(&"tOc".as_bytes());
+  sha1.push_u32_be(2);
+  let mut f = 0;
+  while f < 256 {
+    sha1.push_u32_be(0);
+    f = f + 1;
+  }
+  let mut t = 0;
+  while t < 40 {
+    sha1.push(0);
+    t = t + 1;
+  }
+  match install(&join_path(&dir, &"bad"), &"sha1", &Built { pack: good.pack.clone(), idx: sha1 }) {
+    Err(_) => {
+      return fail(&"install sha1");
+    }
+    Ok(p) => {
+      if open_kind(&p) != "UnsupportedFormat" {
+        return fail(&"sha1 idx is UnsupportedFormat");
+      }
+    }
+  }
+  // 5. 識別子が内容と合わない（.idx の識別子を別のものにする）
+  let mut lie = new_builder();
+  let wrong_id = "2222222222222222222222222222222222222222222222222222222222222222";
+  let _ = add_entry(&mut lie, &wrong_id, &entry_header(3, content.len()), &content);
+  match install(&join_path(&dir, &"bad"), &"lie", &finish(&lie)) {
+    Err(_) => {
+      return fail(&"install lie");
+    }
+    Ok(p) => {
+      if read_kind(&p, &wrong_id) != "Corrupt" {
+        return fail(&"id mismatch is Corrupt");
+      }
+    }
+  }
+  // 6. REF_DELTA の循環（A→B→A）
+  let id_a = "3333333333333333333333333333333333333333333333333333333333333333";
+  let id_b = "4444444444444444444444444444444444444444444444444444444444444444";
+  let dd = delta_keep_then_insert(10, 5, &"x".as_bytes());
+  let mut cyc = new_builder();
+  let _ = add_ref_delta(&mut cyc, &id_b, &dd, &id_a);
+  let _ = add_ref_delta(&mut cyc, &id_a, &dd, &id_b);
+  match install(&join_path(&dir, &"bad"), &"cycle", &finish(&cyc)) {
+    Err(_) => {
+      return fail(&"install cycle");
+    }
+    Ok(p) => {
+      if read_kind(&p, &id_a) != "Corrupt" {
+        return fail(&"delta cycle is Corrupt");
+      }
+    }
+  }
+  // 7. 差分の連鎖が深すぎる（基 + 70 段の OFS_DELTA）
+  let seed = "abcdefghijklmnopqrstuvwxyz0123456789".as_bytes();
+  let mut deep = new_builder();
+  let mut prev = add_base(&mut deep, &ObjectType.Blob, 3, &seed);
+  let mut len = seed.len();
+  let mut step = 0;
+  let mut last_id = "";
+  while step < 70 {
+    let d = delta_keep_then_insert(len, len, &"z".as_bytes());
+    last_id = cat3(&"5", &bytes_to_hex(&compute_sha256(&varint(step + 1000))), &"").as_bytes().slice(0, 64).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+    prev = add_ofs_delta(&mut deep, prev, &d, &last_id);
+    len = len + 1;
+    step = step + 1;
+  }
+  match install(&join_path(&dir, &"bad"), &"deep", &finish(&deep)) {
+    Err(_) => {
+      return fail(&"install deep");
+    }
+    Ok(p) => {
+      if read_kind(&p, &last_id) != "LimitExceeded" {
+        return fail(&"deep delta chain is LimitExceeded");
+      }
+    }
+  }
+  // 8. 基の大きさが合わない差分
+  let mut mismatch = new_builder();
+  let base_off = add_base(&mut mismatch, &ObjectType.Blob, 3, &content);
+  let wrong_len = delta_keep_then_insert(content.len() + 5, 10, &"y".as_bytes());
+  let mm_id = "6666666666666666666666666666666666666666666666666666666666666666";
+  let _ = add_ofs_delta(&mut mismatch, base_off, &wrong_len, &mm_id);
+  match install(&join_path(&dir, &"bad"), &"mismatch", &finish(&mismatch)) {
+    Err(_) => {
+      return fail(&"install mismatch");
+    }
+    Ok(p) => {
+      if read_kind(&p, &mm_id) != "Corrupt" {
+        return fail(&"delta base size mismatch is Corrupt");
+      }
+    }
+  }
+  // 9. 宣言された大きさが上限 (64 MiB) を超える entry は、確保の前に拒否する
+  let mut huge = new_builder();
+  let huge_id = "7777777777777777777777777777777777777777777777777777777777777777";
+  let _ = add_entry(&mut huge, &huge_id, &entry_header(3, 67108865), &content);
+  match install(&join_path(&dir, &"bad"), &"huge", &finish(&huge)) {
+    Err(_) => {
+      return fail(&"install huge");
+    }
+    Ok(p) => {
+      if read_kind(&p, &huge_id) != "LimitExceeded" {
+        return fail(&"declared size over the limit is LimitExceeded");
+      }
+    }
+  }
+  // 10. 宣言された大きさと実際の大きさが違う
+  let mut lenlie = new_builder();
+  let ll_id = "8888888888888888888888888888888888888888888888888888888888888888";
+  let _ = add_entry(&mut lenlie, &ll_id, &entry_header(3, content.len() + 1), &content);
+  match install(&join_path(&dir, &"bad"), &"lenlie", &finish(&lenlie)) {
+    Err(_) => {
+      return fail(&"install lenlie");
+    }
+    Ok(p) => {
+      if read_kind(&p, &ll_id) != "Corrupt" {
+        return fail(&"size mismatch is Corrupt");
+      }
+    }
+  }
+  // 11. .idx の識別子の存在しない pack
+  match install(&join_path(&dir, &"ok"), &"good", &good) {
+    Err(_) => {
+      return fail(&"install good");
+    }
+    Ok(p) => {
+      if read_kind(&p, &id) != "ok" {
+        return fail(&"read good blob");
+      }
+    }
+  }
+  return true;
+}
+
+fn test_odb_integration(dir: &String) -> Bool
+  intent "リポジトリの objects/pack に置いた pack と緩い形式を、同じ入口 odb_read で読めること、非対応の付属ファイルを拒否することを試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let repo_path = join_path(&dir, &"repo.git");
+  return match init_repo(&repo_path, true, &"main") {
+    Err(_) => fail(&"init repo"),
+    Ok(repo) => odb_checks(&repo, &repo_path),
+  };
+}
+
+fn odb_checks(repo: &Repo, repo_path: &String) -> Bool
+  intent "init 済みのリポジトリで pack と緩い形式の統合を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let packed = "stored only in the pack".as_bytes();
+  let mut b = new_builder();
+  let _ = add_base(&mut b, &ObjectType.Blob, 3, &packed);
+  let pack_dir = join_path(&join_path(&repo.git_dir, &"objects"), &"pack");
+  match install(&pack_dir, &"one", &finish(&b)) {
+    Err(_) => {
+      return fail(&"install pack into repo");
+    }
+    Ok(_) => {}
+  }
+  let packed_id = blob_id(&packed);
+  match odb_read(&repo, &packed_id) {
+    Err(_) => {
+      return fail(&"odb_read from pack");
+    }
+    Ok(o) => {
+      if o.content != packed {
+        return fail(&"odb_read pack content");
+      }
+    }
+  }
+  match odb_info(&repo, &packed_id) {
+    Err(_) => {
+      return fail(&"odb_info from pack");
+    }
+    Ok(info) => {
+      if info.size != packed.len() {
+        return fail(&"odb_info pack size");
+      }
+    }
+  }
+  match odb_has(&repo, &packed_id) {
+    Ok(true) => {}
+    _ => {
+      return fail(&"odb_has sees the pack");
+    }
+  }
+  let loose = "stored as a loose object".as_bytes();
+  let loose_id = write_or_empty(&repo, &loose);
+  if loose_id == "" {
+    return fail(&"odb_write");
+  }
+  match odb_read(&repo, &loose_id) {
+    Err(_) => {
+      return fail(&"odb_read loose");
+    }
+    Ok(o) => {
+      if o.content != loose {
+        return fail(&"odb_read loose content");
+      }
+    }
+  }
+  // 既に pack にあるオブジェクトの書き込みは緩い形式を作らない
+  match odb_write(&repo, &ObjectType.Blob, &packed) {
+    Err(_) => {
+      return fail(&"odb_write of a packed object");
+    }
+    Ok(i) => {
+      if i != packed_id {
+        return fail(&"odb_write returns the same id");
+      }
+    }
+  }
+  // 付属ファイルの拒否
+  let mut ok = true;
+  let mpi = join_path(&pack_dir, &"multi-pack-index");
+  match create_synced_file(&mpi, &"x".as_bytes()) {
+    Err(_) => {
+      return fail(&"write multi-pack-index");
+    }
+    Ok(_) => {}
+  }
+  ok = expect_unsupported(&repo_path, &"multi-pack-index") && ok;
+  let bmp = join_path(&pack_dir, &"pack-one.bitmap");
+  match create_synced_file(&bmp, &"x".as_bytes()) {
+    Err(_) => {
+      return fail(&"write bitmap");
+    }
+    Ok(_) => {}
+  }
+  ok = expect_unsupported(&repo_path, &"bitmap") && ok;
+  return ok;
+}
+
+fn write_or_empty(repo: &Repo, content: &Bytes) -> String
+  intent "blob を書いて識別子を返す。失敗なら空文字列"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return match odb_write(&repo, &ObjectType.Blob, &content) {
+    Ok(i) => i,
+    Err(_) => "",
+  };
+}
+
+fn expect_unsupported(repo_path: &String, label: &String) -> Bool
+  intent "open_repo が UnsupportedFormat で拒否するかを返す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let kind = match open_repo(&repo_path) {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+  if kind != "UnsupportedFormat" {
+    return fail(&cat3(&"open_repo rejects ", &label, &""));
+  }
+  return true;
+}
+
+pub fn run_pack_tests() -> Bool
+  intent "git.pack と odb の統合の全テストを実行し全合格なら true を返す。作業用ディレクトリは tmp/ の下に作る"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let suffix = match random_hex(6) {
+    Ok(s) => s,
+    Err(_) => "fallback",
+  };
+  let dir = cat3(&"tmp/p_", &suffix, &"");
+  match make_dirs(&dir) {
+    Err(_) => {
+      return fail(&"cannot create the work directory");
+    }
+    Ok(_) => {}
+  }
+  let mut ok = true;
+  console.log(&"  deltas");
+  ok = test_deltas(&dir) && ok;
+  console.log(&"  rejections");
+  ok = test_rejections(&dir) && ok;
+  console.log(&"  odb integration");
+  ok = test_odb_integration(&dir) && ok;
+  return ok;
+}

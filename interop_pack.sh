@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# 本物の Git（SHA-256 形式）が作って gc（pack 化と差分）した履歴を、pack を含めて読めることの確認（Issue #622）。
+# 比較するもの: オブジェクトの型・長さ・内容、git log --topo-order、git ls-tree -r、git diff-tree --name-status、
+# git fsck --strict、pack の差分（OFS_DELTA）が実際に含まれること。
+set -euo pipefail
+
+if [ -z "${SIGIL:-}" ]; then
+  if command -v sigil >/dev/null 2>&1; then SIGIL="sigil"; else echo "SIGIL is not set" >&2; exit 1; fi
+fi
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "Git version: $(git --version)"
+WORK=tmp/pk
+rm -rf "$WORK"
+mkdir -p "$WORK"
+trap 'rm -rf "$WORK"' EXIT
+R="$WORK/repo"
+
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+export GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@example.com
+t=1700000000
+tick() { t=$((t + 60)); export GIT_AUTHOR_DATE="$t +0000" GIT_COMMITTER_DATE="$t +0000"; }
+
+git init --object-format=sha256 -q -b main "$R"
+git -C "$R" config gc.writeCommitGraph false
+git -C "$R" config repack.writeBitmaps false
+git -C "$R" config core.multiPackIndex false
+git -C "$R" config user.name T
+git -C "$R" config user.email t@example.com
+
+# 履歴: 差分に圧縮されやすい大きめのテキストを少しずつ変える。ブランチ・マージ・タグ・ディレクトリ・実行ビット・symlink を含む。
+big() { for n in $(seq 1 400); do echo "line $n: the quick brown fox jumps over the lazy dog"; done; }
+mkdir -p "$R/dir/sub"
+big > "$R/big.txt"
+echo hello > "$R/dir/a.txt"
+echo deep > "$R/dir/sub/b.txt"
+printf '#!/bin/sh\necho hi\n' > "$R/run.sh"; chmod +x "$R/run.sh"
+ln -s big.txt "$R/link"
+git -C "$R" add -A; tick; git -C "$R" commit -q -m "c1"
+for i in 2 3 4 5 6; do
+  echo "extra $i" >> "$R/big.txt"
+  echo "v$i" > "$R/dir/a.txt"
+  git -C "$R" add -A; tick; git -C "$R" commit -q -m "c$i"
+done
+git -C "$R" tag -a -m "annotated" v1
+git -C "$R" checkout -q -b topic main~2
+echo topic1 > "$R/topic.txt"; sed -i "1s/.*/line 1: edited on the topic branch/" "$R/big.txt"
+git -C "$R" add -A; tick; git -C "$R" commit -q -m "t1"
+echo topic2 > "$R/topic.txt"; git -C "$R" rm -q dir/sub/b.txt
+git -C "$R" add -A; tick; git -C "$R" commit -q -m "t2"
+git -C "$R" checkout -q main
+echo main7 >> "$R/big.txt"; git -C "$R" add -A; tick; git -C "$R" commit -q -m "c7"
+tick; git -C "$R" merge -q --no-ff -m "merge topic" topic
+echo after > "$R/after.txt"; git -C "$R" add -A; tick; git -C "$R" commit -q -m "c8"
+
+$SIGIL build --root . interop_read.sigil main -o "$WORK/read_bin"
+
+# 本物の Git の出力と比べる。$1: 表示名、$2: 期待する pack の数
+compare() {
+  local label="$1" packs="$2"
+  git -C "$R" cat-file --batch-all-objects --batch-check='%(objectname)' > "$WORK/ids.txt"
+  "$WORK/read_bin" > "$WORK/out.txt" || { cat "$WORK/out.txt"; exit 1; }
+  local exp="$WORK/expected.txt"
+  echo "PACKS $packs" > "$exp"
+  while read -r id; do
+    type="$(git -C "$R" cat-file -t "$id")"
+    size="$(git -C "$R" cat-file -s "$id")"
+    sum="$(git -C "$R" cat-file "$type" "$id" | sha256sum | cut -d' ' -f1)"
+    echo "OBJ $id $type $size $sum" >> "$exp"
+  done < "$WORK/ids.txt"
+  git -C "$R" log --topo-order --format='LOG %H' main >> "$exp"
+  git -C "$R" ls-tree -r main | sed 's/^/TREE /' >> "$exp"
+  for c in $(git -C "$R" log --topo-order --format=%H main); do
+    echo "DIFF $c" >> "$exp"
+    if git -C "$R" rev-parse -q --verify "$c^1" >/dev/null; then
+      git -C "$R" diff-tree -r --name-status --no-renames "$c^1" "$c" >> "$exp"
+    else
+      git -C "$R" diff-tree -r --no-commit-id --name-status --no-renames --root "$c" >> "$exp"
+    fi
+  done
+  # 出力の最後の行は main の戻り値 0
+  sed -i '$ d' "$WORK/out.txt"
+  if ! diff -u "$exp" "$WORK/out.txt"; then
+    echo "[$label] output differs from real Git" >&2
+    exit 1
+  fi
+  echo "[$label] read $(wc -l < "$WORK/ids.txt") objects, the history, ls-tree -r and diff --name-status identically to real Git"
+}
+
+# 1. gc の前: 緩いオブジェクト（本物の Git が書いた Huffman 圧縮の zlib）
+test -z "$(ls "$R"/.git/objects/pack/*.idx 2>/dev/null)"
+git -C "$R" fsck --strict --full
+compare "loose" 0
+
+# 2. gc（pack 化と差分）と pack-refs の後
+git -C "$R" gc -q --aggressive --prune=now
+git -C "$R" pack-refs --all
+test -n "$(ls "$R"/.git/objects/pack/*.idx)"
+test "$(find "$R/.git/objects" -type f -path '*/objects/??/*' | wc -l)" -eq 0
+VP="$(git -C "$R" verify-pack -v "$PWD"/"$R"/.git/objects/pack/*.idx)"
+grep -qE '^chain length = [0-9]+: [0-9]+ objects?$' <<<"$VP" || { echo "the pack has no delta objects" >&2; exit 1; }
+git -C "$R" fsck --strict --full
+compare "packed" 1
+echo "=== interop (pack) OK ==="
