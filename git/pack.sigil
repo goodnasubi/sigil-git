@@ -161,7 +161,7 @@ pub fn open_pack(idx_path: &String) -> Result<PackStore, GitError>
     return Err(GitError.Corrupt("pack index checksum mismatch"));
   }
   let pack_sum_in_idx = read_range(&idx, idx_size - hl * 2, hl)?;
-  let pack_path = cat3(&string_slice(&idx_path, 0, idx_path.len() - 4), &".pack", &"");
+  let pack_path = cat3(&string_slice(&idx_path, 0, idx_path.as_bytes().len() - 4), &".pack", &"");
   let pack = open_read(&pack_path)?;
   let pack_size = file_size(&pack)?;
   if pack_size > max_pack_size() {

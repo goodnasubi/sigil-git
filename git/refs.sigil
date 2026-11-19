@@ -220,12 +220,18 @@ pub fn parse_packed_refs(data: &Bytes) -> Result<PackedRefs, GitError>
       end = end + 1;
     }
     let line_b = data.slice(pos, end).unwrap_or(Bytes.new());
-    let line = line_b.to_string_utf8().unwrap_or("");
-    if line.len() != line_b.len() {
-      return Err(GitError.Corrupt("packed-refs line is not valid UTF-8"));
+    let mut line = "";
+    match line_b.to_string_utf8() {
+      Ok(v) => {
+        line = v;
+      }
+      Err(_) => {
+        return Err(GitError.Corrupt("packed-refs line is not valid UTF-8"));
+      }
     }
+    let line_n = line_b.len();
     pos = end + 1;
-    if line.len() > 0 && line_b.get(0).unwrap_or(0) == 35 {
+    if line_n > 0 && line_b.get(0).unwrap_or(0) == 35 {
       if !first {
         return Err(GitError.Corrupt("unexpected comment line in packed-refs"));
       }
@@ -233,11 +239,11 @@ pub fn parse_packed_refs(data: &Bytes) -> Result<PackedRefs, GitError>
         return Err(GitError.UnsupportedFormat("unknown packed-refs header trait"));
       }
       header = cat3(&line, &"\n", &"");
-    } else if line.len() > 0 && line_b.get(0).unwrap_or(0) == 94 {
+    } else if line_n > 0 && line_b.get(0).unwrap_or(0) == 94 {
       if !have {
         return Err(GitError.Corrupt("peeled line without a preceding reference"));
       }
-      let pid = string_slice(&line, 1, line.len());
+      let pid = string_slice(&line, 1, line_n);
       if !is_valid_hex_id(&pid) {
         return Err(GitError.Corrupt("invalid peeled object id in packed-refs"));
       }
@@ -246,15 +252,15 @@ pub fn parse_packed_refs(data: &Bytes) -> Result<PackedRefs, GitError>
       }
       cur_peeled = pid;
     } else {
-      if line.len() < 66 || line_b.get(64).unwrap_or(0) != 32 {
+      if line_n < 66 || line_b.get(64).unwrap_or(0) != 32 {
         return Err(GitError.Corrupt("malformed packed-refs entry"));
       }
       let id = string_slice(&line, 0, 64);
-      let name = string_slice(&line, 65, line.len());
+      let name = string_slice(&line, 65, line_n);
       if !is_valid_hex_id(&id) {
         return Err(GitError.Corrupt("invalid object id in packed-refs"));
       }
-      if name.len() > max_ref_name_len() {
+      if name.as_bytes().len() > max_ref_name_len() {
         return Err(GitError.LimitExceeded("ref name length exceeds 1024 limit"));
       }
       validate_ref_name(&name)?;
@@ -449,12 +455,17 @@ pub fn read_head(repo: &Repo) -> Result<HeadState, GitError>
       if body.len() > 0 && body.get(body.len() - 1).unwrap_or(0) == 10 {
         body = body.slice(0, body.len() - 1).unwrap_or(Bytes.new());
       }
-      let s = body.to_string_utf8().unwrap_or("");
-      if s.len() != body.len() {
-        return Err(GitError.Corrupt("HEAD is not valid UTF-8"));
+      let mut s = "";
+      match body.to_string_utf8() {
+        Ok(v) => {
+          s = v;
+        }
+        Err(_) => {
+          return Err(GitError.Corrupt("HEAD is not valid UTF-8"));
+        }
       }
       if string_starts_with(&s, &"ref: ") {
-        let target = string_slice(&s, 5, s.len());
+        let target = string_slice(&s, 5, body.len());
         validate_ref_name(&target)?;
         if !string_starts_with(&target, &"refs/heads/") {
           return Err(GitError.UnsupportedFormat("HEAD must point to refs/heads/*"));
