@@ -26,7 +26,7 @@ SHA-256 形式のリポジトリの作成（`init`）、緩いオブジェクト
 ### モジュール構成
 
 - `git/fsio.sigil`: ファイル境界（ADR 0049）の薄い包み。排他作成、同期、rename、親ディレクトリの同期、ロックファイルの作成と公開、ディレクトリ列挙。
-- `git/zlib.sigil`: Adler-32 と zlib の stored ブロックの符号化・復号（Huffman 圧縮は未対応）。
+- `git/zlib.sigil`: Adler-32 と zlib の stored ブロックの符号化・復号（伸長は `git/inflate.sigil`）。
 - `git/repo.sigil`: `init_repo`（通常・bare、最小の設定、HEAD を最後に公開）と `open_repo`（SHA-1・reftable・alternates・shallow・worktrees・.git ファイル・replace・promisor・疎なチェックアウト・分割索引を `UnsupportedFormat` で拒否）。
 - `git/odb.sigil`: `odb_write`（一時ファイル→同期→rename→親の同期。既存は内容を検証し、存在だけを信用しない）、`odb_has`、`odb_info`（型と長さ）。
 - `git/refs.sigil`: `update_ref`（`<ref>.lock` の排他作成と旧値の比較）、`delete_ref`（`packed-refs.lock` も取り、packed 側を先に消してから緩い参照を消す）、`create_branch`/`create_tag`/`delete_*`/`list_*`、HEAD の読み書き、packed-refs の解析と再出力（ヘッダと `^` の peeled 行を保つ）。
