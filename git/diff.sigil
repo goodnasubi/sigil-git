@@ -1,0 +1,367 @@
+module git.diff
+  targets server
+  trust none
+
+use git.checkout.Change;
+use git.checkout.compute_changes;
+use git.checkout.flatten_commit;
+use git.checkout.flatten_index_tree;
+use git.error.GitError;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.hash.int_to_str;
+use git.index.new_index_entry;
+use git.index.read_index;
+use git.index.sort_entries;
+use git.limits.max_work_memory;
+use git.object.ObjectType;
+use git.odb.odb_read_in;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.repo.Repo;
+use git.walk.commit_tree;
+use git.worktree.kind_dir;
+use git.worktree.kind_file;
+use git.worktree.kind_missing;
+use git.worktree.new_cache;
+use git.worktree.probe_path;
+use git.worktree.read_worktree_file;
+
+pub struct FileDiff {
+  path: String,
+  old_mode: Int,
+  new_mode: Int,
+  status: String,
+  binary: Bool,
+  patch: Bytes,
+}
+
+pub fn binary_content(content: &Bytes) -> Bool
+  intent "Git と同様に先頭 8000 byte の NUL でバイナリを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < content.len() && i < 8000 {
+    if content.get(i).unwrap_or(0) == 0 {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+pub fn read_blob(repo: &Repo, packs: &List<PackStore>, id: &String) -> Result<Bytes, GitError>
+  intent "差分で参照する blob を読む。空の識別子はファイルが存在しないことを表す"
+  requires none
+  ensures none
+  effects fs
+{
+  if id == "" {
+    return Ok(Bytes.new());
+  }
+  let o = odb_read_in(&repo, &packs, &id)?;
+  return match o.obj_type {
+    ObjectType.Blob => Ok(o.content),
+    _ => Err(GitError.TypeMismatch("diff entry does not point to a blob")),
+  };
+}
+
+fn append_path(out: &mut Bytes, side: Int, path: &String)
+  intent "Git の C 形式でパッチのパスを引用する"
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = path.as_bytes();
+  let mut quote = false;
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes.get(i).unwrap_or(0);
+    if b < 32 || b >= 127 || b == 34 || b == 92 {
+      quote = true;
+    }
+    i = i + 1;
+  }
+  if quote {
+    out.push(34);
+  }
+  out.push(side);
+  out.push(47);
+  i = 0;
+  while i < bytes.len() {
+    let b = bytes.get(i).unwrap_or(0);
+    if b == 34 || b == 92 {
+      out.push(92);
+      out.push(b);
+    } else if b < 32 || b >= 127 {
+      out.push(92);
+      out.push(48 + b / 64);
+      out.push(48 + b / 8 % 8);
+      out.push(48 + b % 8);
+    } else {
+      out.push(b);
+    }
+    i = i + 1;
+  }
+  if quote {
+    out.push(34);
+  }
+}
+
+fn line_count(data: &Bytes) -> Int
+  intent "末尾の改行有無を問わず行数を数える"
+  requires none
+  ensures none
+  effects none
+{
+  let mut lines = 0;
+  let mut i = 0;
+  while i < data.len() {
+    if data.get(i).unwrap_or(0) == 10 {
+      lines = lines + 1;
+    }
+    i = i + 1;
+  }
+  if i > 0 && data.get(i - 1).unwrap_or(0) != 10 {
+    lines = lines + 1;
+  }
+  return lines;
+}
+
+fn append_lines(out: &mut Bytes, prefix: Int, data: &Bytes)
+  intent "統一差分の行を書き、改行なしを明記する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut beginning = true;
+  let mut i = 0;
+  while i < data.len() {
+    if beginning {
+      out.push(prefix);
+    }
+    let byte = data.get(i).unwrap_or(0);
+    out.push(byte);
+    beginning = byte == 10;
+    i = i + 1;
+  }
+  if !beginning {
+    out.extend(&"\n\\ No newline at end of file\n".as_bytes());
+  }
+}
+
+fn append_range(out: &mut Bytes, count: Int)
+  intent "統一差分の範囲を書く"
+  requires none
+  ensures none
+  effects none
+{
+  if count == 0 {
+    out.extend(&"0,0".as_bytes());
+  } else {
+    out.extend(&"1,".as_bytes());
+    out.extend(&int_to_str(count).as_bytes());
+  }
+}
+
+fn append_mode(out: &mut Bytes, label: &String, mode: Int)
+  intent "モードのヘッダを書く"
+  requires none
+  ensures none
+  effects none
+{
+  out.extend(&label.as_bytes());
+  out.extend(&int_to_str(mode).as_bytes());
+  out.push(10);
+}
+
+fn append_file_patch(out: &mut Bytes, path: &String, old_mode: Int, new_mode: Int, prior: &Bytes, next: &Bytes, content_changed: Bool) -> Bool
+  intent "一つの Git パッチ節を書き、バイナリ差分だったか返す"
+  requires none
+  ensures none
+  effects none
+{
+  out.extend(&"diff --git ".as_bytes());
+  append_path(&mut out, 97, &path);
+  out.push(32);
+  append_path(&mut out, 98, &path);
+  out.push(10);
+  if old_mode == 0 {
+    append_mode(&mut out, &"new file mode ", new_mode);
+  } else if new_mode == 0 {
+    append_mode(&mut out, &"deleted file mode ", old_mode);
+  } else if old_mode != new_mode {
+    append_mode(&mut out, &"old mode ", old_mode);
+    append_mode(&mut out, &"new mode ", new_mode);
+  }
+  let mut binary = false;
+  if content_changed && prior.len() + next.len() > 0 {
+    if binary_content(&prior) || binary_content(&next) {
+      binary = true;
+      out.extend(&"Binary files differ\n".as_bytes());
+    } else {
+      out.extend(&"--- ".as_bytes());
+      if old_mode == 0 {
+        out.extend(&"/dev/null".as_bytes());
+      } else {
+        append_path(&mut out, 97, &path);
+      }
+      out.extend(&"\n+++ ".as_bytes());
+      if new_mode == 0 {
+        out.extend(&"/dev/null".as_bytes());
+      } else {
+        append_path(&mut out, 98, &path);
+      }
+      out.extend(&"\n@@ -".as_bytes());
+      append_range(&mut out, line_count(&prior));
+      out.extend(&" +".as_bytes());
+      append_range(&mut out, line_count(&next));
+      out.extend(&" @@\n".as_bytes());
+      append_lines(&mut out, 45, &prior);
+      append_lines(&mut out, 43, &next);
+    }
+  }
+  return binary;
+}
+
+fn file_patch(change: &Change, prior: &Bytes, next: &Bytes, budget: Int) -> Result<FileDiff, GitError>
+  intent "ファイルのモードと内容を統一差分で表す。バイナリは本文を省く"
+  requires none
+  ensures none
+  effects none
+{
+  if (prior.len() + next.len()) * 2 + change.path.as_bytes().len() * 16 + 512 > budget {
+    return Err(GitError.LimitExceeded("patch exceeds working memory limit"));
+  }
+  let mut out = Bytes.new();
+  let mut status = "M";
+  if change.hmode == 0 {
+    status = "A";
+  } else if change.tmode == 0 {
+    status = "D";
+  } else if change.hmode / 10000 != change.tmode / 10000 {
+    status = "T";
+  }
+  let mut binary = false;
+  if status == "T" {
+    let deleted = append_file_patch(&mut out, &change.path, change.hmode, 0, &prior, &Bytes.new(), true);
+    let added = append_file_patch(&mut out, &change.path, 0, change.tmode, &Bytes.new(), &next, true);
+    binary = deleted || added;
+  } else {
+    binary = append_file_patch(&mut out, &change.path, change.hmode, change.tmode, &prior, &next, change.hid != change.tid);
+  }
+  return Ok(FileDiff { path: change.path.clone(), old_mode: change.hmode, new_mode: change.tmode, status: status, binary: binary, patch: out });
+}
+
+fn patches(repo: &Repo, packs: &List<PackStore>, changes: &List<Change>, worktree: Bool) -> Result<List<FileDiff>, GitError>
+  intent "差分の一覧をパス順に生成する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut out = List.new();
+  let mut remaining = max_work_memory() / 2;
+  let mut i = 0;
+  while i < changes.len() {
+    match changes.get(i) {
+      None => {}
+      Some(change) => {
+        let mut prior = Bytes.new();
+        if change.hid != change.tid || change.hmode / 10000 != change.tmode / 10000 {
+          prior = read_blob(&repo, &packs, &change.hid)?;
+        }
+        let mut next = Bytes.new();
+        if change.tmode != 0 && (change.hid != change.tid || change.hmode / 10000 != change.tmode / 10000) {
+          if worktree {
+            let file = read_worktree_file(&repo.work_dir, &change.path)?;
+            let id = bytes_to_hex(&compute_object_id(&"blob", &file.content));
+            if id != change.tid || file.exec != (change.tmode == 100755) {
+              return Err(GitError.Conflict("work tree changed while computing diff"));
+            }
+            next = file.content;
+          } else {
+            next = read_blob(&repo, &packs, &change.tid)?;
+          }
+        }
+        let file_diff = file_patch(&change, &prior, &next, remaining)?;
+        remaining = remaining - file_diff.patch.len() - change.path.as_bytes().len() - 256;
+        out.push(file_diff);
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+pub fn diff_commits(repo: &Repo, left: &String, right: &String) -> Result<List<FileDiff>, GitError>
+  intent "二つのコミットの木の変更とパッチを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let packs = open_packs(&repo)?;
+  let before = commit_tree(&repo, &packs, &left)?;
+  let after = commit_tree(&repo, &packs, &right)?;
+  return diff_trees_in(&repo, &packs, &before, &after);
+}
+
+fn diff_trees_in(repo: &Repo, packs: &List<PackStore>, left: &String, right: &String) -> Result<List<FileDiff>, GitError>
+  intent "開いたオブジェクト格納先を使って木を比較する"
+  requires none
+  ensures none
+  effects fs
+{
+  let before = flatten_index_tree(&repo, &packs, &left)?;
+  let after = flatten_index_tree(&repo, &packs, &right)?;
+  return patches(&repo, &packs, &compute_changes(&before, &after), false);
+}
+
+pub fn diff_trees(repo: &Repo, left: &String, right: &String) -> Result<List<FileDiff>, GitError>
+  intent "二つの tree オブジェクトの変更とパッチを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let packs = open_packs(&repo)?;
+  return diff_trees_in(&repo, &packs, &left, &right);
+}
+
+pub fn diff_worktree(repo: &Repo, commit_id: &String) -> Result<List<FileDiff>, GitError>
+  intent "コミットと追跡対象の作業木を比較し、追跡外のパスは除く"
+  requires none
+  ensures none
+  effects fs
+{
+  if repo.bare {
+    return Err(GitError.UnsupportedFormat("a bare repository has no work tree"));
+  }
+  let packs = open_packs(&repo)?;
+  let before = flatten_commit(&repo, &packs, &commit_id)?;
+  let index = read_index(&repo)?;
+  let mut current = List.new();
+  let mut cache = new_cache();
+  let mut i = 0;
+  while i < index.len() {
+    match index.get(i) {
+      None => {}
+      Some(entry) => {
+        let probe = probe_path(&mut cache, &repo.work_dir, &entry.path)?;
+        if probe.blocker == "" && probe.kind == kind_file() {
+          let file = read_worktree_file(&repo.work_dir, &entry.path)?;
+          let mut mode = 100644;
+          if file.exec {
+            mode = 100755;
+          }
+          let id = bytes_to_hex(&compute_object_id(&"blob", &file.content));
+          current.push(new_index_entry(entry.path.clone(), mode, id));
+        } else if probe.blocker == "" && probe.kind != kind_missing() && probe.kind != kind_dir() {
+          return Err(GitError.UnsupportedEntry("work tree entry must be a regular file"));
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return patches(&repo, &packs, &compute_changes(&before, &sort_entries(&current)), true);
+}

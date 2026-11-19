@@ -18,6 +18,7 @@ pub enum GitError {
   RefMismatch(String),
   UnsupportedEntry(String),
   Conflict(String),
+  MultipleMergeBases(String),
 }
 
 pub fn error_kind_name(err: &GitError) -> String
@@ -40,6 +41,7 @@ pub fn error_kind_name(err: &GitError) -> String
     GitError.RefMismatch(_) => "RefMismatch",
     GitError.UnsupportedEntry(_) => "UnsupportedEntry",
     GitError.Conflict(_) => "Conflict",
+    GitError.MultipleMergeBases(_) => "MultipleMergeBases",
   };
 }
 
@@ -63,6 +65,7 @@ pub fn error_message(err: &GitError) -> String
     GitError.RefMismatch(msg) => msg.clone(),
     GitError.UnsupportedEntry(msg) => msg.clone(),
     GitError.Conflict(msg) => msg.clone(),
+    GitError.MultipleMergeBases(msg) => msg.clone(),
   };
 }
 

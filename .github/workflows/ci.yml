@@ -19,7 +19,7 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -42,7 +42,7 @@ jobs:
       - name: ネイティブ出力の前提
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+          sudo apt-get install -y --no-install-recommends gcc git libc6-dev
 
       - name: キャッシュの復元
         id: cache
@@ -65,6 +65,8 @@ jobs:
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
           SIGIL_REF: ${{ env.SIGIL_REF }}
+          STAGE5_GIT: /usr/bin/git
+          STAGE5_GIT_VERSION: 2.43.0
 
       - name: キャッシュの保存
         if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}

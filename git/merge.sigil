@@ -1,0 +1,404 @@
+module git.merge
+  targets server
+  trust none
+
+use git.checkout.TreeTransition;
+use git.checkout.compute_changes;
+use git.checkout.flatten_commit;
+use git.checkout.prepare_tree_transition;
+use git.checkout.publish_tree_transition;
+use git.commit.encode_commit;
+use git.commit.new_commit_object;
+use git.diff.binary_content;
+use git.diff.read_blob;
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.join_path;
+use git.fsio.lock_create;
+use git.fsio.lock_publish;
+use git.fsio.make_dirs;
+use git.fsio.parent_of;
+use git.fsio.remove_file_if_exists;
+use git.fsio.string_starts_with;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.index.IndexEntry;
+use git.index.copy_entry;
+use git.index.find_entry;
+use git.index.index_lock_path;
+use git.index.new_index_entry;
+use git.index.read_index;
+use git.index.sort_entries;
+use git.limits.max_object_size;
+use git.limits.max_work_memory;
+use git.lines.merge_lines;
+use git.object.ObjectType;
+use git.odb.odb_write;
+use git.odb.open_packs;
+use git.ops.Ident;
+use git.ops.build_tree;
+use git.ops.format_ident;
+use git.pack.PackStore;
+use git.refs.HeadState;
+use git.refs.read_head;
+use git.refs.read_ref;
+use git.repo.Repo;
+use git.walk.index_of;
+use git.walk.read_parents;
+use git.walk.topo_order;
+use git.worktree.rel_parent;
+
+pub enum ConflictKind {
+  Text,
+  Binary,
+  Mode,
+  AddAdd,
+  DeleteModify,
+  FileDirectory,
+}
+
+pub struct MergeConflict {
+  path: String,
+  kind: ConflictKind,
+}
+
+pub enum MergeResult {
+  Committed(String),
+  AlreadyUpToDate(String),
+  Conflicts(List<MergeConflict>),
+}
+
+struct PendingBlob {
+  content: Bytes,
+}
+
+struct MergePlan {
+  entries: List<IndexEntry>,
+  blobs: List<PendingBlob>,
+  conflicts: List<MergeConflict>,
+}
+
+pub fn merge_base(repo: &Repo, packs: &List<PackStore>, ours: &String, theirs: &String) -> Result<String, GitError>
+  intent "双方から到達可能なコミットのうち、他の共通祖先の祖先にならないものを一つ選ぶ"
+  requires none
+  ensures none
+  effects fs
+{
+  let left = topo_order(&repo, &packs, &ours)?;
+  let right = topo_order(&repo, &packs, &theirs)?;
+  let mut covered = Bytes.new();
+  let mut i = 0;
+  while i < left.len() {
+    covered.push(0);
+    i = i + 1;
+  }
+  let mut base = "";
+  i = 0;
+  while i < left.len() {
+    match left.get(i) {
+      None => {}
+      Some(id) => {
+        let ancestor = covered.get(i).unwrap_or(0) == 1;
+        let common = index_of(&right, &id) >= 0;
+        if common && !ancestor {
+          if base != "" {
+            return Err(GitError.MultipleMergeBases("more than one best common ancestor"));
+          }
+          base = id.clone();
+        }
+        if ancestor || common {
+          let parents = read_parents(&repo, &packs, &id)?;
+          let mut j = 0;
+          while j < parents.len() {
+            match parents.get(j) {
+              None => {}
+              Some(parent) => {
+                let _ = covered.set(index_of(&left, &parent), 1);
+              }
+            }
+            j = j + 1;
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if base == "" {
+    return Err(GitError.Conflict("histories have no common ancestor"));
+  }
+  return Ok(base);
+}
+
+fn entry(entries: &List<IndexEntry>, path: &String) -> IndexEntry
+  intent "指定されたパスを引き、存在しなければモード 0 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match entries.get(find_entry(&entries, &path)) {
+    Some(value) => copy_entry(&value),
+    None => new_index_entry(path.clone(), 0, ""),
+  };
+}
+
+fn equal_entry(a: &IndexEntry, b: &IndexEntry) -> Bool
+  intent "パスの内容とモードが等しいか調べる"
+  requires none
+  ensures none
+  effects none
+{
+  return a.mode == b.mode && a.id == b.id;
+}
+
+fn merge_path(repo: &Repo, packs: &List<PackStore>, base: &IndexEntry, left: &IndexEntry, right: &IndexEntry, plan: &mut MergePlan, retained: Int) -> Result<Int, GitError>
+  intent "ファイルの三方向併合を計画し、必要な blob または衝突を記録する"
+  requires none
+  ensures none
+  effects fs
+{
+  if equal_entry(&left, &right) || equal_entry(&base, &right) {
+    if left.mode != 0 {
+      plan.entries.push(copy_entry(&left));
+    }
+  } else if equal_entry(&base, &left) {
+    if right.mode != 0 {
+      plan.entries.push(copy_entry(&right));
+    }
+  } else {
+    let mut kind = ConflictKind.Text;
+    if left.mode == 0 || right.mode == 0 {
+      kind = ConflictKind.DeleteModify;
+    } else if base.mode == 0 {
+      kind = ConflictKind.AddAdd;
+    } else if left.mode != right.mode || (base.mode != 100644 && base.mode != 100755) || (left.mode != 100644 && left.mode != 100755) {
+      kind = ConflictKind.Mode;
+    } else {
+      let a = read_blob(&repo, &packs, &base.id)?;
+      let b = read_blob(&repo, &packs, &left.id)?;
+      let c = read_blob(&repo, &packs, &right.id)?;
+      if binary_content(&a) || binary_content(&b) || binary_content(&c) {
+        kind = ConflictKind.Binary;
+      } else {
+        match merge_lines(&a, &b, &c)? {
+          None => {}
+          Some(content) => {
+            if content.len() > max_object_size() || content.len() + retained > max_work_memory() / 8 {
+              return Err(GitError.LimitExceeded("merged blobs exceed working memory limit"));
+            }
+            let id = bytes_to_hex(&compute_object_id(&"blob", &content));
+            plan.entries.push(new_index_entry(left.path.clone(), left.mode, id));
+            let size = content.len();
+            plan.blobs.push(PendingBlob { content: content });
+            return Ok(retained + size);
+          }
+        }
+      }
+    }
+    plan.conflicts.push(MergeConflict { path: left.path.clone(), kind: kind });
+  }
+  return Ok(retained);
+}
+
+fn append_paths(out: &mut List<IndexEntry>, entries: &List<IndexEntry>, used: Int) -> Result<Int, GitError>
+  intent "作業メモリの範囲内で併合候補の一覧へパスを追加する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = used;
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      None => {}
+      Some(item) => {
+        bytes = bytes + item.path.as_bytes().len() + 256;
+        if bytes > max_work_memory() / 16 {
+          return Err(GitError.LimitExceeded("merge paths exceed working memory limit"));
+        }
+        out.push(copy_entry(&item));
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(bytes);
+}
+
+fn plan_merge(repo: &Repo, packs: &List<PackStore>, base: &List<IndexEntry>, left: &List<IndexEntry>, right: &List<IndexEntry>) -> Result<MergePlan, GitError>
+  intent "全パスの併合を計画し、ファイルとディレクトリの衝突も検出する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut all = List.new();
+  let bytes = append_paths(&mut all, &base, 0)?;
+  let used = append_paths(&mut all, &left, bytes)?;
+  append_paths(&mut all, &right, used)?;
+  let sorted = sort_entries(&all);
+  let mut plan = MergePlan { entries: List.new(), blobs: List.new(), conflicts: List.new() };
+  let mut seen = "";
+  let mut retained = 0;
+  let mut i = 0;
+  while i < sorted.len() {
+    match sorted.get(i) {
+      None => {}
+      Some(item) => {
+        if item.path != seen {
+          retained = merge_path(&repo, &packs, &entry(&base, &item.path), &entry(&left, &item.path), &entry(&right, &item.path), &mut plan, retained)?;
+          seen = item.path.clone();
+        }
+      }
+    }
+    i = i + 1;
+  }
+  i = 0;
+  while i < plan.entries.len() {
+    match plan.entries.get(i) {
+      None => {}
+      Some(item) => {
+        let mut parent = rel_parent(&item.path);
+        while parent != "" {
+          if find_entry(&plan.entries, &parent) >= 0 {
+            plan.conflicts.push(MergeConflict { path: parent.clone(), kind: ConflictKind.FileDirectory });
+            parent = "";
+          } else {
+            parent = rel_parent(&parent);
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(plan);
+}
+
+fn merge_locked(repo: &Repo, target: &String, author: &Ident, committer: &Ident, message: &Bytes, index_file: File, index_lock: &String) -> Result<MergeResult, GitError>
+  intent "index.lock を取得した状態で三方向併合を計画する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut branch = "";
+  match read_head(&repo)? {
+    HeadState.Symbolic(name) => {
+      branch = name;
+    }
+    HeadState.Detached(_) => {
+      return Err(GitError.UnsupportedFormat("merge requires a checked-out branch"));
+    }
+  }
+  if !string_starts_with(&branch, &"refs/heads/") {
+    return Err(GitError.UnsupportedFormat("merge requires a checked-out branch"));
+  }
+  let mut ours = "";
+  match read_ref(&repo, &branch)? {
+    Some(id) => {
+      ours = id;
+    }
+    None => {
+      return Err(GitError.NotFound("merge requires an existing branch tip"));
+    }
+  }
+  let packs = open_packs(&repo)?;
+  let base = merge_base(&repo, &packs, &ours, &target)?;
+  if base == target {
+    return Ok(MergeResult.AlreadyUpToDate(ours));
+  }
+  let left = flatten_commit(&repo, &packs, &ours)?;
+  let right = flatten_commit(&repo, &packs, &target)?;
+  let ancestor = flatten_commit(&repo, &packs, &base)?;
+  let plan = plan_merge(&repo, &packs, &ancestor, &left, &right)?;
+  if plan.conflicts.len() > 0 {
+    return Ok(MergeResult.Conflicts(plan.conflicts));
+  }
+  if compute_changes(&left, &read_index(&repo)?).len() != 0 {
+    return Err(GitError.Conflict("index does not match the current commit"));
+  }
+  let transition = prepare_tree_transition(&repo, &left, &plan.entries)?;
+  let path = join_path(&repo.git_dir, &branch);
+  let lock = cat3(&path, &".lock", &"");
+  make_dirs(&parent_of(&path))?;
+  let file = lock_create(&lock)?;
+  let outcome = publish_merge(&repo, &packs, &transition, &plan, &branch, &ours, &target, &author, &committer, &message, index_file, &index_lock, file, &path, &lock);
+  match outcome {
+    Err(_) => {
+      let _ = remove_file_if_exists(&lock);
+    }
+    Ok(_) => {}
+  }
+  return outcome;
+}
+
+fn publish_merge(repo: &Repo, packs: &List<PackStore>, transition: &TreeTransition, plan: &MergePlan, branch: &String, ours: &String, target: &String, author: &Ident, committer: &Ident, message: &Bytes, index_file: File, index_lock: &String, ref_file: File, path: &String, lock: &String) -> Result<MergeResult, GitError>
+  intent "旧ブランチを確認し、オブジェクト、作業木、索引、ブランチの順で併合を公開する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  match read_ref(&repo, &branch)? {
+    Some(id) => {
+      if id != ours {
+        return Err(GitError.RefMismatch("branch changed while planning merge"));
+      }
+    }
+    None => {
+      return Err(GitError.RefMismatch("branch was removed while planning merge"));
+    }
+  }
+  let a = format_ident(&author)?;
+  let c = format_ident(&committer)?;
+  let mut i = 0;
+  while i < plan.blobs.len() {
+    match plan.blobs.get(i) {
+      None => {}
+      Some(blob) => {
+        odb_write(&repo, &ObjectType.Blob, &blob.content)?;
+      }
+    }
+    i = i + 1;
+  }
+  let tree = build_tree(&repo, &plan.entries, 0, plan.entries.len(), 0)?;
+  let mut parents = List.new();
+  parents.push(ours.clone());
+  parents.push(target.clone());
+  let object = new_commit_object(tree, parents, a, c, List.new(), message.clone());
+  let id = odb_write(&repo, &ObjectType.Commit, &encode_commit(&object)?)?;
+  publish_tree_transition(&repo, &packs, &transition, index_file, &index_lock)?;
+  let data = cat3(&id, &"\n", &"").as_bytes();
+  lock_publish(ref_file, &data, &lock, &path, &parent_of(&path))?;
+  return Ok(MergeResult.Committed(id));
+}
+
+pub fn merge(repo: &Repo, target: &String, author: &Ident, committer: &Ident, message: &Bytes) -> Result<MergeResult, GitError>
+  intent "指定コミットを現在のブランチへ併合し、衝突一覧または二親コミットを返す"
+  requires none
+  ensures none
+  effects fs, random
+{
+  if repo.bare {
+    return Err(GitError.UnsupportedFormat("a bare repository has no work tree"));
+  }
+  let head_lock = join_path(&repo.git_dir, &"HEAD.lock");
+  let head_file = lock_create(&head_lock)?;
+  let outcome = merge_with_index(&repo, &target, &author, &committer, &message);
+  let _ = head_file.close();
+  let _ = remove_file_if_exists(&head_lock);
+  return outcome;
+}
+
+fn merge_with_index(repo: &Repo, target: &String, author: &Ident, committer: &Ident, message: &Bytes) -> Result<MergeResult, GitError>
+  intent "HEAD のロックを保持したまま、索引のロックを取得して併合する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let lock = index_lock_path(&repo);
+  let file = lock_create(&lock)?;
+  let outcome = merge_locked(&repo, &target, &author, &committer, &message, file, &lock);
+  match outcome {
+    Ok(MergeResult.Committed(_)) => {}
+    _ => {
+      let _ = remove_file_if_exists(&lock);
+    }
+  }
+  return outcome;
+}

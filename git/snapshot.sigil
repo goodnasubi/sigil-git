@@ -1,0 +1,53 @@
+module git.snapshot
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.object.ObjectType;
+use git.odb.odb_read_in;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.repo.Repo;
+use git.walk.FlatEntry;
+use git.walk.commit_tree;
+use git.walk.flatten_tree;
+
+pub struct Snapshot {
+  entries: List<FlatEntry>,
+  packs: List<PackStore>,
+}
+
+pub fn snapshot(repo: &Repo, commit_id: &String) -> Result<Snapshot, GitError>
+  intent "コミットの木を作業木に書き出さずに開き、パス・モード・識別子を列挙する"
+  requires none
+  ensures none
+  effects fs
+{
+  let packs = open_packs(&repo)?;
+  let tree = commit_tree(&repo, &packs, &commit_id)?;
+  let entries = flatten_tree(&repo, &packs, &tree)?;
+  return Ok(Snapshot { entries: entries, packs: packs });
+}
+
+pub fn read_snapshot_blob(repo: &Repo, view: &Snapshot, index: Int) -> Result<Bytes, GitError>
+  intent "スナップショット中のファイルまたは symlink の blob を読み取る"
+  requires none
+  ensures none
+  effects fs
+{
+  match view.entries.get(index) {
+    None => {
+      return Err(GitError.NotFound("snapshot entry does not exist"));
+    }
+    Some(entry) => {
+      if entry.mode == 160000 {
+        return Err(GitError.UnsupportedEntry("gitlinks have no blob content"));
+      }
+      let object = odb_read_in(&repo, &view.packs, &entry.id)?;
+      return match object.obj_type {
+        ObjectType.Blob => Ok(object.content),
+        _ => Err(GitError.TypeMismatch("snapshot entry must point to a blob")),
+      };
+    }
+  }
+}

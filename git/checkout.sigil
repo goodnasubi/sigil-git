@@ -22,6 +22,8 @@ use git.index.read_index;
 use git.index.serialize_index;
 use git.index.sort_entries;
 use git.limits.max_index_entries;
+use git.limits.max_path_depth;
+use git.limits.max_work_memory;
 use git.object.ObjectType;
 use git.odb.odb_info;
 use git.odb.odb_read_in;
@@ -60,7 +62,7 @@ use git.worktree.write_worktree_file;
 // 中断しても、HEAD と索引は更新前のまま（または索引だけが先に進んだ状態）で、status は「HEAD の木と索引の差分」として観察でき、未保存の変更を失わない。
 // 強制する指定は初版に含めない。
 
-struct Change {
+pub struct Change {
   path: String,
   hmode: Int,
   hid: String,
@@ -68,13 +70,13 @@ struct Change {
   tid: String,
 }
 
-fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: &String, out: &mut List<IndexEntry>, depth: Int) -> Result<Bool, GitError>
+fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: &String, out: &mut List<IndexEntry>, depth: Int, budget: Int) -> Result<Int, GitError>
   intent "tree を再帰的に展開し、ディレクトリ以外のエントリを（mode・識別子つきで）out に積む。各パスは validate_path で検査し、名前が UTF-8 でなければ InvalidPath。エントリ数は 100000 まで、深さは 128 まで"
   requires none
   ensures none
   effects fs
 {
-  if depth > 128 {
+  if depth > max_path_depth() {
     return Err(GitError.LimitExceeded("tree is nested too deeply"));
   }
   let o = odb_read_in(&repo, &packs, &tree_id)?;
@@ -84,7 +86,12 @@ fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefi
       return Err(GitError.TypeMismatch("expected a tree"));
     }
   }
+  let cost = o.content.len() * 8;
+  if cost > budget {
+    return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
+  }
   let entries = decode_tree(&o.content)?;
+  let mut remaining = budget - cost;
   let mut i = 0;
   while i < entries.len() {
     match entries.get(i) {
@@ -105,33 +112,47 @@ fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefi
         let mode = entry_mode(&e);
         let id = bytes_to_hex(&entry_id(&e));
         if mode == 40000 {
-          flatten_checked(&repo, &packs, &id, &path, &mut out, depth + 1)?;
+          remaining = flatten_checked(&repo, &packs, &id, &path, &mut out, depth + 1, remaining)?;
         } else {
           if out.len() >= max_index_entries() {
             return Err(GitError.LimitExceeded("too many tree entries"));
           }
+          let entry_cost = path.as_bytes().len() + 256;
+          if entry_cost > remaining {
+            return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
+          }
+          remaining = remaining - entry_cost;
           out.push(new_index_entry(path, mode, id));
         }
       }
     }
     i = i + 1;
   }
-  return Ok(true);
+  return Ok(remaining + cost);
 }
 
-fn flatten_commit(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<List<IndexEntry>, GitError>
+pub fn flatten_commit(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<List<IndexEntry>, GitError>
   intent "commit の木を、パスのバイト順に整列したエントリの一覧にする"
   requires none
   ensures none
   effects fs
 {
   let tree_id = commit_tree(&repo, &packs, &commit_id)?;
+  return flatten_index_tree(&repo, &packs, &tree_id);
+}
+
+pub fn flatten_index_tree(repo: &Repo, packs: &List<PackStore>, tree_id: &String) -> Result<List<IndexEntry>, GitError>
+  intent "木をパスのバイト順に整列したエントリの一覧にする"
+  requires none
+  ensures none
+  effects fs
+{
   let mut out = List.new();
-  flatten_checked(&repo, &packs, &tree_id, &"", &mut out, 0)?;
+  flatten_checked(&repo, &packs, &tree_id, &"", &mut out, 0, max_work_memory() / 2)?;
   return Ok(sort_entries(&out));
 }
 
-fn compute_changes(h: &List<IndexEntry>, t: &List<IndexEntry>) -> List<Change>
+pub fn compute_changes(h: &List<IndexEntry>, t: &List<IndexEntry>) -> List<Change>
   intent "HEAD の木 h と切り替え先 t（どちらもパスで整列済み）を比べ、mode か識別子が違うパスを（パス順に）返す。mode 0 はそちらに無いことを表す"
   requires none
   ensures none
@@ -453,16 +474,19 @@ fn resolve_target(repo: &Repo, target: &String) -> Result<String, GitError>
   };
 }
 
-fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Result<String, GitError>
-  intent "index.lock を取得した状態で checkout する。事前の検査をすべて終えてから、削除・書き込み・索引の公開・HEAD の更新の順に進める"
+pub struct TreeTransition {
+  changes: List<Change>,
+  dels: List<String>,
+  swaps: List<String>,
+  data: Bytes,
+}
+
+pub fn prepare_tree_transition(repo: &Repo, h: &List<IndexEntry>, t: &List<IndexEntry>) -> Result<TreeTransition, GitError>
+  intent "保有中の index.lock の下で、作業木を変更せず木の切り替えを検査する"
   requires none
   ensures none
-  effects fs, random
+  effects fs
 {
-  let commit_id = resolve_target(&repo, &target)?;
-  let packs = open_packs(&repo)?;
-  let t = flatten_commit(&repo, &packs, &commit_id)?;
-  let h = head_entries(&repo, &packs)?;
   let index = read_index(&repo)?;
   let changes = compute_changes(&h, &t);
   // symlink・gitlink は作業木に作らない。切り替え先のどこかにあれば、実行前に全体を拒否する。
@@ -531,10 +555,19 @@ fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Resu
     return Err(GitError.LimitExceeded("too many index entries"));
   }
   let data = serialize_index(&next_sorted)?;
+  return Ok(TreeTransition { changes: changes, dels: dels, swaps: swaps, data: data });
+}
+
+pub fn publish_tree_transition(repo: &Repo, packs: &List<PackStore>, transition: &TreeTransition, f: File, lock: &String) -> Result<Bool, GitError>
+  intent "検査済みの変更を作業木と索引に公開する"
+  requires none
+  ensures none
+  effects fs, random
+{
   // 書き込みの前に、切り替え先の blob がすべて読めて blob であることを確かめる（欠落・破損・blob でない場合に、作業木を変えずに失敗するため）。
   let mut v = 0;
-  while v < changes.len() {
-    match changes.get(v) {
+  while v < transition.changes.len() {
+    match transition.changes.get(v) {
       None => {}
       Some(c) => {
         if c.tmode != 0 {
@@ -552,8 +585,8 @@ fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Resu
   }
   // ここから書き込み。まず削除、置き換えるディレクトリの片付け、次にファイルの書き込み。
   let mut d = 0;
-  while d < dels.len() {
-    match dels.get(d) {
+  while d < transition.dels.len() {
+    match transition.dels.get(d) {
       None => {}
       Some(path) => {
         remove_worktree_file(&repo.work_dir, &path)?;
@@ -562,8 +595,8 @@ fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Resu
     d = d + 1;
   }
   let mut s = 0;
-  while s < swaps.len() {
-    match swaps.get(s) {
+  while s < transition.swaps.len() {
+    match transition.swaps.get(s) {
       None => {}
       Some(path) => {
         remove_empty_tree(&repo.work_dir, &path, 0)?;
@@ -572,8 +605,8 @@ fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Resu
     s = s + 1;
   }
   let mut w = 0;
-  while w < changes.len() {
-    match changes.get(w) {
+  while w < transition.changes.len() {
+    match transition.changes.get(w) {
       None => {}
       Some(c) => {
         if c.tmode != 0 {
@@ -592,7 +625,22 @@ fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Resu
     w = w + 1;
   }
   // 索引を公開し、最後に HEAD を更新する。
-  lock_publish(f, &data, &lock, &index_path(&repo), &repo.git_dir)?;
+  lock_publish(f, &transition.data, &lock, &index_path(&repo), &repo.git_dir)?;
+  return Ok(true);
+}
+
+fn checkout_locked(repo: &Repo, target: &String, f: File, lock: &String) -> Result<String, GitError>
+  intent "index.lock を取得した状態で checkout する。事前の検査をすべて終えてから、削除・書き込み・索引の公開・HEAD の更新の順に進める"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let commit_id = resolve_target(&repo, &target)?;
+  let packs = open_packs(&repo)?;
+  let t = flatten_commit(&repo, &packs, &commit_id)?;
+  let h = head_entries(&repo, &packs)?;
+  let transition = prepare_tree_transition(&repo, &h, &t)?;
+  publish_tree_transition(&repo, &packs, &transition, f, &lock)?;
   if is_valid_hex_id(&target) {
     set_head_detached(&repo, &commit_id)?;
   } else {

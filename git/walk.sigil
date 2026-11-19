@@ -8,14 +8,19 @@ use git.commit.decode_commit;
 use git.error.GitError;
 use git.fsio.cat3;
 use git.hash.bytes_to_hex;
+use git.limits.max_history_ids;
+use git.limits.max_path_depth;
+use git.limits.max_work_memory;
 use git.object.ObjectType;
 use git.odb.odb_read_in;
+use git.odb.open_packs;
 use git.pack.PackStore;
 use git.repo.Repo;
 use git.tree.decode_tree;
 use git.tree.entry_id;
 use git.tree.entry_mode;
 use git.tree.entry_name;
+use git.validate.validate_path;
 
 // ADR 0047 決定 6-1 の「履歴・ls-tree -r・diff --name-status」を本物の Git と比べるための、読み取り専用の走査。
 // 履歴は git log --topo-order と同じ並び（子より先に親を出さない。LIFO）、tree の展開は git ls-tree -r と同じ並び、
@@ -28,28 +33,7 @@ pub struct FlatEntry {
   id: String,
 }
 
-fn walk_limit() -> Int
-  intent "走査する commit・tree エントリ数の上限 (20000) を返す"
-  requires none
-  ensures result == 20000
-  effects none
-{
-  return 20000;
-}
-
-fn at(l: &List<Int>, i: Int) -> Int
-  intent "整数のリストの i 番目を返す（範囲外は 0）"
-  requires none
-  ensures none
-  effects none
-{
-  return match l.get(i) {
-    Some(v) => v,
-    None => 0,
-  };
-}
-
-fn index_of(ids: &List<String>, id: &String) -> Int
+pub fn index_of(ids: &List<String>, id: &String) -> Int
   intent "ids の中の id の番号を返す。無ければ -1"
   requires none
   ensures none
@@ -107,7 +91,7 @@ fn get32(b: &Bytes, slot: Int) -> Int
 }
 
 pub fn topo_order(repo: &Repo, packs: &List<PackStore>, tip: &String) -> Result<List<String>, GitError>
-  intent "tip から辿れる commit を git log --topo-order と同じ並びで返す（子より先に親を出さない。LIFO で、親は書かれた順に積む）。commit が 20000 を超えたら LimitExceeded"
+  intent "tip から辿れる commit を git log --topo-order と同じ並びで返す（子より先に親を出さない。LIFO で、親は書かれた順に積む）。履歴または作業メモリの上限を超えたら LimitExceeded"
   requires none
   ensures none
   effects fs
@@ -115,11 +99,9 @@ pub fn topo_order(repo: &Repo, packs: &List<PackStore>, tip: &String) -> Result<
   let mut ids = List.new();
   let mut parent_ids = List.new();
   ids.push(tip.clone());
+  let mut retained = 256;
   let mut i = 0;
   while i < ids.len() {
-    if ids.len() > walk_limit() {
-      return Err(GitError.LimitExceeded("too many commits to walk"));
-    }
     let cid = match ids.get(i) {
       Some(x) => x.clone(),
       None => "",
@@ -133,6 +115,10 @@ pub fn topo_order(repo: &Repo, packs: &List<PackStore>, tip: &String) -> Result<
     }
     let c = decode_commit(&o.content)?;
     let ps = commit_parents(&c);
+    retained = retained + 64 + ps.len() * 128;
+    if retained > max_work_memory() / 2 {
+      return Err(GitError.LimitExceeded("history exceeds working memory limit"));
+    }
     parent_ids.push(ps.clone());
     let mut k = 0;
     while k < ps.len() {
@@ -140,6 +126,10 @@ pub fn topo_order(repo: &Repo, packs: &List<PackStore>, tip: &String) -> Result<
         None => {}
         Some(p) => {
           if index_of(&ids, &p) < 0 {
+            if ids.len() >= max_history_ids() || retained > max_work_memory() / 2 - 256 {
+              return Err(GitError.LimitExceeded("history exceeds identifier or memory limit"));
+            }
+            retained = retained + 256;
             ids.push(p.clone());
           }
         }
@@ -205,6 +195,9 @@ pub fn topo_order(repo: &Repo, packs: &List<PackStore>, tip: &String) -> Result<
       }
     }
   }
+  if out.len() != n {
+    return Err(GitError.Corrupt("cycle in commit history"));
+  }
   return Ok(out);
 }
 
@@ -220,13 +213,13 @@ fn join_rel(prefix: &String, name: &String) -> String
   return cat3(&prefix, &"/", &name);
 }
 
-fn flatten_into(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: &String, out: &mut List<FlatEntry>, depth: Int) -> Result<Bool, GitError>
+fn flatten_into(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: &String, out: &mut List<FlatEntry>, depth: Int, budget: Int) -> Result<Int, GitError>
   intent "tree を再帰的に展開し、ディレクトリ以外のエントリを tree の並びで out に積む"
   requires none
   ensures none
   effects fs
 {
-  if depth > 64 {
+  if depth > max_path_depth() {
     return Err(GitError.LimitExceeded("tree is nested too deeply"));
   }
   let o = odb_read_in(&repo, &packs, &tree_id)?;
@@ -236,29 +229,44 @@ fn flatten_into(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: 
       return Err(GitError.TypeMismatch("expected a tree"));
     }
   }
+  if o.content.len() * 8 > budget {
+    return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
+  }
   let entries = decode_tree(&o.content)?;
+  let mut remaining = budget - o.content.len() * 8;
   let mut i = 0;
   while i < entries.len() {
     match entries.get(i) {
       None => {}
       Some(e) => {
-        let name = entry_name(&e).to_string_utf8().unwrap_or("");
+        let mut name = "";
+        match entry_name(&e).to_string_utf8() {
+          Ok(value) => {
+            name = value;
+          }
+          Err(_) => {
+            return Err(GitError.InvalidPath("tree entry name is not valid UTF-8"));
+          }
+        }
         let path = join_rel(&prefix, &name);
+        validate_path(&path)?;
         let mode = entry_mode(&e);
         let id = bytes_to_hex(&entry_id(&e));
         if mode == 40000 {
-          flatten_into(&repo, &packs, &id, &path, &mut out, depth + 1)?;
+          remaining = flatten_into(&repo, &packs, &id, &path, &mut out, depth + 1, remaining)?;
         } else {
-          if out.len() > walk_limit() {
-            return Err(GitError.LimitExceeded("too many tree entries to list"));
+          let cost = path.as_bytes().len() + 256;
+          if cost > remaining {
+            return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
           }
+          remaining = remaining - cost;
           out.push(FlatEntry { path: path, mode: mode, id: id });
         }
       }
     }
     i = i + 1;
   }
-  return Ok(true);
+  return Ok(remaining + o.content.len() * 8);
 }
 
 pub fn flatten_tree(repo: &Repo, packs: &List<PackStore>, tree_id: &String) -> Result<List<FlatEntry>, GitError>
@@ -268,7 +276,7 @@ pub fn flatten_tree(repo: &Repo, packs: &List<PackStore>, tree_id: &String) -> R
   effects fs
 {
   let mut out = List.new();
-  flatten_into(&repo, &packs, &tree_id, &"", &mut out, 0)?;
+  flatten_into(&repo, &packs, &tree_id, &"", &mut out, 0, max_work_memory() / 2)?;
   return Ok(out);
 }
 
@@ -289,8 +297,8 @@ pub fn commit_tree(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> 
   return Ok(commit_tree_id(&c));
 }
 
-pub fn commit_first_parent(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<Option<String>, GitError>
-  intent "commit の最初の親を返す。無ければ None"
+pub fn read_parents(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<List<String>, GitError>
+  intent "commit の親をすべて返す"
   requires none
   ensures none
   effects fs
@@ -303,8 +311,17 @@ pub fn commit_first_parent(repo: &Repo, packs: &List<PackStore>, commit_id: &Str
     }
   }
   let c = decode_commit(&o.content)?;
-  let ps = commit_parents(&c);
-  return match ps.get(0) {
+  return Ok(commit_parents(&c));
+}
+
+pub fn commit_first_parent(repo: &Repo, packs: &List<PackStore>, commit_id: &String) -> Result<Option<String>, GitError>
+  intent "commit の最初の親を返す。無ければ None"
+  requires none
+  ensures none
+  effects fs
+{
+  let parents = read_parents(&repo, &packs, &commit_id)?;
+  return match parents.get(0) {
     Some(p) => Ok(Some(p.clone())),
     None => Ok(None),
   };
@@ -388,4 +405,14 @@ pub fn diff_name_status(a: &List<FlatEntry>, b: &List<FlatEntry>) -> List<String
     }
   }
   return out;
+}
+
+pub fn log(repo: &Repo, tip: &String) -> Result<List<String>, GitError>
+  intent "指定したコミットから辿れる識別子を位相順で返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let packs = open_packs(&repo)?;
+  return topo_order(&repo, &packs, &tip);
 }
