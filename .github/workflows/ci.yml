@@ -42,7 +42,23 @@ jobs:
       - name: ネイティブ出力の前提
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc git libc6-dev
+          sudo apt-get install -y --no-install-recommends gcc git libc6-dev make zlib1g-dev
+
+      - name: 第5段の比較用 Git の取得
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: git/git
+          ref: 564d0252ca632e0264ed670534a51d18a689ef5d # v2.43.0
+          path: stage5-git-src
+          persist-credentials: false
+
+      - name: 第5段の比較用 Git のビルド
+        working-directory: stage5-git-src
+        run: |
+          make -j"$(nproc)" prefix="$RUNNER_TEMP/stage5-git" \
+            NO_CURL=YesPlease NO_EXPAT=YesPlease NO_GETTEXT=YesPlease \
+            NO_OPENSSL=YesPlease NO_PERL=YesPlease NO_TCLTK=YesPlease install
+          "$RUNNER_TEMP/stage5-git/bin/git" --version
 
       - name: キャッシュの復元
         id: cache
@@ -65,7 +81,7 @@ jobs:
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
           SIGIL_REF: ${{ env.SIGIL_REF }}
-          STAGE5_GIT: /usr/bin/git
+          STAGE5_GIT: ${{ runner.temp }}/stage5-git/bin/git
           STAGE5_GIT_VERSION: 2.43.0
 
       - name: キャッシュの保存
