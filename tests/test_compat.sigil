@@ -1,0 +1,248 @@
+module tests.test_compat
+  targets server
+  trust none
+
+use git.fsio.join_path;
+use git.fsio.read_file_opt;
+use git.hash.hex_to_bytes;
+use git.inflate.inflate_zlib;
+use git.object.ObjectType;
+use git.object.header_obj_type;
+use git.object.verify_object_bytes;
+use git.pack.open_pack;
+use git.pack.pack_count;
+use git.pack.pack_id_at;
+use git.pack.pack_read;
+use git.refs.parse_packed_refs;
+
+pub fn run_compat_tests() -> Bool
+  intent "初版から保存した fixture（v1）を新しい reader が読めることを確認する（ADR 0047 決定 6-7 / ADR 0045 決定 4）"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let base = "fixtures/v1";
+
+  // 1. loose blob
+  match read_file_opt(&join_path(&base, &"blob.obj"), 1048576, false) {
+    Err(_) => {
+      console.log(&"FAIL: could not read blob.obj");
+      return false;
+    }
+    Ok(None) => {
+      console.log(&"FAIL: blob.obj not found");
+      return false;
+    }
+    Ok(Some(z)) => {
+      match inflate_zlib(&z, 0, 1048576) {
+        Err(_) => {
+          console.log(&"FAIL: inflate blob.obj");
+          return false;
+        }
+        Ok(inflated) => {
+          let raw_data = inflated.data;
+          let want_id = hex_to_bytes(&"2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4").unwrap_or(Bytes.new());
+          match verify_object_bytes(&raw_data, &want_id) {
+            Err(_) => {
+              console.log(&"FAIL: verify blob.obj");
+              return false;
+            }
+            Ok(hdr) => {
+              match header_obj_type(&hdr) {
+                ObjectType.Blob => {}
+                _ => {
+                  console.log(&"FAIL: blob.obj type");
+                  return false;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. loose tree
+  match read_file_opt(&join_path(&base, &"tree.obj"), 1048576, false) {
+    Err(_) => {
+      console.log(&"FAIL: could not read tree.obj");
+      return false;
+    }
+    Ok(None) => {
+      console.log(&"FAIL: tree.obj not found");
+      return false;
+    }
+    Ok(Some(z)) => {
+      match inflate_zlib(&z, 0, 1048576) {
+        Err(_) => {
+          console.log(&"FAIL: inflate tree.obj");
+          return false;
+        }
+        Ok(inflated) => {
+          let raw_data = inflated.data;
+          let want_id = hex_to_bytes(&"ea3b6ce0df88dc227083adba05c43d15da3a824a98da9bcaaf1930277fb07f30").unwrap_or(Bytes.new());
+          match verify_object_bytes(&raw_data, &want_id) {
+            Err(_) => {
+              console.log(&"FAIL: verify tree.obj");
+              return false;
+            }
+            Ok(hdr) => {
+              match header_obj_type(&hdr) {
+                ObjectType.Tree => {}
+                _ => {
+                  console.log(&"FAIL: tree.obj type");
+                  return false;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 3. loose commit
+  match read_file_opt(&join_path(&base, &"commit.obj"), 1048576, false) {
+    Err(_) => {
+      console.log(&"FAIL: could not read commit.obj");
+      return false;
+    }
+    Ok(None) => {
+      console.log(&"FAIL: commit.obj not found");
+      return false;
+    }
+    Ok(Some(z)) => {
+      match inflate_zlib(&z, 0, 1048576) {
+        Err(_) => {
+          console.log(&"FAIL: inflate commit.obj");
+          return false;
+        }
+        Ok(inflated) => {
+          let raw_data = inflated.data;
+          let want_id = hex_to_bytes(&"b1e071267937c1c2a8baa1a9ee2c6a448dc9e35685da97521b1f019e9d3e5fe6").unwrap_or(Bytes.new());
+          match verify_object_bytes(&raw_data, &want_id) {
+            Err(_) => {
+              console.log(&"FAIL: verify commit.obj");
+              return false;
+            }
+            Ok(hdr) => {
+              match header_obj_type(&hdr) {
+                ObjectType.Commit => {}
+                _ => {
+                  console.log(&"FAIL: commit.obj type");
+                  return false;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 4. loose tag
+  match read_file_opt(&join_path(&base, &"tag.obj"), 1048576, false) {
+    Err(_) => {
+      console.log(&"FAIL: could not read tag.obj");
+      return false;
+    }
+    Ok(None) => {
+      console.log(&"FAIL: tag.obj not found");
+      return false;
+    }
+    Ok(Some(z)) => {
+      match inflate_zlib(&z, 0, 1048576) {
+        Err(_) => {
+          console.log(&"FAIL: inflate tag.obj");
+          return false;
+        }
+        Ok(inflated) => {
+          let raw_data = inflated.data;
+          let want_id = hex_to_bytes(&"ffa044a306d0cebaa2987aadd19bd5de0aa1cdc6bf5bfc18e4f76094d3cb16b0").unwrap_or(Bytes.new());
+          match verify_object_bytes(&raw_data, &want_id) {
+            Err(_) => {
+              console.log(&"FAIL: verify tag.obj");
+              return false;
+            }
+            Ok(hdr) => {
+              match header_obj_type(&hdr) {
+                ObjectType.Tag => {}
+                _ => {
+                  console.log(&"FAIL: tag.obj type");
+                  return false;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 5. sample pack & idx
+  let idx_path = join_path(&base, &"sample.idx");
+  match open_pack(&idx_path) {
+    Err(_) => {
+      console.log(&"FAIL: could not open sample.idx / sample.pack");
+      return false;
+    }
+    Ok(pack) => {
+      let count = pack_count(&pack);
+      if count == 0 {
+        console.log(&"FAIL: pack object count is zero");
+        return false;
+      }
+      let mut i = 0;
+      while i < count {
+        match pack_id_at(&pack, i) {
+          Err(_) => {
+            console.log(&"FAIL: pack_id_at");
+            return false;
+          }
+          Ok(id_hex) => {
+            match pack_read(&pack, &id_hex) {
+              Err(_) => {
+                console.log(&"FAIL: pack_read");
+                return false;
+              }
+              Ok(None) => {
+                console.log(&"FAIL: pack_read returned None for indexed id");
+                return false;
+              }
+              Ok(Some(_)) => {}
+            }
+          }
+        }
+        i = i + 1;
+      }
+    }
+  }
+
+  // 6. packed-refs
+  match read_file_opt(&join_path(&base, &"packed-refs"), 1048576, false) {
+    Err(_) => {
+      console.log(&"FAIL: could not read packed-refs");
+      return false;
+    }
+    Ok(None) => {
+      console.log(&"FAIL: packed-refs not found");
+      return false;
+    }
+    Ok(Some(bytes)) => {
+      match parse_packed_refs(&bytes) {
+        Err(_) => {
+          console.log(&"FAIL: parse_packed_refs");
+          return false;
+        }
+        Ok(pr) => {
+          if pr.refs.len() == 0 {
+            console.log(&"FAIL: packed-refs has no refs");
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  return true;
+}

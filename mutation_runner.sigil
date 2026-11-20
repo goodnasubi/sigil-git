@@ -1,0 +1,86 @@
+module mutation_runner
+  targets server
+  trust none
+
+use tests.test_compat.run_compat_tests;
+use tests.test_fault.run_fault_tests;
+use tests.test_fuzz.run_fuzz_tests;
+use tests.test_object.run_object_tests;
+use tests.test_ops.run_ops_tests;
+use tests.test_validate.run_validate_tests;
+
+// 変異試験（tests/mutation/run.sh）の入口。
+// 変異を埋めたソースに対し、変異ごとに決めた試験群を実行する。
+// 戻り値 0 = 合格（変異が検出されなかった）、1 以上 = 試験が落ちた（変異を検出した）。
+
+pub fn fuzz() -> Int
+  intent "ファジング試験の実行"
+  requires none
+  ensures none
+  effects console
+{
+  if !run_fuzz_tests() {
+    return 1;
+  }
+  return 0;
+}
+
+pub fn fault() -> Int
+  intent "障害注入・永続化モデル試験の実行"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  if !run_fault_tests() {
+    return 2;
+  }
+  return 0;
+}
+
+pub fn compat() -> Int
+  intent "互換 fixture 試験の実行"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !run_compat_tests() {
+    return 3;
+  }
+  return 0;
+}
+
+pub fn ops() -> Int
+  intent "ops (index/add/commit/checkout) 試験の実行"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  if !run_ops_tests() {
+    return 4;
+  }
+  return 0;
+}
+
+pub fn validate() -> Int
+  intent "validate (パス・参照名検査) 試験の実行"
+  requires none
+  ensures none
+  effects none
+{
+  if !run_validate_tests() {
+    return 5;
+  }
+  return 0;
+}
+
+pub fn object() -> Int
+  intent "object & hash 試験の実行"
+  requires none
+  ensures none
+  effects none
+{
+  if !run_object_tests() {
+    return 6;
+  }
+  return 0;
+}

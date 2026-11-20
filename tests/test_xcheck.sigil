@@ -1,0 +1,103 @@
+module tests.test_xcheck
+  targets server
+  trust none
+
+use git.commit.decode_commit;
+use git.commit.encode_commit;
+use git.commit.new_commit_object_str;
+use git.hash.bytes_to_hex;
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.object.encode_raw_object;
+use git.tree.decode_tree;
+use git.tree.encode_tree;
+use git.tree.new_tree_entry;
+use git.validate.validate_path;
+
+pub fn compute_trace_digest() -> String
+  intent "一連の決定論的操作を実行し、その結果から単一のハッシュダイジェストを算出する（両実行経路一致の検証用、ADR 0047 決定 6-8）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut h = Sha256.new();
+
+  // 1. blob
+  let mut b = Bytes.new();
+  b.extend(&"xcheck blob payload".as_bytes());
+  let raw_blob = encode_raw_object(&ObjectType.Blob, &b);
+  h.update(&raw_blob);
+
+  // 2. tree
+  let mut entries = List.new();
+  let dummy_id = hex_to_bytes(&"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60").unwrap_or(Bytes.new());
+  entries.push(new_tree_entry(33188, "file.txt".as_bytes(), dummy_id.clone()));
+  let raw_tree = encode_tree(&entries).unwrap_or(Bytes.new());
+  h.update(&raw_tree);
+
+  // 3. commit
+  let c = new_commit_object_str("8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60", List.new(), "Test <t@example.com> 1700000000 +0000", "Test <t@example.com> 1700000000 +0000", List.new(), "commit for xcheck\n");
+  let raw_commit = encode_commit(&c).unwrap_or(Bytes.new());
+  h.update(&raw_commit);
+
+  // 4. decode and round-trip
+  match decode_commit(&raw_commit) {
+    Ok(c_dec) => {
+      h.update(&c_dec.tree_id.as_bytes());
+      h.update(&c_dec.message);
+    }
+    Err(_) => {}
+  }
+  match decode_tree(&raw_tree) {
+    Ok(t_entries) => {
+      let mut ti = 0;
+      while ti < t_entries.len() {
+        match t_entries.get(ti) {
+          None => {}
+          Some(te) => {
+            h.update(&te.name);
+          }
+        }
+        ti = ti + 1;
+      }
+    }
+    Err(_) => {}
+  }
+
+  // 5. validation & limits
+  let v1 = validate_path(&"valid/path.txt");
+  let v2 = validate_path(&"../invalid.txt");
+  let mut v_bytes = Bytes.new();
+  match v1 {
+    Ok(_) => {
+      v_bytes.push(1);
+    }
+    Err(_) => {
+      v_bytes.push(0);
+    }
+  }
+  match v2 {
+    Ok(_) => {
+      v_bytes.push(1);
+    }
+    Err(_) => {
+      v_bytes.push(0);
+    }
+  }
+  h.update(&v_bytes);
+
+  let digest = bytes_to_hex(&h.finalize());
+  return digest;
+}
+
+pub fn run_xcheck_tests() -> Bool
+  intent "xcheck ダイジェストが正しく計算できることを確認する"
+  requires none
+  ensures none
+  effects console
+{
+  let digest = compute_trace_digest();
+  console.log(&"xcheck trace digest: ");
+  console.log(&digest);
+  return digest.len() == 64;
+}

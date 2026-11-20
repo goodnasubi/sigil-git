@@ -1,0 +1,418 @@
+module tests.test_fuzz
+  targets server
+  trust none
+
+use git.commit.decode_commit;
+use git.index.parse_index;
+use git.inflate.inflate_zlib;
+use git.object.verify_object_bytes;
+use git.refs.parse_packed_refs;
+use git.tag.decode_tag;
+use git.tree.decode_tree;
+use git.validate.validate_path;
+use git.validate.validate_ref_name;
+
+struct Rng {
+  state: Int,
+}
+
+fn rng_new(seed: Int) -> Rng
+  intent "決定的シードから擬似乱数生成器を作成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut s = seed;
+  if s == 0 {
+    s = 1;
+  }
+  return Rng { state: s };
+}
+
+fn rng_next(rng: &mut Rng) -> Int
+  intent "次の擬似乱数を返す (0 <= n < 2147483647)"
+  requires none
+  ensures none
+  effects none
+{
+  let a = 1103515245;
+  let c = 12345;
+  let next_state = (rng.state * a + c) % 2147483647;
+  let mut s = next_state;
+  if s < 0 {
+    s = 0 - s;
+  }
+  rng.state = s;
+  return s;
+}
+
+fn rng_bytes(rng: &mut Rng, len: Int) -> Bytes
+  intent "指定長の擬似乱数バイト列を生成する"
+  requires len >= 0
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < len {
+    b.push(rng_next(&mut rng) % 256);
+    i = i + 1;
+  }
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// 1. 緩い形式のヘッダのファジング
+// ---------------------------------------------------------------------------
+fn fuzz_headers(rng: &mut Rng, iterations: Int) -> Bool
+  intent "ランダムバイト列および壊れたヘッダを検証し panic しないことを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  let dummy_id = rng_bytes(&mut rng, 32);
+  while i < iterations {
+    let len = rng_next(&mut rng) % 128;
+    let b = rng_bytes(&mut rng, len);
+    let _ = verify_object_bytes(&b, &dummy_id);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 2. tree のファジング
+// ---------------------------------------------------------------------------
+fn fuzz_trees(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた tree データを復号し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 256;
+    let b = rng_bytes(&mut rng, len);
+    let _ = decode_tree(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3. commit のファジング
+// ---------------------------------------------------------------------------
+fn fuzz_commits(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた commit データを復号し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 512;
+    let b = rng_bytes(&mut rng, len);
+    let _ = decode_commit(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4. tag のファジング
+// ---------------------------------------------------------------------------
+fn fuzz_tags(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた tag データを復号し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 512;
+    let b = rng_bytes(&mut rng, len);
+    let _ = decode_tag(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 5. inflate (zlib) のファジング
+// ---------------------------------------------------------------------------
+fn fuzz_inflate(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた zlib データを伸長し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 256;
+    let b = rng_bytes(&mut rng, len);
+    let _ = inflate_zlib(&b, 0, 4096);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 6. 索引 (index v2) のファジング
+// ---------------------------------------------------------------------------
+fn fuzz_index(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた index データを読み込み panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 512;
+    let b = rng_bytes(&mut rng, len);
+    let _ = parse_index(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 7. packed-refs のファジング
+// ---------------------------------------------------------------------------
+fn fuzz_packed_refs(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた packed-refs データを解析し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 512;
+    let b = rng_bytes(&mut rng, len);
+    let _ = parse_packed_refs(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 8. パスと参照名の検査のファジング
+// ---------------------------------------------------------------------------
+fn fuzz_paths_and_refs(rng: &mut Rng, iterations: Int) -> Bool
+  intent "ランダム文字列によるパスおよび参照名の検査"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 64;
+    let b = rng_bytes(&mut rng, len);
+    let s = b.to_string_utf8().unwrap_or("");
+    let _ = validate_path(&s);
+    let _ = validate_ref_name(&s);
+    i = i + 1;
+  }
+  return true;
+}
+
+fn path_fails(s: &String) -> Bool
+  intent "path が不正として拒否されたら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match validate_path(&s) {
+    Ok(_) => false,
+    Err(_) => true,
+  };
+}
+
+fn ref_fails(s: &String) -> Bool
+  intent "ref 名が不正として拒否されたら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match validate_ref_name(&s) {
+    Ok(_) => false,
+    Err(_) => true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 9. 固定の回帰例コーパス（悪意のある入力・境界値）
+// ---------------------------------------------------------------------------
+fn run_regression_corpus() -> Bool
+  intent "過去の脆弱性類似パターンや境界値コーパスを検査し、適切に拒否されることを確かめる"
+  requires none
+  ensures none
+  effects none
+{
+  // (a) パス検査の回帰例
+  if !path_fails(&"../escaped") {
+    return false;
+  }
+  if !path_fails(&"a/../../b") {
+    return false;
+  }
+  if !path_fails(&".git/config") {
+    return false;
+  }
+  if !path_fails(&"a/.git/hooks") {
+    return false;
+  }
+  if !path_fails(&"/absolute/path") {
+    return false;
+  }
+  if !path_fails(&"back\\slash") {
+    return false;
+  }
+  if !path_fails(&"") {
+    return false;
+  }
+  if !path_fails(&".") {
+    return false;
+  }
+  if !path_fails(&"..") {
+    return false;
+  }
+
+  // (b) 参照名の回帰例
+  if !ref_fails(&"refs/heads/..") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo.lock") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo@{bar") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo//bar") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo?bar") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo*bar") {
+    return false;
+  }
+  if !ref_fails(&"@") {
+    return false;
+  }
+  if !ref_fails(&"/refs/heads/foo") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo/") {
+    return false;
+  }
+
+  // (c) 壊れたヘッダ・構造
+  let mut bad_tree = Bytes.new();
+  bad_tree.push(49);  // '1'
+  bad_tree.push(48);  // '0'
+  bad_tree.push(48);  // '0'
+  bad_tree.push(54);  // '6'
+  bad_tree.push(52);  // '4'
+  bad_tree.push(32);  // ' '
+  bad_tree.push(97);  // 'a'
+  bad_tree.push(0);  // NUL
+  // SHA-256 (32 bytes) が欠落
+  match decode_tree(&bad_tree) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // (d) 壊れたコミット
+  let mut bad_commit = Bytes.new();
+  bad_commit.extend(&"tree invalid_hex\n\nmessage\n".as_bytes());
+  match decode_commit(&bad_commit) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // (e) 壊れたタグ
+  let mut bad_tag = Bytes.new();
+  bad_tag.extend(&"object 1234\ntype invalid\ntag v\ntagger T <t@example.com> 0 +0000\n\nmsg".as_bytes());
+  match decode_tag(&bad_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // (f) 壊れた packed-refs
+  let mut bad_pref = Bytes.new();
+  bad_pref.extend(&"not_a_valid_hash refs/heads/main\n".as_bytes());
+  match parse_packed_refs(&bad_pref) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  return true;
+}
+
+pub fn run_fuzz_tests() -> Bool
+  intent "第6段ファジング試験を実行する（ADR 0047 決定 6-6、シード: 20261120）"
+  requires none
+  ensures none
+  effects console
+{
+  let seed = 20261120;
+  let mut rng = rng_new(seed);
+  let iters = 100;
+
+  console.log(&"Fuzzing 1/8: object headers");
+  if !fuzz_headers(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 2/8: tree decoding");
+  if !fuzz_trees(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 3/8: commit decoding");
+  if !fuzz_commits(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 4/8: tag decoding");
+  if !fuzz_tags(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 5/8: inflate zlib");
+  if !fuzz_inflate(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 6/8: index v2");
+  if !fuzz_index(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 7/8: packed-refs");
+  if !fuzz_packed_refs(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 8/8: paths and ref names");
+  if !fuzz_paths_and_refs(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing: regression corpus (malicious inputs & boundaries)");
+  if !run_regression_corpus() {
+    return false;
+  }
+
+  console.log(&"All fuzzing tests passed successfully");
+  return true;
+}

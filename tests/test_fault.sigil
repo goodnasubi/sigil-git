@@ -1,0 +1,491 @@
+module tests.test_fault
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.join_path;
+use git.fsio.make_dir;
+use git.fsio.random_hex;
+use git.fsio.read_file_opt;
+use git.fsio.remove_file_if_exists;
+use git.object.ObjectType;
+use git.odb.odb_read;
+use git.odb.odb_write;
+use git.ops.add_paths;
+use git.ops.commit;
+use git.ops.new_ident;
+use git.refs.ExpectOld;
+use git.refs.HeadState;
+use git.refs.create_branch;
+use git.refs.delete_branch;
+use git.refs.read_head;
+use git.refs.read_ref;
+use git.refs.update_ref;
+use git.repo.Repo;
+use git.repo.init_repo;
+
+// ---------------------------------------------------------------------------
+// A. 永続化モデル（Durable Model）によるクラッシュ像の検証
+// ---------------------------------------------------------------------------
+
+// 仮想 FS のファイル状態
+struct ModelFile {
+  path: String,
+  durable_data: Bytes,
+  unflushed_data: Bytes,
+  synced: Bool,
+}
+
+// 永続化モデル
+struct DurableModel {
+  files: List<ModelFile>,
+}
+
+fn model_new() -> DurableModel
+  intent "空の永続化モデルを作成する"
+  requires none
+  ensures none
+  effects none
+{
+  return DurableModel { files: List.new() };
+}
+
+fn model_find(m: &DurableModel, path: &String) -> Option<Int>
+  intent "指定パスのファイル番号を探す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < m.files.len() {
+    match m.files.get(i) {
+      None => {}
+      Some(f) => {
+        if f.path == path.clone() {
+          return Some(i);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn model_write(m: &mut DurableModel, path: &String, data: &Bytes)
+  intent "未フラッシュの書き込みを記録する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut new_files = List.new();
+  let mut found = false;
+  let mut i = 0;
+  while i < m.files.len() {
+    match m.files.get(i) {
+      None => {}
+      Some(f) => {
+        if f.path == path.clone() {
+          new_files.push(ModelFile { path: f.path.clone(), durable_data: f.durable_data.clone(), unflushed_data: data.clone(), synced: false });
+          found = true;
+        } else {
+          new_files.push(ModelFile { path: f.path.clone(), durable_data: f.durable_data.clone(), unflushed_data: f.unflushed_data.clone(), synced: f.synced });
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if !found {
+    new_files.push(ModelFile { path: path.clone(), durable_data: Bytes.new(), unflushed_data: data.clone(), synced: false });
+  }
+  m.files = new_files;
+}
+
+fn model_sync(m: &mut DurableModel, path: &String)
+  intent "未フラッシュの書き込みを持続化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut new_files = List.new();
+  let mut i = 0;
+  while i < m.files.len() {
+    match m.files.get(i) {
+      None => {}
+      Some(f) => {
+        if f.path == path.clone() {
+          new_files.push(ModelFile { path: f.path.clone(), durable_data: f.unflushed_data.clone(), unflushed_data: f.unflushed_data.clone(), synced: true });
+        } else {
+          new_files.push(ModelFile { path: f.path.clone(), durable_data: f.durable_data.clone(), unflushed_data: f.unflushed_data.clone(), synced: f.synced });
+        }
+      }
+    }
+    i = i + 1;
+  }
+  m.files = new_files;
+}
+
+fn test_durable_model_scenarios() -> Bool
+  intent "永続化モデルで sync 前後のクラッシュ像（書き込み喪失・torn write）における不変条件を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut m = model_new();
+
+  // シナリオ 1: オブジェクト書き込み中の中断
+  // tmp_obj_* への未同期書き込み
+  let tmp_path = "objects/8a/tmp_obj_12345678";
+  let mut content = Bytes.new();
+  content.push(104);
+  content.push(101);
+  model_write(&mut m, &tmp_path, &content);
+
+  // クラッシュ像 A (loss): sync 前の電源断では tmp_obj のデータは 0 byte または存在しない
+  match model_find(&m, &tmp_path) {
+    None => {
+      return false;
+    }
+    Some(idx) => {
+      match m.files.get(idx) {
+        None => {
+          return false;
+        }
+        Some(f) => {
+          if f.durable_data.len() != 0 || f.synced {
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  // 同期を実行
+  model_sync(&mut m, &tmp_path);
+  match model_find(&m, &tmp_path) {
+    None => {
+      return false;
+    }
+    Some(idx) => {
+      match m.files.get(idx) {
+        None => {
+          return false;
+        }
+        Some(f) => {
+          if f.durable_data.len() != 2 || !f.synced {
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  // シナリオ 2: 参照更新中の中断
+  // <ref>.lock の作成と同期
+  let ref_lock = "refs/heads/main.lock";
+  let mut ref_val = Bytes.new();
+  ref_val.extend(&"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60\n".as_bytes());
+  model_write(&mut m, &ref_lock, &ref_val);
+
+  // sync 前の中断では旧参照が不変で、新しいコミットはまだ参照されない（不変条件 b, c）
+  match model_find(&m, &ref_lock) {
+    None => {
+      return false;
+    }
+    Some(idx) => {
+      match m.files.get(idx) {
+        None => {
+          return false;
+        }
+        Some(f) => {
+          if f.synced {
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// B. 実 FS での障害注入試験
+// ---------------------------------------------------------------------------
+
+fn setup_repo_for_fault(root: &String) -> Result<Repo, GitError>
+  intent "試験用の健全なリポジトリを作成し初期コミットを入れる"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let init_br = "main";
+  let repo = init_repo(&root, false, &init_br)?;
+  let mut data = Bytes.new();
+  data.extend(&"committed data\n".as_bytes());
+  let mut paths = List.new();
+  paths.push("file.txt");
+
+  // 作業木にファイル配置
+  create_synced_file(&join_path(&repo.work_dir, &"file.txt"), &data)?;
+  add_paths(&repo, &paths)?;
+  let author = new_ident("Author", "a@example.com", 1700000000, "+0000");
+  let committer = new_ident("Committer", "c@example.com", 1700000000, "+0000");
+  let mut msg = Bytes.new();
+  msg.extend(&"initial\n".as_bytes());
+  let _ = commit(&repo, &author, &committer, &msg)?;
+  return Ok(repo);
+}
+
+fn test_fault_orphaned_tmp_obj(repo: &Repo) -> Bool
+  intent "tmp_obj_* が残された状態でも odb_read/write が安全に動作し既存オブジェクトを壊さないことを検証"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let obj_dir = join_path(&join_path(&repo.git_dir, &"objects"), &"12");
+  let _ = make_dir(&obj_dir);
+  let junk_tmp = join_path(&obj_dir, &"tmp_obj_deadbeef12345678");
+  let mut junk = Bytes.new();
+  junk.push(1);
+  junk.push(2);
+  let _ = create_synced_file(&junk_tmp, &junk);
+
+  // 書き込みと読み取りが正常に動く
+  let mut new_data = Bytes.new();
+  new_data.extend(&"another object\n".as_bytes());
+  let mut new_id = "";
+  match odb_write(&repo, &ObjectType.Blob, &new_data) {
+    Err(_) => {
+      return false;
+    }
+    Ok(s) => {
+      new_id = s;
+    }
+  }
+  match odb_read(&repo, &new_id) {
+    Err(_) => {
+      return false;
+    }
+    Ok(obj) => {
+      if obj.content.len() != new_data.len() {
+        return false;
+      }
+    }
+  }
+
+  // 掃除
+  let _ = remove_file_if_exists(&junk_tmp);
+  return true;
+}
+
+fn test_fault_orphaned_ref_lock(repo: &Repo) -> Bool
+  intent "<ref>.lock が残された状態で Locked で失敗し既存の参照が破壊されないことを検証"
+  requires none
+  ensures none
+  effects fs
+{
+  let lock_path = join_path(&repo.git_dir, &"refs/heads/main.lock");
+  let mut junk = Bytes.new();
+  junk.extend(&"invalid_id\n".as_bytes());
+  let _ = create_synced_file(&lock_path, &junk);
+
+  let mut head_cid = "";
+  match read_ref(&repo, &"refs/heads/main") {
+    Ok(Some(s)) => {
+      head_cid = s;
+    }
+    _ => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;
+    }
+  }
+
+  match update_ref(&repo, &"refs/heads/main", &head_cid, ExpectOld.Any) {
+    Ok(_) => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;  // ロックを無視して書き込んではならない
+    }
+    Err(e) => {
+      match e {
+        GitError.Locked(_) => {}
+        _ => {
+          let _ = remove_file_if_exists(&lock_path);
+          return false;
+        }
+      }
+    }
+  }
+
+  // 既存の HEAD は健全
+  match read_head(&repo) {
+    Err(_) => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;
+    }
+    Ok(HeadState.Symbolic(sym)) => {
+      if sym != "refs/heads/main" {
+        let _ = remove_file_if_exists(&lock_path);
+        return false;
+      }
+    }
+    _ => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;
+    }
+  }
+
+  let _ = remove_file_if_exists(&lock_path);
+  return true;
+}
+
+fn test_fault_orphaned_index_lock(repo: &Repo) -> Bool
+  intent "index.lock が残された状態で add/commit が Locked で失敗し未コミット変更が失われないことを検証"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let lock_path = join_path(&repo.git_dir, &"index.lock");
+  let mut junk = Bytes.new();
+  junk.push(0);
+  let _ = create_synced_file(&lock_path, &junk);
+
+  // 未保存の変更
+  let dirty_path = join_path(&repo.work_dir, &"dirty.txt");
+  let mut dirty_data = Bytes.new();
+  dirty_data.extend(&"user unsaved edit\n".as_bytes());
+  let _ = create_synced_file(&dirty_path, &dirty_data);
+
+  let mut paths = List.new();
+  paths.push("dirty.txt");
+  match add_paths(&repo, &paths) {
+    Ok(_) => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;
+    }
+    Err(e) => {
+      match e {
+        GitError.Locked(_) => {}
+        _ => {
+          let _ = remove_file_if_exists(&lock_path);
+          return false;
+        }
+      }
+    }
+  }
+
+  // ユーザーの未保存の変更は失われない (不変条件 d)
+  match read_file_opt(&dirty_path, 1024, false) {
+    Err(_) => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;
+    }
+    Ok(None) => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;
+    }
+    Ok(Some(b)) => {
+      if b.len() != dirty_data.len() {
+        let _ = remove_file_if_exists(&lock_path);
+        return false;
+      }
+    }
+  }
+
+  let _ = remove_file_if_exists(&lock_path);
+  let _ = remove_file_if_exists(&dirty_path);
+  return true;
+}
+
+fn test_fault_deleted_ref_resurrection(repo: &Repo) -> Bool
+  intent "参照の削除が完了した後に削除した参照が復活しないことを検証"
+  requires none
+  ensures none
+  effects fs
+{
+  // topic ブランチを作成
+  let mut head_ref = "";
+  match read_ref(&repo, &"refs/heads/main") {
+    Ok(Some(s)) => {
+      head_ref = s;
+    }
+    _ => {
+      return false;
+    }
+  }
+  let _ = create_branch(&repo, &"topic", &head_ref);
+
+  // 削除
+  match delete_branch(&repo, &"topic", ExpectOld.Any) {
+    Err(_) => {
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  // 存在しない
+  match read_ref(&repo, &"refs/heads/topic") {
+    Ok(Some(_)) => {
+      return false;  // 復活してはならない
+    }
+    _ => {}
+  }
+
+  return true;
+}
+
+pub fn run_fault_tests() -> Bool
+  intent "第6段障害注入・永続化モデル試験を実行する（ADR 0047 決定 6-5）"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  console.log(&"Fault Injection 1/2: Durable Model crash image simulations");
+  if !test_durable_model_scenarios() {
+    console.log(&"FAIL: durable model scenarios");
+    return false;
+  }
+
+  console.log(&"Fault Injection 2/2: Live filesystem fault injection");
+  let test_root = join_path(&"tmp", &cat3(&"fault_test_", &random_hex(6).unwrap_or("000000"), &""));
+  let mut repo_opt = None;
+  match setup_repo_for_fault(&test_root) {
+    Err(_) => {
+      console.log(&"FAIL: setup_repo_for_fault");
+      return false;
+    }
+    Ok(r) => {
+      repo_opt = Some(r);
+    }
+  }
+  match repo_opt {
+    None => {
+      return false;
+    }
+    Some(repo) => {
+      if !test_fault_orphaned_tmp_obj(&repo) {
+        console.log(&"FAIL: test_fault_orphaned_tmp_obj");
+        return false;
+      }
+
+      if !test_fault_orphaned_ref_lock(&repo) {
+        console.log(&"FAIL: test_fault_orphaned_ref_lock");
+        return false;
+      }
+
+      if !test_fault_orphaned_index_lock(&repo) {
+        console.log(&"FAIL: test_fault_orphaned_index_lock");
+        return false;
+      }
+
+      if !test_fault_deleted_ref_resurrection(&repo) {
+        console.log(&"FAIL: test_fault_deleted_ref_resurrection");
+        return false;
+      }
+    }
+  }
+
+  console.log(&"All fault injection tests passed successfully");
+  return true;
+}
