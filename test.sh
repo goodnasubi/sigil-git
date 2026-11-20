@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=== 1. Checking format (sigil fmt --check) ==="
-$SIGIL fmt --check git/*.sigil tests/*.sigil test_runner.sigil interop_make.sigil interop_delete.sigil interop_read.sigil interop_ops.sigil interop_history.sigil interop_transfer.sigil mutation_runner.sigil perf_runner.sigil
+$SIGIL fmt --check git/*.sigil tests/*.sigil test_runner.sigil interop_make.sigil interop_delete.sigil interop_read.sigil interop_ops.sigil interop_history.sigil interop_transfer.sigil upload_server.sigil mutation_runner.sigil perf_runner.sigil
 
 echo "=== 2. Type checking (sigil check) ==="
 $SIGIL check --root . test_runner.sigil
@@ -29,6 +29,7 @@ $SIGIL check --root . interop_read.sigil
 $SIGIL check --root . interop_ops.sigil
 $SIGIL check --root . interop_history.sigil
 $SIGIL check --root . interop_transfer.sigil
+$SIGIL check --root . upload_server.sigil
 $SIGIL check --root . mutation_runner.sigil
 $SIGIL check --root . perf_runner.sigil
 for f in git/*.sigil tests/*.sigil; do
@@ -65,6 +66,7 @@ SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_ops.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_history.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_transfer.sh
+SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_upload.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" bash tests/fault_interop.sh
 # Issue #634: ステップ単位の強制終了・電源断の模擬、カーネル障害注入（Linux x86_64 の ptrace。他の環境では明示的に失敗する）
 # tmpfs の本物の ENOSPC には root か sudo -n が要る。権限が無い手元の環境では、警告を出してその部分だけを省く。

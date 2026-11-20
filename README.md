@@ -105,6 +105,13 @@ SHA-256 のリポジトリで、`add` → `commit` → `checkout` の一連が�
 - `git/wirepack.sigil`: 明示した識別子の集合から、非 thin・非 delta・zlib stored の pack v2 を作ります（転送の応答専用。ローカルへは保存しません）。
 - 上限（`git/limits.sigil`）: pkt-line 65520 byte、オブジェクト 4096、応答 1 MiB、広告する参照 1024、グラフ走査 100000 件。超えるときは自動分割も再試行もせず `LimitExceeded` です。
 
+## 転送 第2段「upload-pack」（ADR 0048、Issue #11）
+
+スマート HTTP v0 の upload-pack（参照広告、want／have／done、wire 専用 pack v2 応答、gzip 要求）です。詳細は [docs/UPLOAD_PACK.md](docs/UPLOAD_PACK.md)。
+
+- `git/upload.sigil`、`git/gzip.sigil`、`git/crc32.sigil`、`git/acl.sigil`、`upload_server.sigil`（HMAC Bearer・固定 ACL の HTTP サーバー）。
+- 実 Git の確認: `SIGIL=... STAGE5_GIT=... ./interop_upload.sh`
+
 ## テストの実行
 
 前提として、Sigil コンパイラ（固定版コミット `33467e3b43238fdc69331c58a788c95f1de393e5`）が利用可能である必要があります。
