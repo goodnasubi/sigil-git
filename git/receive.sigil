@@ -18,6 +18,7 @@ use git.fsio.make_dirs;
 use git.fsio.random_hex;
 use git.fsio.read_file_opt;
 use git.fsio.remove_file_if_exists;
+use git.fsio.string_ends_with;
 use git.gzip.select_encoding;
 use git.gzip.trimmed_lower;
 use git.hash.bytes_to_hex;
@@ -26,6 +27,9 @@ use git.limits.max_advertised_refs;
 use git.limits.max_graph_walk_items;
 use git.limits.max_transfer_objects;
 use git.limits.max_transfer_response_size;
+use git.meta.meta_can_read;
+use git.meta.meta_can_write;
+use git.meta.parse_meta;
 use git.object.ObjectType;
 use git.odb.odb_read_in;
 use git.odb.odb_write;
@@ -710,6 +714,30 @@ fn write_status(wc: &WriteCheck) -> Int
       return 0;
     }
     return 403;
+  }
+  if string_ends_with(&wc.acl_path, &"sigil-metadata") {
+    let bytes = match read_file_opt(&wc.acl_path, 16384, false) {
+      Ok(Some(b)) => b,
+      _ => Bytes.new(),
+    };
+    match parse_meta(&bytes, &wc.repo_id) {
+      Err(_) => {
+        return 404;
+      }
+      Ok(meta) => {
+        let opt_sub = match wc.subject.len() > 0 {
+          true => Some(wc.subject.clone()),
+          false => None,
+        };
+        if !meta_can_read(&meta, &opt_sub) {
+          return 404;
+        }
+        if !meta_can_write(&meta, &opt_sub) {
+          return 403;
+        }
+        return 0;
+      }
+    }
   }
   let text = match read_file_opt(&wc.acl_path, 65536, false) {
     Ok(Some(b)) => b.to_string_utf8().unwrap_or(""),

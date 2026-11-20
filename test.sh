@@ -68,6 +68,7 @@ SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_transfer.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_upload.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_receive.sh
+SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_meta.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" bash tests/fault_interop.sh
 # Issue #634: ステップ単位の強制終了・電源断の模擬、カーネル障害注入（Linux x86_64 の ptrace。他の環境では明示的に失敗する）
 # tmpfs の本物の ENOSPC には root か sudo -n が要る。権限が無い手元の環境では、警告を出してその部分だけを省く。

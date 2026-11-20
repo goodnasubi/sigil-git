@@ -1,0 +1,697 @@
+module tests.test_meta
+  targets server
+  trust none
+
+use git.acl.parse_fixed_acl;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.file_exists;
+use git.fsio.join_path;
+use git.fsio.lock_create;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.fsio.remove_file_if_exists;
+use git.meta.backup_repo;
+use git.meta.calc_repo_storage;
+use git.meta.can_manage;
+use git.meta.can_read;
+use git.meta.can_write;
+use git.meta.create_repo_managed;
+use git.meta.empty_meta;
+use git.meta.empty_usage;
+use git.meta.escape_json_string;
+use git.meta.json_quote;
+use git.meta.list_accessible_repos;
+use git.meta.load_meta;
+use git.meta.meta_to_json;
+use git.meta.new_meta;
+use git.meta.parse_meta;
+use git.meta.ref_name_safe;
+use git.meta.restore_repo;
+use git.meta.save_meta_atomic;
+use git.meta.serialize_meta;
+use git.meta.update_acl_managed;
+use git.meta.update_default_branch_managed;
+use git.meta.update_visibility_managed;
+use git.repo.init_repo;
+
+// ADR 0048 決定 3: リポジトリの metadata・ACL・管理操作・バックアップ復元の単体テスト。
+
+fn fail(label: &String) -> Bool
+  intent "失敗したラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&cat3(&"  FAILED: ", &label, &""));
+  return false;
+}
+
+fn expect(cond: Bool, label: &String) -> Bool
+  intent "cond が偽ならラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  if !cond {
+    return fail(&label);
+  }
+  return true;
+}
+
+fn test_parse_fixed_acl_empty_subjects() -> Bool
+  intent "parse_fixed_acl で主体名が空の行（=rw 等）が確実に拒否されることの検証（P2 宿題）"
+  requires none
+  ensures none
+  effects console
+{
+  if !expect(parse_fixed_acl(&"=rw").is_err(), &"parse_fixed_acl =rw should err") {
+    return false;
+  }
+  if !expect(parse_fixed_acl(&"repo:=rw").is_err(), &"parse_fixed_acl repo:=rw should err") {
+    return false;
+  }
+  if !expect(parse_fixed_acl(&"repo:alice,=rw").is_err(), &"parse_fixed_acl repo:alice,=rw should err") {
+    return false;
+  }
+  if !expect(parse_fixed_acl(&"repo:alice=").is_err(), &"parse_fixed_acl repo:alice= should err") {
+    return false;
+  }
+  if !expect(parse_fixed_acl(&"repo:alice,,bob").is_err(), &"parse_fixed_acl repo:alice,,bob should err") {
+    return false;
+  }
+  if !expect(parse_fixed_acl(&"repo:").is_err(), &"parse_fixed_acl repo: should err") {
+    return false;
+  }
+  if !expect(parse_fixed_acl(&":alice").is_err(), &"parse_fixed_acl :alice should err") {
+    return false;
+  }
+  if !expect(parse_fixed_acl(&"repo:alice=rw;repo2:bob").is_ok(), &"parse_fixed_acl valid should ok") {
+    return false;
+  }
+  return true;
+}
+
+fn test_parse_and_serialize_meta() -> Bool
+  intent "metadata のパースとシリアライズ、正常系と異常系の検証"
+  requires none
+  ensures none
+  effects console
+{
+  let mut owners = List.new();
+  owners.push("alice");
+  owners.push("bob");
+  let mut writers = List.new();
+  writers.push("charlie");
+  let mut readers = List.new();
+  readers.push("david");
+
+  let meta = new_meta(&"my-repo", 1, &"private", &"main", &owners, &writers, &readers);
+
+  let bytes = serialize_meta(&meta);
+  let mut parsed = empty_meta();
+  match parse_meta(&bytes, &"my-repo") {
+    Ok(m) => {
+      parsed = m;
+    }
+    Err(_) => {
+      return fail(&"serialize -> parse failed");
+    }
+  }
+
+  if !expect(parsed.id == "my-repo", &"parsed id") {
+    return false;
+  }
+  if !expect(parsed.version == 1, &"parsed version") {
+    return false;
+  }
+  if !expect(parsed.visibility == "private", &"parsed visibility") {
+    return false;
+  }
+  if !expect(parsed.default_branch == "main", &"parsed default branch") {
+    return false;
+  }
+  if !expect(parsed.owners.len() == 2, &"parsed owners len") {
+    return false;
+  }
+  if !expect(parsed.writers.len() == 1, &"parsed writers len") {
+    return false;
+  }
+  if !expect(parsed.readers.len() == 1, &"parsed readers len") {
+    return false;
+  }
+
+  // 負例: 不明版
+  let bad_ver = "version=2\nid=r\nvisibility=private\ndefault_branch=main\nowners=alice\n".as_bytes();
+  if !expect(parse_meta(&bad_ver, &"r").is_err(), &"unknown version rejected") {
+    return false;
+  }
+
+  // 負例: 不正可視性
+  let bad_vis = "version=1\nid=r\nvisibility=invalid\ndefault_branch=main\nowners=alice\n".as_bytes();
+  if !expect(parse_meta(&bad_vis, &"r").is_err(), &"invalid visibility rejected") {
+    return false;
+  }
+
+  // 負例: owner が 0 人
+  let no_owner = "version=1\nid=r\nvisibility=private\ndefault_branch=main\nowners=\n".as_bytes();
+  if !expect(parse_meta(&no_owner, &"r").is_err(), &"zero owners rejected") {
+    return false;
+  }
+
+  // 負例: 空の主体名
+  let empty_sub = "version=1\nid=r\nvisibility=private\ndefault_branch=main\nowners=alice,,bob\n".as_bytes();
+  if !expect(parse_meta(&empty_sub, &"r").is_err(), &"empty subject rejected") {
+    return false;
+  }
+
+  // 負例: ID 不一致
+  let id_mismatch = "version=1\nid=other\nvisibility=private\ndefault_branch=main\nowners=alice\n".as_bytes();
+  if !expect(parse_meta(&id_mismatch, &"expected").is_err(), &"id mismatch rejected") {
+    return false;
+  }
+
+  // 負例: 不正なブランチ名（ダブルクォートや制御文字）
+  let bad_branch = "version=1\nid=r\nvisibility=private\ndefault_branch=bad\"branch\nowners=alice\n".as_bytes();
+  if !expect(parse_meta(&bad_branch, &"r").is_err(), &"ref name with quote rejected") {
+    return false;
+  }
+  let bad_branch_slash = "version=1\nid=r\nvisibility=private\ndefault_branch=/main\nowners=alice\n".as_bytes();
+  if !expect(parse_meta(&bad_branch_slash, &"r").is_err(), &"ref name starting with / rejected") {
+    return false;
+  }
+
+  // 汎用パース (expected_id が空の場合は ID 一致チェックをスキップ)
+  if !expect(parse_meta(&bytes, &"").is_ok(), &"generic parse with empty expected_id succeeds") {
+    return false;
+  }
+
+  // 負例: 重複キー
+  let dup_key = "version=1\nid=r\nid=r\nvisibility=private\ndefault_branch=main\nowners=alice\n".as_bytes();
+  if !expect(parse_meta(&dup_key, &"r").is_err(), &"duplicate key rejected") {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_ref_name_safe_cases() -> Bool
+  intent "ref_name_safe の正例・負例の網羅検証"
+  requires none
+  ensures none
+  effects console
+{
+  if !expect(ref_name_safe(&"main"), &"main is safe") {
+    return false;
+  }
+  if !expect(ref_name_safe(&"refs/heads/main"), &"refs/heads/main is safe") {
+    return false;
+  }
+  if !expect(ref_name_safe(&"feature/user-auth-123"), &"feature branch is safe") {
+    return false;
+  }
+  if !expect(ref_name_safe(&"v1.0.0"), &"tag is safe") {
+    return false;
+  }
+  if !expect(!ref_name_safe(&""), &"empty ref is unsafe") {
+    return false;
+  }
+  if !expect(!ref_name_safe(&"main\"bad"), &"ref with quote is unsafe") {
+    return false;
+  }
+  if !expect(!ref_name_safe(&"main\\bad"), &"ref with backslash is unsafe") {
+    return false;
+  }
+  if !expect(!ref_name_safe(&"feature branch"), &"ref with space is unsafe") {
+    return false;
+  }
+  if !expect(!ref_name_safe(&"main\nbranch"), &"ref with newline is unsafe") {
+    return false;
+  }
+  if !expect(!ref_name_safe(&"main\rbranch"), &"ref with CR is unsafe") {
+    return false;
+  }
+  if !expect(!ref_name_safe(&"main\tbranch"), &"ref with tab is unsafe") {
+    return false;
+  }
+  return true;
+}
+
+fn test_json_escaping_cases() -> Bool
+  intent "JSON エスケープ処理の安全性とパース成功検証"
+  requires none
+  ensures none
+  effects console
+{
+  let raw_str = "hello \"world\" \n \r \t \\ end";
+  let escaped = escape_json_string(&raw_str);
+  if !expect(escaped.len() > raw_str.len(), &"escaped string length check") {
+    return false;
+  }
+  let quoted = json_quote(&raw_str);
+  match json.parse(&quoted.as_bytes()) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"json.parse on quoted string failed");
+    }
+  }
+
+  let mut owners = List.new();
+  owners.push("alice");
+  let meta = new_meta(&"my-repo", 1, &"private", &"main", &owners, &List.new(), &List.new());
+  let meta_json = meta_to_json(&meta);
+  match json.parse(&meta_json.as_bytes()) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"json.parse on meta_to_json failed");
+    }
+  }
+  return true;
+}
+
+fn test_permission_checks() -> Bool
+  intent "can_read / can_write / can_manage の権限表の検証"
+  requires none
+  ensures none
+  effects console
+{
+  let mut owners = List.new();
+  owners.push("alice");
+  let mut writers = List.new();
+  writers.push("bob");
+  let mut readers = List.new();
+  readers.push("charlie");
+
+  let priv_meta = new_meta(&"p", 1, &"private", &"main", &owners, &writers, &readers);
+
+  // private: 匿名は読めない
+  if !expect(!can_read(&priv_meta, &None), &"private anon cannot read") {
+    return false;
+  }
+  // private: 不明ユーザーは読めない
+  if !expect(!can_read(&priv_meta, &Some("dave")), &"private dave cannot read") {
+    return false;
+  }
+  // private: reader は読めるが書けない・管理できない
+  if !expect(can_read(&priv_meta, &Some("charlie")), &"private charlie can read") {
+    return false;
+  }
+  if !expect(!can_write(&priv_meta, &Some("charlie")), &"private charlie cannot write") {
+    return false;
+  }
+  if !expect(!can_manage(&priv_meta, &Some("charlie")), &"private charlie cannot manage") {
+    return false;
+  }
+
+  // private: writer は読めるし書けるが管理できない
+  if !expect(can_read(&priv_meta, &Some("bob")), &"private bob can read") {
+    return false;
+  }
+  if !expect(can_write(&priv_meta, &Some("bob")), &"private bob can write") {
+    return false;
+  }
+  if !expect(!can_manage(&priv_meta, &Some("bob")), &"private bob cannot manage") {
+    return false;
+  }
+
+  // private: owner はすべて可能
+  if !expect(can_read(&priv_meta, &Some("alice")), &"private alice can read") {
+    return false;
+  }
+  if !expect(can_write(&priv_meta, &Some("alice")), &"private alice can write") {
+    return false;
+  }
+  if !expect(can_manage(&priv_meta, &Some("alice")), &"private alice can manage") {
+    return false;
+  }
+
+  // public-read: 匿名も読めるが、書き込み・管理は不可
+  let mut p_owners = List.new();
+  p_owners.push("alice");
+  let empty_list = List.new();
+  let pub_meta = new_meta(&"pub", 1, &"public-read", &"main", &p_owners, &empty_list, &empty_list);
+
+  if !expect(can_read(&pub_meta, &None), &"public-read anon can read") {
+    return false;
+  }
+  if !expect(can_read(&pub_meta, &Some("stranger")), &"public-read stranger can read") {
+    return false;
+  }
+  if !expect(!can_write(&pub_meta, &None), &"public-read anon cannot write") {
+    return false;
+  }
+  if !expect(!can_write(&pub_meta, &Some("stranger")), &"public-read stranger cannot write") {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_lifecycle_and_management() -> Bool
+  intent "管理操作（作成、可視性、既定ブランチ、ACL変更、最後のowner保護、競合）の検証"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = cat3(&"tmp/test_meta_root_", &random_hex(8).unwrap_or("x"), &"");
+  make_dirs(&root).unwrap_or(true);
+
+  // 1. 作成: 非管理者の拒否
+  let non_admin = create_repo_managed(&root, &"repo1", &"alice", &"main", &"admin", &"bob");
+  if !expect(non_admin.is_err(), &"non-admin create rejected") {
+    return false;
+  }
+
+  // 2. 作成: 管理者の成功
+  let mut created = empty_meta();
+  match create_repo_managed(&root, &"repo1", &"alice", &"main", &"admin", &"admin") {
+    Ok(m) => {
+      created = m;
+    }
+    Err(_) => {
+      return fail(&"admin create repo failed");
+    }
+  }
+  if !expect(created.visibility == "private", &"new repo is private") {
+    return false;
+  }
+  if !expect(created.owners.len() == 1, &"new repo has 1 owner") {
+    return false;
+  }
+
+  // 3. 重複作成の競合 (409)
+  let dup = create_repo_managed(&root, &"repo1", &"alice", &"main", &"admin", &"admin");
+  if !expect(dup.is_err(), &"duplicate create conflict") {
+    return false;
+  }
+
+  // 4. 一覧: alice には見え、bob には見えない
+  let alice_list = list_accessible_repos(&root, &Some("alice"));
+  if !expect(alice_list.len() == 1, &"alice sees repo1") {
+    return false;
+  }
+  let bob_list = list_accessible_repos(&root, &Some("bob"));
+  if !expect(bob_list.len() == 0, &"bob does not see private repo1") {
+    return false;
+  }
+
+  // 5. 存在秘匿: 未知のリポジトリに対する更新要求は not_found
+  let vis_nonexistent = update_visibility_managed(&root, &"nonexistent", &"public-read", &"alice");
+  match vis_nonexistent {
+    Err(e) => {
+      if !expect(e == "not_found", &"nonexistent repo returns not_found") {
+        return false;
+      }
+    }
+    Ok(_) => {
+      return fail(&"nonexistent repo should fail");
+    }
+  }
+
+  // 6. 存在秘匿: private リポジトリへの未認可ユーザー（bob）からの更新要求は not_found（forbidden ではない）
+  let vis_bob = update_visibility_managed(&root, &"repo1", &"public-read", &"bob");
+  match vis_bob {
+    Err(e) => {
+      if !expect(e == "not_found", &"unauthorized bob receives not_found to hide existence") {
+        return false;
+      }
+    }
+    Ok(_) => {
+      return fail(&"bob should not succeed");
+    }
+  }
+
+  // 7. 可視性変更: owner (alice) の成功
+  let mut vis_alice = empty_meta();
+  match update_visibility_managed(&root, &"repo1", &"public-read", &"alice") {
+    Ok(m) => {
+      vis_alice = m;
+    }
+    Err(_) => {
+      return fail(&"alice change visibility failed");
+    }
+  }
+  if !expect(vis_alice.visibility == "public-read", &"visibility changed to public-read") {
+    return false;
+  }
+
+  // 可視性変更後は bob や匿名からも一覧に見える
+  let bob_list2 = list_accessible_repos(&root, &Some("bob"));
+  if !expect(bob_list2.len() == 1, &"bob sees public-read repo1") {
+    return false;
+  }
+
+  // 8. 既定ブランチ変更: 危険な名前の拒否
+  let bad_br_res = update_default_branch_managed(&root, &"repo1", &"bad\"branch", &"alice");
+  if !expect(bad_br_res.is_err(), &"unsafe default branch rejected") {
+    return false;
+  }
+
+  // 9. 既定ブランチ変更: 正常
+  let mut br_alice = empty_meta();
+  match update_default_branch_managed(&root, &"repo1", &"develop", &"alice") {
+    Ok(m) => {
+      br_alice = m;
+    }
+    Err(_) => {
+      return fail(&"alice change default branch failed");
+    }
+  }
+  if !expect(br_alice.default_branch == "develop", &"default branch changed") {
+    return false;
+  }
+
+  // 10. ACL 変更: 最後の owner を消す試みは拒否
+  let mut empty_owners = List.new();
+  let empty_own_res = update_acl_managed(&root, &"repo1", &empty_owners, &List.new(), &List.new(), &"alice");
+  if !expect(empty_own_res.is_err(), &"removing last owner rejected") {
+    return false;
+  }
+
+  // 11. ACL 変更: 正常追加（carol=owner, bob=writer, dave=reader）
+  let mut new_owners = List.new();
+  new_owners.push("alice");
+  new_owners.push("carol");
+  let mut new_writers = List.new();
+  new_writers.push("bob");
+  let mut new_readers = List.new();
+  new_readers.push("dave");
+  let mut acl_res = empty_meta();
+  match update_acl_managed(&root, &"repo1", &new_owners, &new_writers, &new_readers, &"alice") {
+    Ok(m) => {
+      acl_res = m;
+    }
+    Err(_) => {
+      return fail(&"acl update failed");
+    }
+  }
+  if !expect(acl_res.owners.len() == 2, &"two owners now") {
+    return false;
+  }
+  if !expect(acl_res.writers.len() == 1, &"one writer now") {
+    return false;
+  }
+  if !expect(acl_res.readers.len() == 1, &"one reader now") {
+    return false;
+  }
+
+  // 12. 可視性を private に戻し、閲覧権限しかない dave からの更新は forbidden (not_found ではない)
+  let _ = update_visibility_managed(&root, &"repo1", &"private", &"alice");
+  let vis_dave = update_visibility_managed(&root, &"repo1", &"public-read", &"dave");
+  match vis_dave {
+    Err(e) => {
+      if !expect(e == "forbidden", &"reader dave receives forbidden") {
+        return false;
+      }
+    }
+    Ok(_) => {
+      return fail(&"reader dave should fail");
+    }
+  }
+
+  // 10. 排他ロック競合: ロック中の更新は conflict
+  let repo_dir = cat3(&cat3(&root, &"/", &"repo1"), &".git", &"");
+  let lock_path = join_path(&repo_dir, &"sigil-receive.lock");
+  match lock_create(&lock_path) {
+    Ok(lf) => {
+      let race_vis = update_visibility_managed(&root, &"repo1", &"private", &"alice");
+      if !expect(race_vis.is_err(), &"racing visibility update returns conflict") {
+        let _ = lf.close();
+        let _ = remove_file_if_exists(&lock_path);
+        return false;
+      }
+      let _ = lf.close();
+      let _ = remove_file_if_exists(&lock_path);
+    }
+    Err(_) => {
+      return fail(&"lock_create failed");
+    }
+  }
+
+  // 11. 使用量計測
+  let mut usage = empty_usage();
+  match calc_repo_storage(&repo_dir) {
+    Ok(u) => {
+      usage = u;
+    }
+    Err(_) => {
+      return fail(&"calc_repo_storage failed");
+    }
+  }
+  if !expect(usage.usage_bytes > 0, &"storage bytes > 0") {
+    return false;
+  }
+  if !expect(usage.max_objects == 4096, &"max_objects 4096") {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_backup_and_restore() -> Bool
+  intent "排他バックアップと完全性印、復元の検証"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = cat3(&"tmp/test_backup_root_", &random_hex(8).unwrap_or("y"), &"");
+  make_dirs(&root).unwrap_or(true);
+  let repo_dir = cat3(&cat3(&root, &"/", &"orig"), &".git", &"");
+  match init_repo(&repo_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo failed");
+    }
+  }
+
+  let mut owners = List.new();
+  owners.push("alice");
+  let empty_list = List.new();
+  let meta = new_meta(&"orig", 1, &"private", &"main", &owners, &empty_list, &empty_list);
+  match save_meta_atomic(&repo_dir, &meta) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"save_meta_atomic failed");
+    }
+  }
+
+  // packed-refs の作成とバックアップ・復元の検証
+  let packed_path = join_path(&repo_dir, &"packed-refs");
+  let _ = create_synced_file(&packed_path, &"# pack-refs with: sorted-packed tags\n1111111111111111111111111111111111111111 refs/tags/v1.0.0\n".as_bytes());
+
+  let backup_dir = cat3(&root, &"/backup", &"");
+  match backup_repo(&repo_dir, &backup_dir) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"backup_repo failed");
+    }
+  }
+
+  // 完了印があること
+  let mark = join_path(&backup_dir, &"sigil-backup.complete");
+  if !expect(file_exists(&mark).unwrap_or(false), &"backup complete marker exists") {
+    return false;
+  }
+
+  // バックアップ先に packed-refs があること
+  if !expect(file_exists(&join_path(&backup_dir, &"packed-refs")).unwrap_or(false), &"backup copied packed-refs") {
+    return false;
+  }
+
+  // 復元
+  let restore_dir = cat3(&root, &"/restored.git", &"");
+  match restore_repo(&backup_dir, &restore_dir) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"restore_repo failed");
+    }
+  }
+
+  // 復元先に packed-refs があること
+  if !expect(file_exists(&join_path(&restore_dir, &"packed-refs")).unwrap_or(false), &"restore copied packed-refs") {
+    return false;
+  }
+
+  // 復元された metadata の検証
+  let mut restored_meta = empty_meta();
+  match load_meta(&restore_dir, &"orig") {
+    Ok(m) => {
+      restored_meta = m;
+    }
+    Err(_) => {
+      return fail(&"load_meta on restored repo failed");
+    }
+  }
+  if !expect(restored_meta.owners.len() == 1, &"restored owners match") {
+    return false;
+  }
+
+  // 空でない宛先への復元拒否
+  let restore_non_empty = restore_repo(&backup_dir, &restore_dir);
+  if !expect(restore_non_empty.is_err(), &"restore into non-empty directory rejected") {
+    return false;
+  }
+
+  // 完了印を欠くバックアップの復元拒否
+  let _ = remove_file_if_exists(&mark);
+  let restore2 = restore_repo(&backup_dir, &cat3(&root, &"/restored2.git", &""));
+  if !expect(restore2.is_err(), &"incomplete backup restore rejected") {
+    return false;
+  }
+
+  // 破損した metadata を持つバックアップの復元拒否
+  let corrupt_backup_dir = cat3(&root, &"/corrupt_backup", &"");
+  make_dirs(&corrupt_backup_dir).unwrap_or(true);
+  let _ = create_synced_file(&join_path(&corrupt_backup_dir, &"sigil-backup.complete"), &"".as_bytes());
+  let _ = create_synced_file(&join_path(&corrupt_backup_dir, &"sigil-metadata"), &"broken-meta".as_bytes());
+  let restore_corrupt = restore_repo(&corrupt_backup_dir, &cat3(&root, &"/restored_corrupt.git", &""));
+  if !expect(restore_corrupt.is_err(), &"corrupt metadata backup restore rejected") {
+    return false;
+  }
+
+  return true;
+}
+
+pub fn run_meta_tests() -> Bool
+  intent "metadata・ACL・管理・バックアップのすべての単体テストを実行する"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  console.log(&"  ACL: parse_fixed_acl empty subject validation");
+  if !test_parse_fixed_acl_empty_subjects() {
+    return false;
+  }
+
+  console.log(&"  ref names: safe validation");
+  if !test_ref_name_safe_cases() {
+    return false;
+  }
+
+  console.log(&"  JSON: escaping and roundtrip");
+  if !test_json_escaping_cases() {
+    return false;
+  }
+
+  console.log(&"  metadata: parse and serialize");
+  if !test_parse_and_serialize_meta() {
+    return false;
+  }
+
+  console.log(&"  metadata: permissions check");
+  if !test_permission_checks() {
+    return false;
+  }
+
+  console.log(&"  metadata: lifecycle, ACL update, and race conditions");
+  if !test_lifecycle_and_management() {
+    return false;
+  }
+
+  console.log(&"  metadata: backup and restore");
+  if !test_backup_and_restore() {
+    return false;
+  }
+
+  return true;
+}

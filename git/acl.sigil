@@ -77,6 +77,28 @@ fn str_at(l: &List<String>, i: Int) -> String
   };
 }
 
+pub fn subject_name_ok(name: &String) -> Bool
+  intent "主体名が非空かつ安全な文字 [a-zA-Z0-9_-]{1,64} か"
+  requires none
+  ensures none
+  effects none
+{
+  let b = name.as_bytes();
+  if b.len() < 1 || b.len() > 64 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 45;
+    if !ok {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
 pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
   intent "`repo:subject,subject;repo:subject` を読む。リポジトリ id が正規形でない・重複・主体が空のときは Err（固定の理由だけ）"
   requires none
@@ -90,6 +112,18 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
   let mut i = 0;
   while i < entries.len() {
     let e = str_at(&entries, i);
+    let eb = e.as_bytes();
+    let mut colon_count = 0;
+    let mut c_idx = 0;
+    while c_idx < eb.len() {
+      if eb.get(c_idx).unwrap_or(0) == 58 {
+        colon_count = colon_count + 1;
+      }
+      c_idx = c_idx + 1;
+    }
+    if colon_count != 1 {
+      return Err("invalid_acl");
+    }
     let parts = split_on(&e, 58);
     if parts.len() != 2 {
       return Err("invalid_acl");
@@ -99,6 +133,24 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
       return Err("invalid_acl");
     }
     let sub_text = str_at(&parts, 1);
+    let sb = sub_text.as_bytes();
+    if sb.len() == 0 || sb.get(0).unwrap_or(0) == 44 || sb.get(sb.len() - 1).unwrap_or(0) == 44 {
+      return Err("invalid_acl");
+    }
+    let mut prev_comma = false;
+    let mut j = 0;
+    while j < sb.len() {
+      let sc = sb.get(j).unwrap_or(0);
+      if sc == 44 {
+        if prev_comma {
+          return Err("invalid_acl");
+        }
+        prev_comma = true;
+      } else {
+        prev_comma = false;
+      }
+      j = j + 1;
+    }
     let subs = split_on(&sub_text, 44);
     if subs.len() == 0 {
       return Err("invalid_acl");
@@ -108,11 +160,29 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
     let mut k = 0;
     while k < subs.len() {
       let item = str_at(&subs, k);
+      let ib = item.as_bytes();
+      if ib.len() == 0 || ib.get(0).unwrap_or(0) == 61 || ib.get(ib.len() - 1).unwrap_or(0) == 61 {
+        return Err("invalid_acl");
+      }
+      let mut eq_count = 0;
+      let mut eq_idx = 0;
+      while eq_idx < ib.len() {
+        if ib.get(eq_idx).unwrap_or(0) == 61 {
+          eq_count = eq_count + 1;
+        }
+        eq_idx = eq_idx + 1;
+      }
+      if eq_count > 1 {
+        return Err("invalid_acl");
+      }
       let kv = split_on(&item, 61);
       if kv.len() < 1 || kv.len() > 2 {
         return Err("invalid_acl");
       }
       let name = str_at(&kv, 0);
+      if !subject_name_ok(&name) {
+        return Err("invalid_acl");
+      }
       if kv.len() == 2 {
         if str_at(&kv, 1) != "rw" {
           return Err("invalid_acl");
