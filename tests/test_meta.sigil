@@ -10,21 +10,25 @@ use git.fsio.join_path;
 use git.fsio.lock_create;
 use git.fsio.make_dirs;
 use git.fsio.random_hex;
+use git.fsio.read_file_opt;
 use git.fsio.remove_file_if_exists;
 use git.meta.backup_repo;
 use git.meta.calc_repo_storage;
 use git.meta.can_manage;
 use git.meta.can_read;
 use git.meta.can_write;
+use git.meta.check_repo_storage_limits;
 use git.meta.create_repo_managed;
 use git.meta.empty_meta;
 use git.meta.empty_usage;
 use git.meta.escape_json_string;
+use git.meta.is_usage_exceeded;
 use git.meta.json_quote;
 use git.meta.list_accessible_repos;
 use git.meta.load_meta;
 use git.meta.meta_to_json;
 use git.meta.new_meta;
+use git.meta.new_usage;
 use git.meta.parse_meta;
 use git.meta.ref_name_safe;
 use git.meta.restore_repo;
@@ -652,6 +656,385 @@ fn test_backup_and_restore() -> Bool
   return true;
 }
 
+fn test_robustness_backup_non_empty_target() -> Bool
+  intent "(a) backup_repo / backup_inner でバックアップ先ディレクトリが空でない場合に拒否されることの検証"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = cat3(&"tmp/test_backup_nonempty_", &random_hex(8).unwrap_or("x"), &"");
+  make_dirs(&root).unwrap_or(true);
+  let repo_dir = cat3(&cat3(&root, &"/", &"orig"), &".git", &"");
+  match init_repo(&repo_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo failed");
+    }
+  }
+  let mut owners = List.new();
+  owners.push("alice");
+  let empty_list = List.new();
+  let meta = new_meta(&"orig", 1, &"private", &"main", &owners, &empty_list, &empty_list);
+  match save_meta_atomic(&repo_dir, &meta) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"save_meta_atomic failed");
+    }
+  }
+
+  // 1. ゴミファイルが存在するディレクトリへのバックアップ拒否
+  let backup_dir = cat3(&root, &"/backup_dir", &"");
+  make_dirs(&backup_dir).unwrap_or(true);
+  let stray_file = join_path(&backup_dir, &"stray.txt");
+  let _ = create_synced_file(&stray_file, &"leftover".as_bytes());
+
+  let res1 = backup_repo(&repo_dir, &backup_dir);
+  if !expect(res1.is_err(), &"(a) backup into non-empty directory should fail") {
+    return false;
+  }
+
+  // 2. 古い完了印だけが残っているディレクトリへのバックアップ拒否（完了印だけ消して上書きしない）
+  let _ = remove_file_if_exists(&stray_file);
+  let old_mark = join_path(&backup_dir, &"sigil-backup.complete");
+  let _ = create_synced_file(&old_mark, &"complete\n".as_bytes());
+
+  let res2 = backup_repo(&repo_dir, &backup_dir);
+  if !expect(res2.is_err(), &"(a) backup into directory with old mark should fail") {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_robustness_backup_deep_verification() -> Bool
+  intent "(b) backup_inner で metadata/HEAD/config/packed-refs/objects/refs の件数・内容まで完全照合することの検証"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = cat3(&"tmp/test_backup_deep_", &random_hex(8).unwrap_or("x"), &"");
+  make_dirs(&root).unwrap_or(true);
+  let repo_dir = cat3(&cat3(&root, &"/", &"orig"), &".git", &"");
+  match init_repo(&repo_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo failed");
+    }
+  }
+  let mut owners = List.new();
+  owners.push("alice");
+  let empty_list = List.new();
+  let meta = new_meta(&"orig", 1, &"private", &"main", &owners, &empty_list, &empty_list);
+  match save_meta_atomic(&repo_dir, &meta) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"save_meta_atomic failed");
+    }
+  }
+
+  // packed-refs, objects, refs を作成
+  let packed_path = join_path(&repo_dir, &"packed-refs");
+  let _ = create_synced_file(&packed_path, &"1111 refs/heads/p1\n".as_bytes());
+
+  let obj_dir = join_path(&repo_dir, &"objects/12");
+  make_dirs(&obj_dir).unwrap_or(true);
+  let obj_file = join_path(&obj_dir, &"345678");
+  let _ = create_synced_file(&obj_file, &"fake object payload".as_bytes());
+
+  let ref_dir = join_path(&repo_dir, &"refs/heads/feature");
+  make_dirs(&ref_dir).unwrap_or(true);
+  let ref_file = join_path(&ref_dir, &"nested");
+  let _ = create_synced_file(&ref_file, &"ref: refs/heads/main\n".as_bytes());
+
+  let backup_dir = cat3(&root, &"/backup_verified", &"");
+  match backup_repo(&repo_dir, &backup_dir) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"(b) backup_repo with nested objects/refs failed");
+    }
+  }
+
+  // バックアップ先の内容照合
+  let b_obj = join_path(&backup_dir, &"objects/12/345678");
+  let b_ref = join_path(&backup_dir, &"refs/heads/feature/nested");
+  if !expect(file_exists(&b_obj).unwrap_or(false), &"(b) backup copied loose object") {
+    return false;
+  }
+  if !expect(file_exists(&b_ref).unwrap_or(false), &"(b) backup copied nested ref") {
+    return false;
+  }
+
+  let mut copied_obj_bytes = Bytes.new();
+  match read_file_opt(&b_obj, 1024, false).unwrap_or(None) {
+    Some(d) => {
+      copied_obj_bytes = d;
+    }
+    None => {
+      return fail(&"(b) could not read copied object");
+    }
+  }
+  if !expect(copied_obj_bytes == "fake object payload".as_bytes(), &"(b) copied object content matches") {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_robustness_update_default_branch_order() -> Bool
+  intent "(c) update_default_branch_managed で HEAD 更新が先・metadata atomic 更新が後に行われること、不正名や失敗時の検証"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = cat3(&"tmp/test_defbranch_", &random_hex(8).unwrap_or("x"), &"");
+  make_dirs(&root).unwrap_or(true);
+  let id = "repop4";
+  match create_repo_managed(&root, &id, &"alice", &"main", &"admin", &"admin") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"create_repo_managed failed");
+    }
+  }
+  let git_dir = cat3(&cat3(&root, &"/", &id), &".git", &"");
+
+  // 1. 正常な更新: HEAD と metadata が両方正しく更新されること
+  match update_default_branch_managed(&root, &id, &"develop", &"alice") {
+    Ok(m) => {
+      if !expect(m.default_branch == "develop", &"(c) returned meta default branch is develop") {
+        return false;
+      }
+    }
+    Err(_) => {
+      return fail(&"(c) update_default_branch_managed develop failed");
+    }
+  }
+
+  let head_path = join_path(&git_dir, &"HEAD");
+  let mut head_bytes = Bytes.new();
+  match read_file_opt(&head_path, 256, false).unwrap_or(None) {
+    Some(b) => {
+      head_bytes = b;
+    }
+    None => {
+      return fail(&"(c) HEAD file missing");
+    }
+  }
+  if !expect(head_bytes == "ref: refs/heads/develop\n".as_bytes(), &"(c) HEAD content points to develop") {
+    return false;
+  }
+
+  let cur_meta = load_meta(&git_dir, &id).unwrap_or(empty_meta());
+  if !expect(cur_meta.default_branch == "develop", &"(c) saved meta default branch is develop") {
+    return false;
+  }
+
+  // 2. 不正なブランチ名（空白や制御文字、危険文字）は拒否され状態が不変であること
+  let res_invalid = update_default_branch_managed(&root, &id, &"bad branch", &"alice");
+  if !expect(res_invalid.is_err(), &"(c) invalid branch name rejected") {
+    return false;
+  }
+  let after_meta = load_meta(&git_dir, &id).unwrap_or(empty_meta());
+  if !expect(after_meta.default_branch == "develop", &"(c) meta unchanged after rejection") {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_robustness_create_repo_debris_recovery() -> Bool
+  intent "(d) create_repo_managed でクラッシュ残骸の自動回復と save_meta_atomic 失敗時等のクリーンアップ検証"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = cat3(&"tmp/test_debris_", &random_hex(8).unwrap_or("x"), &"");
+  make_dirs(&root).unwrap_or(true);
+  let id = "debris_repo";
+  let git_dir = cat3(&cat3(&root, &"/", &id), &".git", &"");
+
+  // init_repo だけ実行され、metadata が保存される前にクラッシュした状態（残骸）を模擬
+  match init_repo(&git_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo failed");
+    }
+  }
+  let debris_file = join_path(&git_dir, &"stray_debris.txt");
+  let _ = create_synced_file(&debris_file, &"leftover debris".as_bytes());
+
+  // この状態で create_repo_managed を呼ぶと、クラッシュ残骸を検知・回復して作成に成功すること
+  match create_repo_managed(&root, &id, &"alice", &"main", &"admin", &"admin") {
+    Ok(m) => {
+      if !expect(m.owners.len() == 1, &"(d) created repo owner count is 1") {
+        return false;
+      }
+    }
+    Err(_) => {
+      return fail(&"(d) create_repo_managed should recover from debris and succeed");
+    }
+  }
+
+  // 残骸ファイルが掃除され、metadata が正常に配置されていること
+  if !expect(!file_exists(&debris_file).unwrap_or(false), &"(d) stray debris file removed") {
+    return false;
+  }
+  let loaded = load_meta(&git_dir, &id);
+  if !expect(loaded.is_ok(), &"(d) load_meta succeeds on recovered repo") {
+    return false;
+  }
+
+  // 正常に作成されたリポジトリへの再作成は conflict で拒否されること
+  let res_conflict = create_repo_managed(&root, &id, &"bob", &"main", &"admin", &"admin");
+  if !expect(res_conflict.is_err(), &"(d) existing repo conflict rejected") {
+    return false;
+  }
+
+  // 実データ（objects や refs）がある場合は metadata 欠落でも削除されず conflict で拒絶されること
+  let real_id = "real_data_repo";
+  let real_git_dir = cat3(&cat3(&root, &"/", &real_id), &".git", &"");
+  match init_repo(&real_git_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo for real data failed");
+    }
+  }
+  let ref_main = join_path(&real_git_dir, &"refs/heads/main");
+  let commit_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n";
+  let _ = create_synced_file(&ref_main, &commit_hash.as_bytes());
+
+  let loose_dir = join_path(&real_git_dir, &"objects/ab");
+  make_dirs(&loose_dir).unwrap_or(true);
+  let loose_file = join_path(&loose_dir, &"cdef0123456789");
+  let _ = create_synced_file(&loose_file, &"dummy object".as_bytes());
+
+  let res_real = create_repo_managed(&root, &real_id, &"alice", &"main", &"admin", &"admin");
+  if !expect(res_real.is_err(), &"(d) repo with real data and missing metadata must be rejected with conflict") {
+    return false;
+  }
+  match res_real {
+    Ok(_) => {
+      return fail(&"(d) should not succeed when real data exists");
+    }
+    Err(e) => {
+      if !expect(e == "conflict", &"(d) error code is conflict") {
+        return false;
+      }
+    }
+  }
+  if !expect(file_exists(&ref_main).unwrap_or(false), &"(d) ref_main preserved and not destroyed") {
+    return false;
+  }
+  if !expect(file_exists(&loose_file).unwrap_or(false), &"(d) loose object preserved and not destroyed") {
+    return false;
+  }
+
+  // packed-refs がある場合も実データとして保護されること
+  let packed_id = "packed_data_repo";
+  let packed_git_dir = cat3(&cat3(&root, &"/", &packed_id), &".git", &"");
+  match init_repo(&packed_git_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo for packed data failed");
+    }
+  }
+  let packed_refs_file = join_path(&packed_git_dir, &"packed-refs");
+  let _ = create_synced_file(&packed_refs_file, &"# pack-refs with: peeled fully-peeled sorted\n".as_bytes());
+
+  let res_packed = create_repo_managed(&root, &packed_id, &"alice", &"main", &"admin", &"admin");
+  if !expect(res_packed.is_err(), &"(d) repo with packed-refs must be rejected with conflict") {
+    return false;
+  }
+  if !expect(file_exists(&packed_refs_file).unwrap_or(false), &"(d) packed-refs preserved and not destroyed") {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_robustness_storage_calculation_and_limits() -> Bool
+  intent "(e) calc_repo_storage で入れ子 ref と pack 内オブジェクト集計、および上限超過判定の検証"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let root = cat3(&"tmp/test_storage_", &random_hex(8).unwrap_or("x"), &"");
+  make_dirs(&root).unwrap_or(true);
+  let id = "store_repo";
+  match create_repo_managed(&root, &id, &"alice", &"main", &"admin", &"admin") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"create_repo_managed failed");
+    }
+  }
+  let git_dir = cat3(&cat3(&root, &"/", &id), &".git", &"");
+
+  // 1. 入れ子 ref の作成（refs/heads/deep/nested/feat と refs/tags/release/v1.0）
+  let deep_ref_dir = join_path(&git_dir, &"refs/heads/deep/nested");
+  make_dirs(&deep_ref_dir).unwrap_or(true);
+  let deep_ref_file = join_path(&deep_ref_dir, &"feat");
+  let _ = create_synced_file(&deep_ref_file, &"1111222233334444555566667777888899990000\n".as_bytes());
+
+  let deep_tag_dir = join_path(&git_dir, &"refs/tags/release");
+  make_dirs(&deep_tag_dir).unwrap_or(true);
+  let deep_tag_file = join_path(&deep_tag_dir, &"v1.0");
+  let _ = create_synced_file(&deep_tag_file, &"2222333344445555666677778888999900001111\n".as_bytes());
+
+  // 2. pack ファイルの配置（fixtures/v1/sample.idx と sample.pack）
+  let pack_dir = join_path(&git_dir, &"objects/pack");
+  make_dirs(&pack_dir).unwrap_or(true);
+  let fixture_idx = "fixtures/v1/sample.idx";
+  let fixture_pack = "fixtures/v1/sample.pack";
+  if file_exists(&fixture_idx).unwrap_or(false) && file_exists(&fixture_pack).unwrap_or(false) {
+    let idx_bytes = read_file_opt(&fixture_idx, 65536, false).unwrap_or(None).unwrap_or(Bytes.new());
+    let pack_bytes = read_file_opt(&fixture_pack, 65536, false).unwrap_or(None).unwrap_or(Bytes.new());
+    let _ = create_synced_file(&join_path(&pack_dir, &"sample.idx"), &idx_bytes);
+    let _ = create_synced_file(&join_path(&pack_dir, &"sample.pack"), &pack_bytes);
+  }
+
+  // 3. calc_repo_storage の実行
+  let mut usage = empty_usage();
+  match calc_repo_storage(&git_dir) {
+    Ok(u) => {
+      usage = u;
+    }
+    Err(_) => {
+      return fail(&"(e) calc_repo_storage failed");
+    }
+  }
+
+  if !expect(usage.object_count > 0, &"(e) pack objects counted in object_count") {
+    return false;
+  }
+  if !expect(usage.usage_bytes > 0, &"(e) nested refs and pack files counted in usage_bytes") {
+    return false;
+  }
+  if !expect(!is_usage_exceeded(&usage), &"(e) initial usage not exceeded") {
+    return false;
+  }
+  if !expect(check_repo_storage_limits(&usage).is_ok(), &"(e) initial limits check ok") {
+    return false;
+  }
+
+  // 4. 上限超過判定の検証
+  let over_obj = new_usage(5000, 1000, 4096, 67108864);
+  if !expect(is_usage_exceeded(&over_obj), &"(e) over_obj detected as exceeded") {
+    return false;
+  }
+  if !expect(check_repo_storage_limits(&over_obj).is_err(), &"(e) check_repo_storage_limits rejects over_obj") {
+    return false;
+  }
+
+  let over_bytes = new_usage(10, 70000000, 4096, 67108864);
+  if !expect(is_usage_exceeded(&over_bytes), &"(e) over_bytes detected as exceeded") {
+    return false;
+  }
+  if !expect(check_repo_storage_limits(&over_bytes).is_err(), &"(e) check_repo_storage_limits rejects over_bytes") {
+    return false;
+  }
+
+  return true;
+}
+
 pub fn run_meta_tests() -> Bool
   intent "metadata・ACL・管理・バックアップのすべての単体テストを実行する"
   requires none
@@ -690,6 +1073,31 @@ pub fn run_meta_tests() -> Bool
 
   console.log(&"  metadata: backup and restore");
   if !test_backup_and_restore() {
+    return false;
+  }
+
+  console.log(&"  robustness (a): backup non-empty target rejection");
+  if !test_robustness_backup_non_empty_target() {
+    return false;
+  }
+
+  console.log(&"  robustness (b): backup deep verification");
+  if !test_robustness_backup_deep_verification() {
+    return false;
+  }
+
+  console.log(&"  robustness (c): update default branch order and validation");
+  if !test_robustness_update_default_branch_order() {
+    return false;
+  }
+
+  console.log(&"  robustness (d): create repo debris recovery and cleanup");
+  if !test_robustness_create_repo_debris_recovery() {
+    return false;
+  }
+
+  console.log(&"  robustness (e): storage calculation and limit checks");
+  if !test_robustness_storage_calculation_and_limits() {
     return false;
   }
 

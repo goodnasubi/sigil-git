@@ -119,6 +119,25 @@ SHA-256 のリポジトリで、`add` → `commit` → `checkout` の一連が�
 - `git/recvpack.sigil`、`git/receive.sigil`、`git/acl.sigil`（`can_write`）、`upload_server.sigil`（write 権限の確認つき）。
 - 実 Git の確認: `SIGIL=... STAGE5_GIT=... ./interop_receive.sh`
 
+## 転送 第4段「metadata／ACLと管理UI」（ADR 0048、Issue #15）
+
+リポジトリのライフサイクル管理、永続化 metadata、ACL（owner/writer/reader）、可視性（private/public-read）、デフォルトブランチ管理、バックアップ・復元、および静的管理 UI です。
+
+- `git/meta.sigil`: メタデータの atomic 更新、ACL・可視性判定、バックアップ・復元、使用量集計。
+- `upload_server.sigil`: 管理 API（`/api/repos/*`、JSON、同一 Origin 検証、16 KiB 上限）および静的管理 UI（HTML/DOM）。
+- 実 Git の確認: `SIGIL=... STAGE5_GIT=... ./interop_meta.sh`
+
+## 転送 第5段「比較・故障注入・ファジングの記録」（ADR 0048、Issue #17）
+
+ADR 0048（P4-4）に規定された完了条件 1〜6 を網羅した公式集約検証です。詳細は [docs/HOSTING_VERIFICATION.md](docs/HOSTING_VERIFICATION.md)。
+
+- **公式 Git との比較（完了条件 1）**: Git 2.43.0 / 2.39.5 による clone / fetch / push、注釈付きタグ・peeled 行、gzip Content-Encoding 送受信実測、再起動後 `git fsck --strict`。
+- **拒否の負例（完了条件 2）**: 認可・認証失敗、存在秘匿（404）、非 fast-forward・削除・タグ上書き拒否、排他ロック競合、拒否後の参照不変性。
+- **上限と性能（完了条件 3）**: 各種固定上限（pkt-line 65520、転送 4096 objects / 16 MiB、repo 64 MiB、API 16 KiB、gzip 境界）の防御と性能実測（ネイティブ vs SIR 評価器）。
+- **故障注入（完了条件 4）**: バックアップ堅牢化 5 件修正、staging / オブジェクト同期 / rename 中断、short I/O・EIO・ENOSPC 注入、永続化順序モデル検証。
+- **ファジング（完了条件 5）**: 8 領域の構造認識ファジング（1200+ 反復、パニック 0 件）と変異試験（6 件全検出）。
+- **管理 UI と実行経路一致（完了条件 6）**: 静的管理 UI の実ブラウザ安全性（XSS/CSRF/token 非永続化）と、SIR 評価器 vs ネイティブのダイジェスト完全一致（核論理 `ebce0bda...`、転送 `3fde4e5e...`）。
+
 ## テストの実行
 
 前提として、Sigil コンパイラ（固定版コミット `33467e3b43238fdc69331c58a788c95f1de393e5`）が利用可能である必要があります。
@@ -138,5 +157,7 @@ SIGIL=/path/to/sigil ./interop.sh        # 第2段: init・書き込み・参照
 SIGIL=/path/to/sigil ./interop_pack.sh   # 第3段: gc 済みの pack の読み取り（オブジェクト・log --topo-order・ls-tree -r・diff）
 SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_history.sh  # 第5段
 SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_transfer.sh  # 転送 第1段: 広告を実 Git と比較、pack を index-pack --strict・verify-pack・fsck で検証
-SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_receive.sh  # 転送 第3段: 実 Git の push と拒否、認可、上限
+SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_upload.sh    # 転送 第2段: upload-pack、want/have 交渉、gzip 要求実測
+SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_receive.sh   # 転送 第3段: 実 Git の push と拒否、認可、上限
+SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_meta.sh      # 転送 第4段: metadata・ACL・管理 UI・Git 認可
 ```
