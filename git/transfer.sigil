@@ -1,0 +1,536 @@
+module git.transfer
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.string_starts_with;
+use git.hash.is_valid_hex_id;
+use git.limits.max_advertised_refs;
+use git.limits.max_graph_walk_items;
+use git.limits.max_transfer_response_size;
+use git.object.ObjectType;
+use git.odb.odb_read_in;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.pktline.pkt_encode;
+use git.pktline.pkt_flush;
+use git.refs.HeadState;
+use git.refs.check_ref_name;
+use git.refs.list_branches;
+use git.refs.list_tags;
+use git.refs.read_head;
+use git.repo.Repo;
+use git.tag.decode_tag;
+use git.tag.tag_object_id;
+
+// ADR 0048 決定 1・2: 能力広告（プロトコル v0）と対応表。
+// 広告するのは実装した能力だけ。upload-pack は object-format=sha256・symref（有効なとき）・side-band-64k、
+// receive-pack は object-format=sha256・report-status・ofs-delta。対応表に無い要求は黙って成功させず拒否する（既定は拒否）。
+
+pub struct AdvRef {
+  name: String,
+  id: String,
+  peeled: Option<String>,
+}
+
+pub struct AdvSet {
+  refs: List<AdvRef>,
+  head_id: Option<String>,
+  head_symref: Option<String>,
+}
+
+pub fn new_adv_ref(name: String, id: String, peeled: Option<String>) -> AdvRef
+  intent "AdvRef を構築する。peeled は注釈付きタグを再帰的に剥いだ非 tag オブジェクトの識別子（軽量タグ・ブランチは None）"
+  requires none
+  ensures none
+  effects none
+{
+  return AdvRef { name: name, id: id, peeled: peeled };
+}
+
+fn zero_id() -> String
+  intent "ゼロ識別子（64 桁の 0）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "0000000000000000000000000000000000000000000000000000000000000000";
+}
+
+pub fn upload_pack_capabilities(symref_target: &Option<String>) -> String
+  intent "upload-pack の能力の文字列を返す。symref_target があれば symref=HEAD:<参照> を含める"
+  requires none
+  ensures none
+  effects none
+{
+  return match symref_target {
+    Some(t) => cat3(&"object-format=sha256 symref=HEAD:", &t, &" side-band-64k"),
+    None => "object-format=sha256 side-band-64k",
+  };
+}
+
+pub fn receive_pack_capabilities() -> String
+  intent "receive-pack の能力の文字列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "object-format=sha256 report-status ofs-delta";
+}
+
+fn name_less(a: &String, b: &String) -> Bool
+  intent "参照名をバイト列として辞書順に比較し a < b かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let ab = a.as_bytes();
+  let bb = b.as_bytes();
+  let mut i = 0;
+  while i < ab.len() && i < bb.len() {
+    let x = ab.get(i).unwrap_or(0);
+    let y = bb.get(i).unwrap_or(0);
+    if x != y {
+      return x < y;
+    }
+    i = i + 1;
+  }
+  return ab.len() < bb.len();
+}
+
+fn adv_at(l: &List<AdvRef>, i: Int) -> AdvRef
+  intent "AdvRef のリストの i 番目の複製を返す"
+  requires i >= 0 && i < l.len()
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(r) => AdvRef { name: r.name.clone(), id: r.id.clone(), peeled: r.peeled.clone() },
+    None => AdvRef { name: "", id: "", peeled: None },
+  };
+}
+
+fn check_refs(refs: &List<AdvRef>) -> Result<Bool, GitError>
+  intent "広告する参照を検査する: 名前・識別子・peeled・昇順かつ重複なし"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  let mut prev = "";
+  while i < refs.len() {
+    let r = adv_at(&refs, i);
+    check_ref_name(&r.name)?;
+    if !is_valid_hex_id(&r.id) {
+      return Err(GitError.Corrupt("advertised ref id is not a SHA-256 object id"));
+    }
+    match r.peeled {
+      Some(p) => {
+        if !is_valid_hex_id(&p) {
+          return Err(GitError.Corrupt("advertised peeled id is not a SHA-256 object id"));
+        }
+        if !string_starts_with(&r.name, &"refs/tags/") {
+          return Err(GitError.Corrupt("only refs/tags/* can have a peeled line"));
+        }
+      }
+      None => {}
+    }
+    if i > 0 && !name_less(&prev, &r.name) {
+      return Err(GitError.Corrupt("advertised refs are not strictly sorted by name"));
+    }
+    prev = r.name.clone();
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn push_line(out: &mut Bytes, text: &Bytes) -> Result<Bool, GitError>
+  intent "1 行を pkt-line にして追記する。後続の flush（4 byte）を含めて応答が 1 MiB を超えるなら LimitExceeded（追記しない）"
+  requires none
+  ensures none
+  effects none
+{
+  let pkt = pkt_encode(&text)?;
+  if out.len() + pkt.len() + 4 > max_transfer_response_size() {
+    return Err(GitError.LimitExceeded("advertisement exceeds the 1 MiB response limit"));
+  }
+  out.extend(&pkt);
+  return Ok(true);
+}
+
+fn first_line(id: &String, name: &String, caps: &String) -> Bytes
+  intent "最初の参照行（<id> <名前>\\0<能力>\\n）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.extend(&id.as_bytes());
+  b.push(32);
+  b.extend(&name.as_bytes());
+  b.push(0);
+  b.extend(&caps.as_bytes());
+  b.push(10);
+  return b;
+}
+
+fn plain_line(id: &String, name: &String) -> Bytes
+  intent "参照行（<id> <名前>\\n）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.extend(&id.as_bytes());
+  b.push(32);
+  b.extend(&name.as_bytes());
+  b.push(10);
+  return b;
+}
+
+pub fn advertise_upload_pack(refs: &List<AdvRef>, head_id: &Option<String>, symref_target: &Option<String>) -> Result<Bytes, GitError>
+  intent "upload-pack の広告（pkt-line の列＋ flush）を作る。HEAD を先頭に、参照を昇順に並べ、注釈付きタグの直後に peeled 行を置く。参照が無い空のリポジトリはゼロ識別子と capabilities^{} を使う。参照数 1024 と応答 1 MiB を超えれば LimitExceeded"
+  requires none
+  ensures none
+  effects none
+{
+  check_refs(&refs)?;
+  let mut head_ok = false;
+  match head_id {
+    Some(h) => {
+      if !is_valid_hex_id(&h) {
+        return Err(GitError.Corrupt("HEAD id is not a SHA-256 object id"));
+      }
+      head_ok = true;
+    }
+    None => {}
+  }
+  match symref_target {
+    Some(t) => {
+      if !head_ok {
+        return Err(GitError.Corrupt("symref is advertised without HEAD"));
+      }
+      if !string_starts_with(&t, &"refs/heads/") {
+        return Err(GitError.Corrupt("symref target must be under refs/heads/"));
+      }
+      check_ref_name(&t)?;
+    }
+    None => {}
+  }
+  let mut count = refs.len();
+  if head_ok {
+    count = count + 1;
+  }
+  if count > max_advertised_refs() {
+    return Err(GitError.LimitExceeded("too many advertised references"));
+  }
+  let caps = upload_pack_capabilities(&symref_target);
+  let mut out = Bytes.new();
+  let mut first = true;
+  match head_id {
+    Some(h) => {
+      push_line(&mut out, &first_line(&h, &"HEAD", &caps))?;
+      first = false;
+    }
+    None => {}
+  }
+  let mut i = 0;
+  while i < refs.len() {
+    let r = adv_at(&refs, i);
+    if first {
+      push_line(&mut out, &first_line(&r.id, &r.name, &caps))?;
+      first = false;
+    } else {
+      push_line(&mut out, &plain_line(&r.id, &r.name))?;
+    }
+    match r.peeled {
+      Some(p) => {
+        push_line(&mut out, &plain_line(&p, &cat3(&r.name, &"^{}", &"")))?;
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  if first {
+    push_line(&mut out, &first_line(&zero_id(), &"capabilities^{}", &caps))?;
+  }
+  out.extend(&pkt_flush());
+  return Ok(out);
+}
+
+pub fn advertise_receive_pack(refs: &List<AdvRef>) -> Result<Bytes, GitError>
+  intent "receive-pack の広告を作る。HEAD・symref・peeled 行は出さない。参照が無ければゼロ識別子と capabilities^{} を使う。参照数 1024 と応答 1 MiB を超えれば LimitExceeded"
+  requires none
+  ensures none
+  effects none
+{
+  check_refs(&refs)?;
+  if refs.len() > max_advertised_refs() {
+    return Err(GitError.LimitExceeded("too many advertised references"));
+  }
+  let caps = receive_pack_capabilities();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < refs.len() {
+    let r = adv_at(&refs, i);
+    if i == 0 {
+      push_line(&mut out, &first_line(&r.id, &r.name, &caps))?;
+    } else {
+      push_line(&mut out, &plain_line(&r.id, &r.name))?;
+    }
+    i = i + 1;
+  }
+  if refs.len() == 0 {
+    push_line(&mut out, &first_line(&zero_id(), &"capabilities^{}", &caps))?;
+  }
+  out.extend(&pkt_flush());
+  return Ok(out);
+}
+
+// ---------------------------------------------------------------------------
+// リポジトリから広告する参照を集める（識別子の存在と型を 0047 の核で検査し、注釈付きタグを剥がす）
+// ---------------------------------------------------------------------------
+
+struct Peeled {
+  id: String,
+  steps: Int,
+}
+
+fn peel_tag(repo: &Repo, packs: &List<PackStore>, id: &String, budget: Int) -> Result<Peeled, GitError>
+  intent "注釈付きタグを再帰的に剥がし、非 tag オブジェクトの識別子を返す。走査が budget 件を超えれば LimitExceeded"
+  requires budget >= 0
+  ensures none
+  effects fs
+{
+  let mut cur = id.clone();
+  let mut steps = 0;
+  let mut done = false;
+  while !done {
+    steps = steps + 1;
+    if steps > budget {
+      return Err(GitError.LimitExceeded("tag peeling exceeds the graph walk limit"));
+    }
+    let o = odb_read_in(&repo, &packs, &cur)?;
+    match o.obj_type {
+      ObjectType.Tag => {
+        let t = decode_tag(&o.content)?;
+        cur = tag_object_id(&t);
+      }
+      _ => {
+        done = true;
+      }
+    }
+  }
+  return Ok(Peeled { id: cur, steps: steps });
+}
+
+pub fn collect_adv_set(repo: &Repo) -> Result<AdvSet, GitError>
+  intent "リポジトリのブランチ・タグ・HEAD から広告用の参照を集める。各識別子のオブジェクトの存在と型（ブランチは commit）を検査し、注釈付きタグを剥がす。参照数 1024 を超えれば LimitExceeded"
+  requires none
+  ensures none
+  effects fs
+{
+  return collect_adv_set_limited(&repo, max_graph_walk_items());
+}
+
+pub fn collect_adv_set_limited(repo: &Repo, walk_budget: Int) -> Result<AdvSet, GitError>
+  intent "collect_adv_set の本体。タグを剥がす走査件数の上限を walk_budget にする（固定上限は 100000。小さい値は上限の境界を試すためにある）"
+  requires walk_budget >= 0
+  ensures none
+  effects fs
+{
+  let branches = list_branches(&repo)?;
+  let tags = list_tags(&repo)?;
+  if branches.len() + tags.len() > max_advertised_refs() {
+    return Err(GitError.LimitExceeded("too many advertised references"));
+  }
+  let packs = open_packs(&repo)?;
+  let mut refs = List.new();
+  let mut budget = walk_budget;
+  let mut head_id = None;
+  let mut head_symref = None;
+  let head = read_head(&repo)?;
+  let mut i = 0;
+  while i < branches.len() {
+    match branches.get(i) {
+      None => {}
+      Some(b) => {
+        let o = odb_read_in(&repo, &packs, &b.id)?;
+        match o.obj_type {
+          ObjectType.Commit => {}
+          _ => {
+            return Err(GitError.TypeMismatch("a branch does not point to a commit"));
+          }
+        }
+        refs.push(AdvRef { name: b.name.clone(), id: b.id.clone(), peeled: None });
+      }
+    }
+    i = i + 1;
+  }
+  i = 0;
+  while i < tags.len() {
+    match tags.get(i) {
+      None => {}
+      Some(t) => {
+        let o = odb_read_in(&repo, &packs, &t.id)?;
+        let mut peeled = None;
+        match o.obj_type {
+          ObjectType.Tag => {
+            let p = peel_tag(&repo, &packs, &t.id, budget)?;
+            budget = budget - p.steps;
+            peeled = Some(p.id);
+          }
+          _ => {}
+        }
+        refs.push(AdvRef { name: t.name.clone(), id: t.id.clone(), peeled: peeled });
+      }
+    }
+    i = i + 1;
+  }
+  match head {
+    HeadState.Detached(h) => {
+      let _ = odb_read_in(&repo, &packs, &h)?;
+      head_id = Some(h);
+    }
+    HeadState.Symbolic(target) => {
+      let mut j = 0;
+      while j < branches.len() {
+        match branches.get(j) {
+          None => {}
+          Some(b) => {
+            if b.name == target {
+              head_id = Some(b.id.clone());
+              head_symref = Some(target.clone());
+            }
+          }
+        }
+        j = j + 1;
+      }
+    }
+  }
+  return Ok(AdvSet { refs: refs, head_id: head_id, head_symref: head_symref });
+}
+
+// ---------------------------------------------------------------------------
+// 対応表（既定は拒否）
+// ---------------------------------------------------------------------------
+
+pub fn transfer_supported_features() -> List<String>
+  intent "対応している転送の機能の名前の一覧を返す（それ以外は拒否される）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push("protocol-v0");
+  l.push("object-format=sha256");
+  l.push("side-band-64k");
+  l.push("symref");
+  l.push("report-status");
+  l.push("ofs-delta");
+  l.push("peeled-tag");
+  l.push("pack-v2");
+  return l;
+}
+
+pub fn transfer_unsupported_features() -> List<String>
+  intent "対応表に未対応と明記した機能の名前の一覧を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push("protocol-v1");
+  l.push("protocol-v2");
+  l.push("command=ls-refs");
+  l.push("command=fetch");
+  l.push("object-format=sha1");
+  l.push("ssh");
+  l.push("dumb-http");
+  l.push("thin-pack");
+  l.push("shallow");
+  l.push("deepen");
+  l.push("deepen-since");
+  l.push("deepen-not");
+  l.push("deepen-relative");
+  l.push("filter");
+  l.push("partial-clone");
+  l.push("allow-tip-sha1-in-want");
+  l.push("allow-reachable-sha1-in-want");
+  l.push("multi-ref-push");
+  l.push("atomic");
+  l.push("delete-refs");
+  l.push("force-push");
+  l.push("push-options");
+  l.push("push-cert");
+  l.push("lfs");
+  l.push("submodule-recursive");
+  l.push("hooks");
+  l.push("multi_ack");
+  l.push("multi_ack_detailed");
+  l.push("no-done");
+  l.push("side-band");
+  l.push("include-tag");
+  l.push("no-progress");
+  l.push("agent");
+  return l;
+}
+
+pub fn check_transfer_feature(name: &String) -> Result<Bool, GitError>
+  intent "機能の名前が対応表の対応にあるか検査する。無ければ（未対応と明記したものも未知のものも）UnsupportedFormat で拒否し、黙って成功させない"
+  requires none
+  ensures none
+  effects none
+{
+  let sup = transfer_supported_features();
+  let mut i = 0;
+  while i < sup.len() {
+    match sup.get(i) {
+      Some(s) => {
+        if s == name {
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Err(GitError.UnsupportedFormat(cat3(&"unsupported transfer feature: ", &name, &"")));
+}
+
+fn service_has(service_upload: Bool, cap: &String) -> Bool
+  intent "クライアントが要求してよい能力か（サービスが広告したもの）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if cap == "object-format=sha256" {
+    return true;
+  }
+  if service_upload {
+    return cap == "side-band-64k";
+  }
+  return cap == "report-status" || cap == "ofs-delta";
+}
+
+pub fn check_requested_capabilities(service_upload: Bool, caps: &List<String>) -> Result<Bool, GitError>
+  intent "クライアントが要求した能力が、そのサービスの広告にあるものだけかを検査する。広告に無い能力（symref を含む）は UnsupportedFormat で拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < caps.len() {
+    match caps.get(i) {
+      Some(c) => {
+        if !service_has(service_upload, &c) {
+          return Err(GitError.UnsupportedFormat(cat3(&"unsupported capability requested: ", &c, &"")));
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}

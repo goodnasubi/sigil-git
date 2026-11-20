@@ -1,0 +1,344 @@
+module tests.test_xcheck_transfer
+  targets server
+  trust none
+
+use git.commit.encode_commit;
+use git.commit.new_commit_object_str;
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat3;
+use git.fsio.join_path;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.hash.bytes_to_hex;
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.odb.odb_write;
+use git.pktline.pkt_decode_section;
+use git.pktline.pkt_encode_str;
+use git.refs.create_branch;
+use git.refs.create_tag;
+use git.refs.set_head_symbolic;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.tag.encode_tag;
+use git.tag.new_tag_object_str;
+use git.transfer.AdvRef;
+use git.transfer.advertise_receive_pack;
+use git.transfer.advertise_upload_pack;
+use git.transfer.check_requested_capabilities;
+use git.transfer.check_transfer_feature;
+use git.transfer.collect_adv_set;
+use git.transfer.new_adv_ref;
+use git.tree.encode_tree;
+use git.tree.new_tree_entry_str;
+use git.wirepack.wire_pack_build;
+
+// ADR 0048 第 1 段「0047 の核との突き合わせ」: 転送 codec と wire pack の決定論的な操作列・エラー・上限の結果を 1 つのダイジェストにする。
+// SIR 評価器とネイティブで同じ値になること、固定した期待値と一致することを test.sh が確かめる（tests/test_xcheck.sigil と同じ方式）。
+
+fn record(h: &mut Sha256, tag: &String, detail: &String)
+  intent "操作の名前と結果（正常値またはエラー種別）をダイジェストに畳み込む"
+  requires none
+  ensures none
+  effects none
+{
+  h.update(&tag.as_bytes());
+  h.update(&":".as_bytes());
+  h.update(&detail.as_bytes());
+  h.update(&"\n".as_bytes());
+}
+
+fn rec_bytes(h: &mut Sha256, tag: &String, r: Result<Bytes, GitError>)
+  intent "結果が成功ならそのバイト列の SHA-256、失敗ならエラー種別を記録する"
+  requires none
+  ensures none
+  effects none
+{
+  match r {
+    Ok(b) => {
+      record(&mut h, &tag, &cat3(&"ok:", &bytes_to_hex(&sha256(&b)), &""));
+    }
+    Err(e) => {
+      record(&mut h, &tag, &cat3(&"err:", &error_kind_name(&e), &""));
+    }
+  }
+}
+
+fn rec_bool(h: &mut Sha256, tag: &String, r: Result<Bool, GitError>)
+  intent "結果が成功なら ok、失敗ならエラー種別を記録する"
+  requires none
+  ensures none
+  effects none
+{
+  match r {
+    Ok(_) => {
+      record(&mut h, &tag, &"ok");
+    }
+    Err(e) => {
+      record(&mut h, &tag, &cat3(&"err:", &error_kind_name(&e), &""));
+    }
+  }
+}
+
+fn rec_lines(h: &mut Sha256, tag: &String, r: Result<List<Bytes>, GitError>)
+  intent "pkt-line の区間の復号結果（行数と各行の SHA-256）またはエラー種別を記録する"
+  requires none
+  ensures none
+  effects none
+{
+  match r {
+    Ok(ls) => {
+      let mut i = 0;
+      while i < ls.len() {
+        match ls.get(i) {
+          None => {}
+          Some(l) => {
+            record(&mut h, &tag, &bytes_to_hex(&sha256(&l)));
+          }
+        }
+        i = i + 1;
+      }
+      record(&mut h, &tag, &"end-of-section");
+    }
+    Err(e) => {
+      record(&mut h, &tag, &cat3(&"err:", &error_kind_name(&e), &""));
+    }
+  }
+}
+
+fn rep_id(c: &String) -> String
+  intent "文字 c を 64 個並べた識別子を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let one = c.as_bytes().get(0).unwrap_or(97);
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < 64 {
+    b.push(one);
+    i = i + 1;
+  }
+  return b.to_string_utf8().unwrap_or("");
+}
+
+fn fixed_refs() -> List<AdvRef>
+  intent "固定の参照の列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  r.push(new_adv_ref("refs/heads/main", rep_id(&"a"), None));
+  r.push(new_adv_ref("refs/heads/topic", rep_id(&"b"), None));
+  r.push(new_adv_ref("refs/tags/v1", rep_id(&"c"), Some(rep_id(&"d"))));
+  r.push(new_adv_ref("refs/tags/v2", rep_id(&"e"), None));
+  return r;
+}
+
+fn many_refs(n: Int) -> List<AdvRef>
+  intent "n 個の参照を昇順に作る（名前は refs/heads/b と 4 桁の番号）"
+  requires n >= 0 && n < 10000
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  let mut i = 0;
+  while i < n {
+    let d3 = i / 1000 % 10;
+    let d2 = i / 100 % 10;
+    let d1 = i / 10 % 10;
+    let d0 = i % 10;
+    let mut name = Bytes.new();
+    name.extend(&"refs/heads/b".as_bytes());
+    name.push(48 + d3);
+    name.push(48 + d2);
+    name.push(48 + d1);
+    name.push(48 + d0);
+    r.push(new_adv_ref(name.to_string_utf8().unwrap_or(""), rep_id(&"a"), None));
+    i = i + 1;
+  }
+  return r;
+}
+
+fn ident() -> String
+  intent "固定の作者・コミッターの署名を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "T <t@example.com> 1700000000 +0000";
+}
+
+fn put(repo: &Repo, t: &ObjectType, c: &Bytes) -> String
+  intent "オブジェクトを書いて識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return match odb_write(&repo, &t, &c) {
+    Ok(id) => id,
+    Err(_) => "",
+  };
+}
+
+fn codec_part(h: &mut Sha256)
+  intent "pkt-line・広告・対応表の結果を記録する"
+  requires none
+  ensures none
+  effects none
+{
+  match pkt_encode_str(&"want me\n") {
+    Ok(b) => {
+      record(&mut h, &"pkt_enc", &b.to_string_utf8().unwrap_or(""));
+    }
+    Err(e) => {
+      record(&mut h, &"pkt_enc", &error_kind_name(&e));
+    }
+  }
+  rec_lines(&mut h, &"dec_ok", pkt_decode_section(&"0006ab0006cd0000".as_bytes()));
+  rec_lines(&mut h, &"dec_trunc", pkt_decode_section(&"00".as_bytes()));
+  rec_lines(&mut h, &"dec_nonhex", pkt_decode_section(&"zzzz".as_bytes()));
+  rec_lines(&mut h, &"dec_delim", pkt_decode_section(&"0001".as_bytes()));
+  rec_lines(&mut h, &"dec_resp_end", pkt_decode_section(&"0002".as_bytes()));
+  rec_lines(&mut h, &"dec_len3", pkt_decode_section(&"0003".as_bytes()));
+  rec_lines(&mut h, &"dec_len4", pkt_decode_section(&"0004".as_bytes()));
+  rec_lines(&mut h, &"dec_big", pkt_decode_section(&"fff1".as_bytes()));
+  rec_lines(&mut h, &"dec_noflush", pkt_decode_section(&"0006ab".as_bytes()));
+  rec_lines(&mut h, &"dec_trailing", pkt_decode_section(&"00000006ab".as_bytes()));
+  let head = Some(rep_id(&"a"));
+  let sym = Some("refs/heads/main");
+  rec_bytes(&mut h, &"adv_up", advertise_upload_pack(&fixed_refs(), &head, &sym));
+  rec_bytes(&mut h, &"adv_up_nohead", advertise_upload_pack(&fixed_refs(), &None, &None));
+  rec_bytes(&mut h, &"adv_up_empty", advertise_upload_pack(&List.new(), &None, &None));
+  rec_bytes(&mut h, &"adv_rp", advertise_receive_pack(&fixed_refs()));
+  rec_bytes(&mut h, &"adv_rp_empty", advertise_receive_pack(&List.new()));
+  rec_bytes(&mut h, &"adv_1024", advertise_upload_pack(&many_refs(1024), &None, &None));
+  rec_bytes(&mut h, &"adv_1025", advertise_upload_pack(&many_refs(1025), &None, &None));
+  rec_bytes(&mut h, &"adv_1024_head", advertise_upload_pack(&many_refs(1024), &head, &None));
+  rec_bool(&mut h, &"feature_ok", check_transfer_feature(&"side-band-64k"));
+  rec_bool(&mut h, &"feature_thin", check_transfer_feature(&"thin-pack"));
+  let mut caps = List.new();
+  caps.push("report-status");
+  rec_bool(&mut h, &"caps_up_report", check_requested_capabilities(true, &caps));
+  rec_bool(&mut h, &"caps_rp_report", check_requested_capabilities(false, &caps));
+}
+
+fn repo_part(h: &mut Sha256, repo: &Repo)
+  intent "固定のオブジェクトを書いて、wire pack・広告の収集・拒否の結果を記録する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let blob = put(&repo, &ObjectType.Blob, &"xcheck transfer\n".as_bytes());
+  let mut es = List.new();
+  es.push(new_tree_entry_str(100644, "t.txt", hex_to_bytes(&blob).unwrap_or(Bytes.new())));
+  let tree = match encode_tree(&es) {
+    Ok(c) => put(&repo, &ObjectType.Tree, &c),
+    Err(_) => "",
+  };
+  let commit = match encode_commit(&new_commit_object_str(tree.clone(), List.new(), ident(), ident(), List.new(), "xcheck\n")) {
+    Ok(c) => put(&repo, &ObjectType.Commit, &c),
+    Err(_) => "",
+  };
+  let tag = match encode_tag(&new_tag_object_str(commit.clone(), "commit", "x1", ident(), "tag\n")) {
+    Ok(c) => put(&repo, &ObjectType.Tag, &c),
+    Err(_) => "",
+  };
+  record(&mut h, &"ids", &cat3(&blob, &cat3(&tree, &commit, &""), &tag));
+  let _ = create_branch(&repo, &"main", &commit);
+  let _ = create_tag(&repo, &"x1", &tag);
+  let _ = set_head_symbolic(&repo, &"refs/heads/main");
+  let mut ids = List.new();
+  ids.push(commit.clone());
+  ids.push(tree.clone());
+  ids.push(blob.clone());
+  ids.push(tag.clone());
+  ids.push(blob.clone());
+  rec_bytes(&mut h, &"pack_all", wire_pack_build(&repo, &ids));
+  let mut bad = List.new();
+  bad.push("nothex");
+  rec_bytes(&mut h, &"pack_bad_id", wire_pack_build(&repo, &bad));
+  let mut lost = List.new();
+  lost.push(rep_id(&"1"));
+  rec_bytes(&mut h, &"pack_missing", wire_pack_build(&repo, &lost));
+  let mut many = List.new();
+  let mut i = 0;
+  while i < 4097 {
+    many.push(blob.clone());
+    i = i + 1;
+  }
+  rec_bytes(&mut h, &"pack_4097", wire_pack_build(&repo, &many));
+  let mut edge = List.new();
+  i = 0;
+  while i < 4096 {
+    edge.push(blob.clone());
+    i = i + 1;
+  }
+  rec_bytes(&mut h, &"pack_4096", wire_pack_build(&repo, &edge));
+  match collect_adv_set(&repo) {
+    Ok(set) => {
+      rec_bytes(&mut h, &"collected_adv", advertise_upload_pack(&set.refs, &set.head_id, &set.head_symref));
+    }
+    Err(e) => {
+      record(&mut h, &"collected_adv", &cat3(&"err:", &error_kind_name(&e), &""));
+    }
+  }
+}
+
+pub fn compute_transfer_digest() -> String
+  intent "転送 codec と wire pack の決定論的な操作列・エラー・上限の結果を畳み込んだダイジェストを返す（SIR 評価器とネイティブの一致の検証用、ADR 0048 第 1 段）"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut h = Sha256.new();
+  codec_part(&mut h);
+  let suffix = match random_hex(6) {
+    Ok(s) => s,
+    Err(_) => "fallback",
+  };
+  let dir = cat3(&"tmp/xt_", &suffix, &"");
+  match make_dirs(&dir) {
+    Err(_) => {
+      record(&mut h, &"workdir", &"error");
+    }
+    Ok(_) => {
+      match init_repo(&join_path(&dir, &"x.git"), true, &"main") {
+        Err(e) => {
+          record(&mut h, &"init", &error_kind_name(&e));
+        }
+        Ok(repo) => {
+          repo_part(&mut h, &repo);
+        }
+      }
+    }
+  }
+  return bytes_to_hex(&h.finalize());
+}
+
+pub fn run_xcheck_transfer_tests() -> Bool
+  intent "転送のダイジェストが固定した期待値と一致することを確認する"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let digest = compute_transfer_digest();
+  console.log(&"xcheck transfer digest: ");
+  console.log(&digest);
+  if digest != expected_transfer_digest() {
+    console.log(&"FAIL: transfer digest mismatch with the pinned expected digest");
+    return false;
+  }
+  return true;
+}
+
+pub fn expected_transfer_digest() -> String
+  intent "固定した期待ダイジェストを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "3fde4e5e7373be2532669ea69809c0da971f72d25ca5e95bdfe7da409a893485";
+}

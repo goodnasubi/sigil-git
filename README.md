@@ -96,6 +96,15 @@ SHA-256 のリポジトリで、`add` → `commit` → `checkout` の一連が�
 
 第5段で使用した Sigil コンパイラの固定 SHA は `33467e3b43238fdc69331c58a788c95f1de393e5` です。相互運用の比較版は Git **2.43.0** です。`interop_history.sh` は履歴・木・blob・差分の比較、テキストパッチの双方向適用、併合の木、衝突時の無変更、および上限エラーを検査します。
 
+## 転送 第1段「転送 codec と wire 専用 pack 出力」（ADR 0048）
+
+転送（clone／fetch／push）の土台になる、符号化・復号と pack 出力です。upload-pack の要求処理、隔離受信、push は後続の段で扱います。詳細は [docs/TRANSFER.md](docs/TRANSFER.md)。
+
+- `git/pktline.sigil`: pkt-line の符号化・復号（プロトコル v0。4 桁の小文字 hex、`0000` flush、1 つ 65520 byte まで。delimiter／response-end は拒否）。
+- `git/transfer.sigil`: 能力広告（upload-pack は `object-format=sha256`・`symref`・`side-band-64k`、receive-pack は `object-format=sha256`・`report-status`・`ofs-delta`）、注釈付きタグの peeled 行、空リポジトリの `capabilities^{}`、対応表（既定は拒否）。
+- `git/wirepack.sigil`: 明示した識別子の集合から、非 thin・非 delta・zlib stored の pack v2 を作ります（転送の応答専用。ローカルへは保存しません）。
+- 上限（`git/limits.sigil`）: pkt-line 65520 byte、オブジェクト 4096、応答 1 MiB、広告する参照 1024、グラフ走査 100000 件。超えるときは自動分割も再試行もせず `LimitExceeded` です。
+
 ## テストの実行
 
 前提として、Sigil コンパイラ（固定版コミット `33467e3b43238fdc69331c58a788c95f1de393e5`）が利用可能である必要があります。
@@ -114,4 +123,5 @@ sigil run --root . test_runner.sigil main
 SIGIL=/path/to/sigil ./interop.sh        # 第2段: init・書き込み・参照
 SIGIL=/path/to/sigil ./interop_pack.sh   # 第3段: gc 済みの pack の読み取り（オブジェクト・log --topo-order・ls-tree -r・diff）
 SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_history.sh  # 第5段
+SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_transfer.sh  # 転送 第1段: 広告を実 Git と比較、pack を index-pack --strict・verify-pack・fsck で検証
 ```

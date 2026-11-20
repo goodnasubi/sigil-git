@@ -1,0 +1,109 @@
+module interop_transfer
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat2;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.read_file_opt;
+use git.fsio.string_slice;
+use git.fsio.string_starts_with;
+use git.hash.int_to_str;
+use git.pktline.pkt_decode_section;
+use git.repo.open_repo;
+use git.transfer.advertise_receive_pack;
+use git.transfer.advertise_upload_pack;
+use git.transfer.collect_adv_set;
+use git.wirepack.wire_pack_build;
+
+fn read_input(path: &String) -> Result<Bytes, GitError>
+  intent "path のファイルを読む（10 MiB まで）。無ければ NotFound"
+  requires none
+  ensures none
+  effects fs.read
+{
+  let mut out = Bytes.new();
+  match read_file_opt(&path, 10485760, false)? {
+    Some(b) => {
+      out = b;
+    }
+    None => {
+      return Err(GitError.NotFound("input file is missing"));
+    }
+  }
+  return Ok(out);
+}
+
+fn step(dir: &String, line: &String) -> Result<String, GitError>
+  intent "コマンド 1 行を実行して結果の文字列を返す。adv_upload／adv_receive は広告を <dir>/<名前>.bin に書く。pack:<名前> は <dir>/<名前>.ids の識別子から wire pack を <dir>/<名前>.pack に書く。decode:<名前> は <dir>/<名前>.bin を pkt-line の区間として復号して行数を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let repo = open_repo(&cat3(&dir, &"/repo", &""))?;
+  if line == "adv_upload" {
+    let set = collect_adv_set(&repo)?;
+    let out = advertise_upload_pack(&set.refs, &set.head_id, &set.head_symref)?;
+    create_synced_file(&cat3(&dir, &"/adv_upload.bin", &""), &out)?;
+    return Ok("written");
+  }
+  if line == "adv_receive" {
+    let set = collect_adv_set(&repo)?;
+    let out = advertise_receive_pack(&set.refs)?;
+    create_synced_file(&cat3(&dir, &"/adv_receive.bin", &""), &out)?;
+    return Ok("written");
+  }
+  if string_starts_with(&line, &"pack:") {
+    let name = string_slice(&line, 5, line.as_bytes().len());
+    let ids_text = read_input(&cat3(&dir, &"/", &cat2(&name, &".ids")))?.to_string_utf8().unwrap_or("");
+    let ids = ids_text.lines();
+    let pack = wire_pack_build(&repo, &ids)?;
+    create_synced_file(&cat3(&dir, &"/", &cat2(&name, &".pack")), &pack)?;
+    return Ok(int_to_str(pack.len()));
+  }
+  if string_starts_with(&line, &"decode:") {
+    let name = string_slice(&line, 7, line.as_bytes().len());
+    let data = read_input(&cat3(&dir, &"/", &cat2(&name, &".bin")))?;
+    let ls = pkt_decode_section(&data)?;
+    return Ok(int_to_str(ls.len()));
+  }
+  return Err(GitError.UnsupportedFormat("unknown command"));
+}
+
+pub fn main() -> Int
+  intent "tmp/interop_transfer/cmds.txt のコマンドを 1 行ずつ tmp/interop_transfer/repo（SHA-256）に対して実行し、結果を 1 行ずつ出力する（成功は ok:結果、失敗は error:種別）。コマンドが読めなければ 1"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "tmp/interop_transfer";
+  let cmds = match read_file_opt(&"tmp/interop_transfer/cmds.txt", 1048576, false) {
+    Ok(Some(b)) => b.to_string_utf8().unwrap_or(""),
+    _ => "",
+  };
+  if cmds == "" {
+    console.log(&"error: no commands");
+    return 1;
+  }
+  let lines = cmds.lines();
+  let mut i = 0;
+  while i < lines.len() {
+    match lines.get(i) {
+      None => {}
+      Some(line) => {
+        match step(&dir, &line) {
+          Ok(v) => {
+            console.log(&cat3(&"ok:", &v, &""));
+          }
+          Err(e) => {
+            console.log(&cat2(&"error:", &error_kind_name(&e)));
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}

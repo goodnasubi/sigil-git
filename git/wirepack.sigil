@@ -1,0 +1,267 @@
+module git.wirepack
+  targets server
+  trust none
+
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.error.GitError;
+use git.fsio.file_exists;
+use git.hash.bytes_to_hex;
+use git.hash.compute_sha256;
+use git.hash.is_valid_hex_id;
+use git.limits.max_graph_walk_items;
+use git.limits.max_transfer_objects;
+use git.limits.max_transfer_response_size;
+use git.object.ObjectType;
+use git.object.object_type_name;
+use git.odb.object_path;
+use git.odb.odb_read_in;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.pack.pack_has;
+use git.repo.Repo;
+use git.tag.decode_tag;
+use git.tag.tag_object_id;
+use git.tag.tag_object_type;
+use git.tree.decode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.walk.index_of;
+use git.zlib.zlib_stored;
+
+// ADR 0048 決定 1・2: wire 専用 pack v2 の出力。
+// 明示的に渡された識別子の集合から、非 thin・非 delta の pack v2（"PACK"・版 2・件数・オブジェクト群・SHA-256 の検査値）を作る。
+// 各オブジェクトは 0047 の核で読み（識別子の再計算で検証）、型ごとに内容を解読して検査する。
+// オブジェクトの zlib は git.zlib の stored ブロックだけ。応答の大きさは作る前に見積もって、1 MiB を超えれば何も返さず LimitExceeded にする。
+// これは転送応答専用で、ローカルの保存（repack・gc）には使わない。
+
+fn type_code(t: &ObjectType) -> Int
+  intent "pack のオブジェクト種別の番号（commit 1・tree 2・blob 3・tag 4）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match t {
+    ObjectType.Commit => 1,
+    ObjectType.Tree => 2,
+    ObjectType.Blob => 3,
+    ObjectType.Tag => 4,
+  };
+}
+
+pub fn stored_zlib_len(n: Int) -> Int
+  intent "n byte を git.zlib の zlib_stored に通した長さを、作らずに計算する（2 + 5 × ブロック数 + n + 4）"
+  requires n >= 0
+  ensures result >= n + 11
+  effects none
+{
+  let mut blocks = 1;
+  if n > 0 {
+    blocks = (n + 65534) / 65535;
+  }
+  return 2 + blocks * 5 + n + 4;
+}
+
+fn push_be32(out: &mut Bytes, v: Int)
+  intent "32 bit の値を big endian で追記する"
+  requires v >= 0
+  ensures none
+  effects none
+{
+  out.push(v / 16777216 % 256);
+  out.push(v / 65536 % 256);
+  out.push(v / 256 % 256);
+  out.push(v % 256);
+}
+
+pub fn pack_object_header(code: Int, size: Int) -> Bytes
+  intent "pack のオブジェクトの先頭（種別と展開後の長さの可変長整数）を返す"
+  requires code >= 1 && code <= 4 && size >= 0
+  ensures result.len() >= 1
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut first = code * 16 + size % 16;
+  let mut rest = size / 16;
+  if rest > 0 {
+    first = first + 128;
+  }
+  out.push(first);
+  while rest > 0 {
+    let mut b = rest % 128;
+    rest = rest / 128;
+    if rest > 0 {
+      b = b + 128;
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+fn exists_in(repo: &Repo, packs: &List<PackStore>, id_hex: &String) -> Result<Bool, GitError>
+  intent "識別子のオブジェクトが緩い形式のファイルか pack にあるかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  if file_exists(&object_path(&repo, &id_hex)?)? {
+    return Ok(true);
+  }
+  let mut i = 0;
+  while i < packs.len() {
+    match packs.get(i) {
+      None => {}
+      Some(p) => {
+        if pack_has(&p, &id_hex)? {
+          return Ok(true);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(false);
+}
+
+fn need(repo: &Repo, packs: &List<PackStore>, id_hex: &String, budget: Int) -> Result<Int, GitError>
+  intent "参照先のオブジェクトの存在を確かめて、残りの走査件数を返す。件数を使い切れば LimitExceeded、無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  if budget <= 0 {
+    return Err(GitError.LimitExceeded("object reference checks exceed the graph walk limit"));
+  }
+  if !exists_in(&repo, &packs, &id_hex)? {
+    return Err(GitError.NotFound("a referenced object does not exist"));
+  }
+  return Ok(budget - 1);
+}
+
+fn verify_object(repo: &Repo, packs: &List<PackStore>, obj_type: &ObjectType, content: &Bytes, budget: Int) -> Result<Int, GitError>
+  intent "型ごとに内容を解読して検査し、参照するオブジェクト（commit の tree と親、tree のエントリ、tag の対象）の存在を確かめて、残りの走査件数を返す。tag の対象は宣言した型も読んで確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut left = budget;
+  match obj_type {
+    ObjectType.Blob => {}
+    ObjectType.Commit => {
+      let c = decode_commit(&content)?;
+      left = need(&repo, &packs, &commit_tree_id(&c), left)?;
+      let parents = commit_parents(&c);
+      let mut i = 0;
+      while i < parents.len() {
+        match parents.get(i) {
+          None => {}
+          Some(p) => {
+            left = need(&repo, &packs, &p, left)?;
+          }
+        }
+        i = i + 1;
+      }
+    }
+    ObjectType.Tree => {
+      let entries = decode_tree(&content)?;
+      let mut i = 0;
+      while i < entries.len() {
+        match entries.get(i) {
+          None => {}
+          Some(e) => {
+            // gitlink (160000) は別リポジトリの commit なので、この核では存在を求めない
+            if entry_mode(&e) != 160000 {
+              left = need(&repo, &packs, &bytes_to_hex(&entry_id(&e)), left)?;
+            }
+          }
+        }
+        i = i + 1;
+      }
+    }
+    ObjectType.Tag => {
+      let t = decode_tag(&content)?;
+      let target = tag_object_id(&t);
+      if left <= 0 {
+        return Err(GitError.LimitExceeded("object reference checks exceed the graph walk limit"));
+      }
+      left = left - 1;
+      let o = odb_read_in(&repo, &packs, &target)?;
+      if object_type_name(&o.obj_type) != tag_object_type(&t) {
+        return Err(GitError.TypeMismatch("a tag's declared object type does not match its target"));
+      }
+    }
+  }
+  return Ok(left);
+}
+
+pub fn wire_pack_build(repo: &Repo, ids: &List<String>) -> Result<Bytes, GitError>
+  intent "識別子の集合から wire 専用の pack v2（非 thin・非 delta・zlib stored）を作る。重複は除き、与えた順に並べる。識別子の形・存在・型・内容・参照を 0047 の核で検査する。オブジェクト数 4096・走査 100000 件・応答 1 MiB を超える見込みなら、何も作らず LimitExceeded"
+  requires none
+  ensures none
+  effects fs
+{
+  return wire_pack_build_limited(&repo, &ids, max_graph_walk_items());
+}
+
+pub fn wire_pack_build_limited(repo: &Repo, ids: &List<String>, walk_budget: Int) -> Result<Bytes, GitError>
+  intent "wire_pack_build の本体。参照の検査の走査件数の上限を walk_budget にする（固定上限は 100000。小さい値は上限の境界を試すためにある）"
+  requires walk_budget >= 0
+  ensures none
+  effects fs
+{
+  if ids.len() > max_transfer_objects() {
+    return Err(GitError.LimitExceeded("too many objects in one transfer"));
+  }
+  let mut uniq = List.new();
+  let mut i = 0;
+  while i < ids.len() {
+    match ids.get(i) {
+      None => {}
+      Some(id) => {
+        if !is_valid_hex_id(&id) {
+          return Err(GitError.Corrupt("object id is not a SHA-256 object id"));
+        }
+        if index_of(&uniq, &id) < 0 {
+          uniq.push(id.clone());
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let packs = open_packs(&repo)?;
+  let mut predicted = 12 + 32;
+  let mut budget = walk_budget;
+  let mut body = Bytes.new();
+  i = 0;
+  while i < uniq.len() {
+    match uniq.get(i) {
+      None => {}
+      Some(id) => {
+        let o = odb_read_in(&repo, &packs, &id)?;
+        budget = verify_object(&repo, &packs, &o.obj_type, &o.content, budget)?;
+        let hdr = pack_object_header(type_code(&o.obj_type), o.content.len());
+        predicted = predicted + hdr.len() + stored_zlib_len(o.content.len());
+        if predicted > max_transfer_response_size() {
+          return Err(GitError.LimitExceeded("pack would exceed the 1 MiB response limit"));
+        }
+        body.extend(&hdr);
+        body.extend(&zlib_stored(&o.content));
+      }
+    }
+    i = i + 1;
+  }
+  let mut out = Bytes.new();
+  out.push(80);
+  out.push(65);
+  out.push(67);
+  out.push(75);
+  push_be32(&mut out, 2);
+  push_be32(&mut out, uniq.len());
+  out.extend(&body);
+  let trailer = compute_sha256(&out);
+  out.extend(&trailer);
+  if out.len() != predicted {
+    return Err(GitError.Corrupt("internal error: pack size differs from the estimate"));
+  }
+  return Ok(out);
+}

@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=== 1. Checking format (sigil fmt --check) ==="
-$SIGIL fmt --check git/*.sigil tests/*.sigil test_runner.sigil interop_make.sigil interop_delete.sigil interop_read.sigil interop_ops.sigil interop_history.sigil mutation_runner.sigil perf_runner.sigil
+$SIGIL fmt --check git/*.sigil tests/*.sigil test_runner.sigil interop_make.sigil interop_delete.sigil interop_read.sigil interop_ops.sigil interop_history.sigil interop_transfer.sigil mutation_runner.sigil perf_runner.sigil
 
 echo "=== 2. Type checking (sigil check) ==="
 $SIGIL check --root . test_runner.sigil
@@ -28,6 +28,7 @@ $SIGIL check --root . interop_delete.sigil
 $SIGIL check --root . interop_read.sigil
 $SIGIL check --root . interop_ops.sigil
 $SIGIL check --root . interop_history.sigil
+$SIGIL check --root . interop_transfer.sigil
 $SIGIL check --root . mutation_runner.sigil
 $SIGIL check --root . perf_runner.sigil
 for f in git/*.sigil tests/*.sigil; do
@@ -63,6 +64,7 @@ SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_pack.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_ops.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_history.sh
+SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_transfer.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" bash tests/fault_interop.sh
 grep -E '^# [0-9a-f]{64}' fixtures/v1/manifest.txt | sed 's/^# //' | (cd fixtures/v1 && sha256sum -c - >/dev/null)
 echo "Fixture v1 SHA-256 checksums verified!"
@@ -85,6 +87,24 @@ if [ "$SIR_DIGEST" != "$NATIVE_DIGEST" ] || [ "$SIR_DIGEST" != "$EXPECTED_DIGEST
   exit 1
 fi
 echo "Execution path equivalence verified!"
+
+echo "=== 6b. Transfer codec and wire pack: SIR evaluator vs Native binary (ADR 0048) ==="
+EXPECTED_XFER_DIGEST="3fde4e5e7373be2532669ea69809c0da971f72d25ca5e95bdfe7da409a893485"
+SIR_XFER="$($SIGIL run --root . tests/test_xcheck_transfer.sigil compute_transfer_digest | tail -n 1 | tr -d '"')"
+XFER_BIN="$(mktemp -t sigil_git_xfer_XXXXXX)"
+trap 'rm -f "$XFER_BIN"' EXIT
+$SIGIL build --root . tests/test_xcheck_transfer.sigil compute_transfer_digest -o "$XFER_BIN"
+NATIVE_XFER="$("$XFER_BIN" | tail -n 1 | tr -d '"')"
+rm -f "$XFER_BIN"
+trap - EXIT
+echo "SIR evaluator transfer digest: $SIR_XFER"
+echo "Native binary transfer digest: $NATIVE_XFER"
+echo "Pinned expected digest:        $EXPECTED_XFER_DIGEST"
+if [ "$SIR_XFER" != "$NATIVE_XFER" ] || [ "$SIR_XFER" != "$EXPECTED_XFER_DIGEST" ]; then
+  echo "Error: transfer digest mismatch between SIR evaluator, Native binary, and Pinned digest" >&2
+  exit 1
+fi
+echo "Transfer execution path equivalence verified!"
 
 echo "=== 7. Mutation testing suite ==="
 if command -v python3 >/dev/null 2>&1; then
