@@ -1,0 +1,1048 @@
+module tests.test_receive
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.file_exists;
+use git.fsio.join_path;
+use git.fsio.list_names;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.fsio.remove_file_if_exists;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.hash.compute_sha256;
+use git.hash.hex_to_bytes;
+use git.odb.odb_has;
+use git.odb.open_packs;
+use git.pktline.pkt_encode;
+use git.pktline.pkt_encode_str;
+use git.pktline.pkt_flush;
+use git.receive.ReceiveReply;
+use git.receive.ReceiveRequest;
+use git.receive.WriteCheck;
+use git.receive.new_write_check;
+use git.receive.parse_receive_request;
+use git.receive.policy_check;
+use git.receive.receive_commit;
+use git.receive.receive_info_refs_reply;
+use git.receive.receive_pack_post;
+use git.receive.receive_pack_post_limited;
+use git.receive.receive_verify;
+use git.recvpack.RecvObject;
+use git.recvpack.recv_pack_parse;
+use git.refs.read_ref;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.upload.reachable_objects;
+use git.wirepack.wire_pack_build;
+use git.zlib.zlib_stored;
+use tests.test_upload.Fixture;
+use tests.test_upload.build_fixture;
+
+// ADR 0048 第 3 段: receive-pack（受信広告、pack の隔離検証、単一参照 push、report-status、gzip 拒否、上限）を試す。
+// 本物の Git クライアントとの接続は interop_receive.sh で確かめる。
+
+fn fail(label: &String) -> Bool
+  intent "失敗したラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&cat3(&"  FAILED: ", &label, &""));
+  return false;
+}
+
+fn expect(cond: Bool, label: &String) -> Bool
+  intent "cond が偽ならラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  if !cond {
+    return fail(&label);
+  }
+  return true;
+}
+
+fn pkt(text: &String) -> Bytes
+  intent "文字列を pkt-line にする"
+  requires none
+  ensures none
+  effects none
+{
+  return pkt_encode_str(&text).unwrap_or(Bytes.new());
+}
+
+fn zero() -> String
+  intent "ゼロ識別子"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < 64 {
+    b.push(48);
+    i = i + 1;
+  }
+  return b.to_string_utf8().unwrap_or("");
+}
+
+fn one(a: &String) -> List<String>
+  intent "要素 1 つのリスト"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a.clone());
+  return l;
+}
+
+fn caps_ok() -> String
+  intent "正常な能力の並び"
+  requires none
+  ensures none
+  effects none
+{
+  return "report-status ofs-delta object-format=sha256";
+}
+
+fn command_pkt(oldv: &String, newv: &String, name: &String, caps: &String) -> Bytes
+  intent "コマンド行の pkt-line（NUL の後に能力）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = cat3(&cat3(&oldv, &" ", &newv), &" ", &name).as_bytes();
+  payload.push(0);
+  payload.extend(&caps.as_bytes());
+  return pkt_encode(&payload).unwrap_or(Bytes.new());
+}
+
+fn push_body(oldv: &String, newv: &String, name: &String, caps: &String, pack: &Bytes) -> Bytes
+  intent "単一参照の push 要求本文（コマンド、flush、pack）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = command_pkt(&oldv, &newv, &name, &caps);
+  b.extend(&pkt_flush());
+  b.extend(&pack);
+  return b;
+}
+
+fn report_ok(name: &String) -> Bytes
+  intent "成功の report-status"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = pkt(&"unpack ok\n");
+  b.extend(&pkt(&cat3(&"ok ", &name, &"\n")));
+  b.extend(&pkt_flush());
+  return b;
+}
+
+fn report_ng(unpack: &String, name: &String, reason: &String) -> Bytes
+  intent "拒否の report-status"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = pkt(&cat3(&"unpack ", &unpack, &"\n"));
+  b.extend(&pkt(&cat3(&cat3(&"ng ", &name, &" "), &reason, &"\n")));
+  b.extend(&pkt_flush());
+  return b;
+}
+
+fn ids_of(f: &Fixture, tip: &String) -> List<String>
+  intent "tip からの到達集合の識別子（失敗すれば空）"
+  requires none
+  ensures none
+  effects fs
+{
+  return match open_packs(&f.repo) {
+    Ok(packs) => match reachable_objects(&f.repo, &packs, &one(&tip), 4096, 100000) {
+      Ok(l) => l,
+      Err(_) => List.new(),
+    },
+    Err(_) => List.new(),
+  };
+}
+
+fn pack_of(f: &Fixture, ids: &List<String>) -> Bytes
+  intent "ids から wire pack を作る（失敗すれば空）"
+  requires none
+  ensures none
+  effects fs
+{
+  return wire_pack_build(&f.repo, &ids).unwrap_or(Bytes.new());
+}
+
+fn empty_pack() -> Bytes
+  intent "オブジェクトを含まない pack（lightweight tag や既存 commit への branch 用）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = "PACK".as_bytes();
+  b.extend(&be32(2));
+  b.extend(&be32(0));
+  let t = compute_sha256(&b);
+  b.extend(&t);
+  return b;
+}
+
+fn be32(n: Int) -> Bytes
+  intent "big endian の 32 bit"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(n / 16777216 % 256);
+  b.push(n / 65536 % 256);
+  b.push(n / 256 % 256);
+  b.push(n % 256);
+  return b;
+}
+
+fn fresh(dir: &String, name: &String, fallback: &Repo) -> Repo
+  intent "空の bare リポジトリ（HEAD は main）を作る"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return init_repo(&join_path(&dir, &name), true, &"main").unwrap_or(fallback.clone());
+}
+
+fn wc_ok() -> WriteCheck
+  intent "書き込みを許可する WriteCheck"
+  requires none
+  ensures none
+  effects none
+{
+  return new_write_check("", "demo", "alice", true);
+}
+
+fn post(repo: &Repo, body: &Bytes) -> ReceiveReply
+  intent "正常な Content-Type・符号化なしで POST する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut ct = Some("application/x-git-receive-pack-request".as_bytes());
+  return receive_pack_post(&repo, &List.new(), &ct, &body, &wc_ok());
+}
+
+fn ref_is(repo: &Repo, name: &String, want: &String) -> Bool
+  intent "参照の現在値が want か（want が空なら参照が無い）"
+  requires none
+  ensures none
+  effects fs.read
+{
+  return match read_ref(&repo, &name) {
+    Ok(Some(v)) => v == want.clone(),
+    Ok(None) => want.clone() == "",
+    Err(_) => false,
+  };
+}
+
+fn staging_empty(repo: &Repo) -> Bool
+  intent "staging に pack が残っていないか"
+  requires none
+  ensures none
+  effects fs
+{
+  return match list_names(&join_path(&repo.git_dir, &"sigil-staging"), 100) {
+    Ok(names) => names.len() == 0,
+    Err(_) => true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 要求の解読と方針
+// ---------------------------------------------------------------------------
+
+fn run_parse(f: &Fixture) -> Bool
+  intent "コマンド行・能力・方針の解読を試す"
+  requires none
+  ensures none
+  effects console
+{
+  let mut ok = true;
+  let c2 = f.commit2.clone();
+  let good = push_body(&zero(), &c2, &"refs/heads/main", &caps_ok(), &empty_pack());
+  match parse_receive_request(&good) {
+    Ok(r) => {
+      ok = expect(r.cmd.old_id == zero() && r.cmd.new_id == c2 && r.cmd.ref_name == "refs/heads/main" && !r.multiple && r.pack.len() == 44, &"parse: a single command with a pack") && ok;
+    }
+    Err(_) => {
+      ok = fail(&"parse: a valid request is accepted") && ok;
+    }
+  }
+  let sha1 = push_body(&"0000000000000000000000000000000000000000", &"1111111111111111111111111111111111111111", &"refs/heads/main", &caps_ok(), &empty_pack());
+  ok = expect(is_unsupported(&parse_receive_request(&sha1)), &"parse: SHA-1 object ids are unsupported") && ok;
+  let atomic = push_body(&zero(), &c2, &"refs/heads/main", &"report-status atomic", &empty_pack());
+  ok = expect(is_unsupported(&parse_receive_request(&atomic)), &"parse: atomic is unsupported") && ok;
+  let opts = push_body(&zero(), &c2, &"refs/heads/main", &"report-status push-options", &empty_pack());
+  ok = expect(is_unsupported(&parse_receive_request(&opts)), &"parse: push-options is unsupported") && ok;
+  let sb = push_body(&zero(), &c2, &"refs/heads/main", &"report-status side-band-64k", &empty_pack());
+  ok = expect(is_unsupported(&parse_receive_request(&sb)), &"parse: side-band-64k is not advertised so it is unsupported") && ok;
+  let sha1fmt = push_body(&zero(), &c2, &"refs/heads/main", &"report-status object-format=sha1", &empty_pack());
+  ok = expect(is_unsupported(&parse_receive_request(&sha1fmt)), &"parse: object-format=sha1 is unsupported") && ok;
+  let norep = push_body(&zero(), &c2, &"refs/heads/main", &"ofs-delta", &empty_pack());
+  ok = expect(is_unsupported(&parse_receive_request(&norep)), &"parse: report-status is required") && ok;
+  let nopack = push_body(&zero(), &c2, &"refs/heads/main", &caps_ok(), &Bytes.new());
+  ok = expect(parse_receive_request(&nopack).is_err(), &"parse: a missing pack is rejected") && ok;
+  let mut shallow = pkt(&cat3(&"shallow ", &c2, &"\n"));
+  shallow.extend(&good);
+  ok = expect(is_unsupported(&parse_receive_request(&shallow)), &"parse: a shallow line is unsupported") && ok;
+  let mut two = command_pkt(&zero(), &c2, &"refs/heads/main", &caps_ok());
+  two.extend(&command_pkt(&zero(), &c2, &"refs/heads/other", &""));
+  two.extend(&pkt_flush());
+  two.extend(&empty_pack());
+  match parse_receive_request(&two) {
+    Ok(r) => {
+      ok = expect(r.multiple, &"parse: a second command is flagged as multiple refs") && ok;
+    }
+    Err(_) => {
+      ok = fail(&"parse: multiple refs parse to a flagged request") && ok;
+    }
+  }
+  ok = expect(parse_receive_request(&Bytes.new()).is_err(), &"parse: an empty body is rejected") && ok;
+  ok = expect(parse_receive_request(&pkt_flush()).is_err(), &"parse: a flush-only body is rejected") && ok;
+  let nonul = pkt(&cat3(&cat3(&zero(), &" ", &c2), &" ", &"refs/heads/main\n"));
+  ok = expect(parse_receive_request(&nonul).is_err(), &"parse: missing capabilities are rejected") && ok;
+  let upper = push_body(&zero(), &"ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD", &"refs/heads/main", &caps_ok(), &empty_pack());
+  ok = expect(parse_receive_request(&upper).is_err(), &"parse: non-canonical object ids are rejected") && ok;
+  // 方針（pack を読む前）
+  ok = expect(policy_for(&zero(), &c2, &"refs/heads/main") == "", &"policy: a new branch is allowed") && ok;
+  ok = expect(policy_for(&zero(), &c2, &"refs/tags/v1") == "", &"policy: a new tag is allowed") && ok;
+  ok = expect(policy_for(&zero(), &c2, &"refs/notes/x") == "unsupported_ref", &"policy: only heads and tags") && ok;
+  ok = expect(policy_for(&zero(), &c2, &"HEAD") == "unsupported_ref", &"policy: HEAD is not pushable") && ok;
+  ok = expect(policy_for(&zero(), &c2, &"refs/heads/a..b") == "invalid_ref", &"policy: invalid ref names") && ok;
+  ok = expect(policy_for(&c2, &zero(), &"refs/heads/main") == "delete_not_allowed", &"policy: delete of a branch") && ok;
+  ok = expect(policy_for(&c2, &zero(), &"refs/tags/v1") == "delete_not_allowed", &"policy: delete of a tag") && ok;
+  ok = expect(policy_for(&c2, &f.commit1, &"refs/tags/v1") == "tag_exists", &"policy: tags are create-only") && ok;
+  ok = expect(policy_for(&c2, &f.commit1, &"refs/heads/main") == "", &"policy: updating a branch is decided later") && ok;
+  return ok;
+}
+
+fn policy_for(oldv: &String, newv: &String, name: &String) -> String
+  intent "方針の拒否理由（許可なら空）"
+  requires none
+  ensures none
+  effects none
+{
+  return policy_check(&oldv, &newv, &name);
+}
+
+fn is_unsupported(r: &Result<ReceiveRequest, GitError>) -> Bool
+  intent "解読が UnsupportedFormat で失敗したか"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Err(GitError.UnsupportedFormat(_)) => true,
+    _ => false,
+  };
+}
+
+fn has_text(b: &Bytes, needle: &String) -> Bool
+  intent "b に needle（UTF-8）が含まれるか"
+  requires none
+  ensures none
+  effects none
+{
+  let n = needle.as_bytes();
+  if n.len() == 0 {
+    return true;
+  }
+  let mut i = 0;
+  while i + n.len() <= b.len() {
+    if b.slice(i, i + n.len()).unwrap_or(Bytes.new()) == n.clone() {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn starts_with_text(b: &Bytes, prefix: &String) -> Bool
+  intent "b が prefix で始まるか"
+  requires none
+  ensures none
+  effects none
+{
+  let p = prefix.as_bytes();
+  if b.len() < p.len() {
+    return false;
+  }
+  return b.slice(0, p.len()).unwrap_or(Bytes.new()) == p;
+}
+
+// ---------------------------------------------------------------------------
+// pack の隔離検証
+// ---------------------------------------------------------------------------
+
+fn entry_header(code: Int, size: Int) -> Bytes
+  intent "pack エントリの先頭（型 1〜7 と展開後の長さの可変長整数）"
+  requires code >= 1 && code <= 7 && size >= 0
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut first = code * 16 + size % 16;
+  let mut rest = size / 16;
+  if rest > 0 {
+    first = first + 128;
+  }
+  out.push(first);
+  while rest > 0 {
+    let mut b = rest % 128;
+    rest = rest / 128;
+    if rest > 0 {
+      b = b + 128;
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+fn plain_entry(code: Int, content: &Bytes) -> Bytes
+  intent "差分でないエントリ（stored の zlib）"
+  requires code >= 1 && code <= 4
+  ensures none
+  effects none
+{
+  let mut b = entry_header(code, content.len());
+  b.extend(&zlib_stored(&content));
+  return b;
+}
+
+fn varint(n: Int) -> Bytes
+  intent "差分の大きさの可変長整数"
+  requires n >= 0
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut v = n;
+  let mut more = true;
+  while more {
+    let mut b = v % 128;
+    v = v / 128;
+    if v > 0 {
+      b = b + 128;
+    } else {
+      more = false;
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+fn delta_append(base_len: Int, tail: &Bytes) -> Bytes
+  intent "基底全体をコピーして tail を足す差分（基底は 255 byte 以下、tail は 127 byte 以下）"
+  requires base_len >= 1 && base_len < 256 && tail.len() >= 1 && tail.len() < 128
+  ensures none
+  effects none
+{
+  let mut d = varint(base_len);
+  d.extend(&varint(base_len + tail.len()));
+  d.push(144);
+  d.push(base_len);
+  d.push(tail.len());
+  d.extend(&tail);
+  return d;
+}
+
+fn ofs_entry(rel: Int, delta: &Bytes) -> Bytes
+  intent "OFS_DELTA エントリ（rel は 127 以下）"
+  requires rel >= 1 && rel < 128
+  ensures none
+  effects none
+{
+  let mut b = entry_header(6, delta.len());
+  b.push(rel);
+  b.extend(&zlib_stored(&delta));
+  return b;
+}
+
+fn ref_entry(base_hex: &String, delta: &Bytes) -> Bytes
+  intent "REF_DELTA エントリ"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = entry_header(7, delta.len());
+  b.extend(&hex_bytes(&base_hex));
+  b.extend(&zlib_stored(&delta));
+  return b;
+}
+
+fn hex_bytes(h: &String) -> Bytes
+  intent "64 桁の hex を 32 byte にする（失敗すれば空）"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_to_bytes(&h).unwrap_or(Bytes.new());
+}
+
+fn assemble_n(count: Int, entries: &List<Bytes>) -> Bytes
+  intent "見出しの件数を count にして pack を組み立てる（trailer は再計算）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = "PACK".as_bytes();
+  b.extend(&be32(2));
+  b.extend(&be32(count));
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      Some(e) => {
+        b.extend(&e);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let t = compute_sha256(&b);
+  b.extend(&t);
+  return b;
+}
+
+fn assemble(entries: &List<Bytes>) -> Bytes
+  intent "件数どおりに pack を組み立てる"
+  requires none
+  ensures none
+  effects none
+{
+  return assemble_n(entries.len(), &entries);
+}
+
+fn blob_id(content: &Bytes) -> String
+  intent "blob の識別子"
+  requires none
+  ensures none
+  effects none
+{
+  return bytes_to_hex(&compute_object_id(&"blob", &content));
+}
+
+fn parse_kind(pack: &Bytes, objects: Int, total: Int, single: Int) -> String
+  intent "recv_pack_parse の結果を ok／limit／unsupported／corrupt に分類する"
+  requires none
+  ensures none
+  effects none
+{
+  return match recv_pack_parse(&pack, objects, total, single) {
+    Ok(_) => "ok",
+    Err(GitError.LimitExceeded(_)) => "limit",
+    Err(GitError.UnsupportedFormat(_)) => "unsupported",
+    Err(GitError.Corrupt(_)) => "corrupt",
+    Err(_) => "other",
+  };
+}
+
+fn parse_count(pack: &Bytes) -> Int
+  intent "recv_pack_parse が返すオブジェクト数（失敗は -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match recv_pack_parse(&pack, 4096, 16777216, 8388608) {
+    Ok(l) => l.len(),
+    Err(_) => 0 - 1,
+  };
+}
+
+fn chain_pack(n_deltas: Int) -> Bytes
+  intent "10 byte の blob と、1 byte ずつ足す OFS_DELTA の連鎖 n_deltas 個の pack"
+  requires n_deltas >= 0
+  ensures none
+  effects none
+{
+  let mut entries = List.new();
+  let first = plain_entry(3, &"0123456789".as_bytes());
+  let mut prev_len = first.len();
+  entries.push(first);
+  let mut content_len = 10;
+  let mut i = 0;
+  while i < n_deltas {
+    let e = ofs_entry(prev_len, &delta_append(content_len, &"x".as_bytes()));
+    prev_len = e.len();
+    entries.push(e);
+    content_len = content_len + 1;
+    i = i + 1;
+  }
+  return assemble(&entries);
+}
+
+fn run_packs(f: &Fixture) -> Bool
+  intent "pack の隔離検証（見出し・件数・trailer・zlib・OID・delta・thin pack・上限）を試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut ok = true;
+  let ids = ids_of(&f, &f.commit2);
+  let good = pack_of(&f, &ids);
+  ok = expect(ids.len() == 6 && parse_count(&good) == 6, &"pack: a valid wire pack yields every object once") && ok;
+  match recv_pack_parse(&good, 4096, 16777216, 8388608) {
+    Ok(objs) => {
+      let mut all = true;
+      let mut i = 0;
+      while i < objs.len() {
+        match objs.get(i) {
+          Some(o) => {
+            if index_in(&ids, &o.id) < 0 {
+              all = false;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      ok = expect(all, &"pack: object ids are recomputed and match the published ids") && ok;
+    }
+    Err(_) => {
+      ok = fail(&"pack: valid pack parses") && ok;
+    }
+  }
+  ok = expect(parse_kind(&empty_pack(), 4096, 16777216, 8388608) == "ok", &"pack: an empty pack (0 objects) is accepted") && ok;
+  // 見出し・trailer・長さ
+  let short = good.slice(0, 20).unwrap_or(Bytes.new());
+  ok = expect(parse_kind(&short, 4096, 16777216, 8388608) == "corrupt", &"pack: truncated pack is corrupt") && ok;
+  let cut = good.slice(0, good.len() - 1).unwrap_or(Bytes.new());
+  ok = expect(parse_kind(&cut, 4096, 16777216, 8388608) == "corrupt", &"pack: pack without a full trailer is corrupt") && ok;
+  ok = expect(parse_kind(&flip(&good, good.len() - 1), 4096, 16777216, 8388608) == "corrupt", &"pack: a wrong trailer byte is corrupt") && ok;
+  ok = expect(parse_kind(&flip(&good, 40), 4096, 16777216, 8388608) == "corrupt", &"pack: a flipped data byte breaks the trailer") && ok;
+  ok = expect(parse_kind(&flip(&good, 0), 4096, 16777216, 8388608) == "corrupt", &"pack: a bad signature is corrupt") && ok;
+  ok = expect(parse_kind(&flip(&good, 7), 4096, 16777216, 8388608) == "unsupported", &"pack: only version 2 is supported") && ok;
+  let blob_a = plain_entry(3, &"aaaa\n".as_bytes());
+  let mut one_entry = List.new();
+  one_entry.push(blob_a.clone());
+  ok = expect(parse_kind(&assemble_n(2, &one_entry), 4096, 16777216, 8388608) == "corrupt", &"pack: a count larger than the entries is corrupt") && ok;
+  ok = expect(parse_kind(&assemble_n(0, &one_entry), 4096, 16777216, 8388608) == "corrupt", &"pack: data after the declared entries is corrupt") && ok;
+  let mut padded = List.new();
+  let mut with_pad = blob_a.clone();
+  with_pad.push(0);
+  padded.push(with_pad);
+  ok = expect(parse_kind(&assemble_n(1, &padded), 4096, 16777216, 8388608) == "corrupt", &"pack: a stray byte before the trailer is corrupt") && ok;
+  // 不正な zlib（Adler-32 の不一致）
+  let mut bad_z = blob_a.clone();
+  let last = bad_z.len() - 1;
+  let mut bad_list = List.new();
+  bad_list.push(flip(&bad_z, last));
+  ok = expect(parse_kind(&assemble(&bad_list), 4096, 16777216, 8388608) == "corrupt", &"pack: a bad zlib checksum is corrupt") && ok;
+  // 宣言された大きさの不一致
+  let mut lie = entry_header(3, 9);
+  lie.extend(&zlib_stored(&"aaaa\n".as_bytes()));
+  let mut lie_list = List.new();
+  lie_list.push(lie);
+  ok = expect(parse_kind(&assemble(&lie_list), 4096, 16777216, 8388608) == "corrupt", &"pack: a declared size that differs from the data is corrupt") && ok;
+  // 上限: 件数・累計・単体（直下・一致・超過）
+  let b10 = "0123456789".as_bytes();
+  let b20 = "01234567890123456789".as_bytes();
+  let mut two = List.new();
+  two.push(plain_entry(3, &b10));
+  two.push(plain_entry(3, &b20));
+  let two_pack = assemble(&two);
+  ok = expect(parse_kind(&two_pack, 2, 30, 20) == "ok", &"limits: at the object, total and single limits succeeds") && ok;
+  ok = expect(parse_kind(&two_pack, 1, 30, 20) == "limit", &"limits: one object over the count limit fails") && ok;
+  ok = expect(parse_kind(&two_pack, 2, 29, 20) == "limit", &"limits: one byte over the cumulative limit fails") && ok;
+  ok = expect(parse_kind(&two_pack, 2, 30, 19) == "limit", &"limits: one byte over the single limit fails") && ok;
+  ok = expect(parse_kind(&two_pack, 3, 31, 21) == "ok", &"limits: just under succeeds") && ok;
+  // delta: OFS／REF と thin pack
+  let base = "hello world\n".as_bytes();
+  let base_entry = plain_entry(3, &base);
+  let mut ofs = List.new();
+  ofs.push(base_entry.clone());
+  ofs.push(ofs_entry(base_entry.len(), &delta_append(base.len(), &"!!\n".as_bytes())));
+  ok = expect(parse_count(&assemble(&ofs)) == 2, &"delta: an OFS_DELTA resolves against an earlier entry") && ok;
+  let mut ofs_content = base.clone();
+  ofs_content.extend(&"!!\n".as_bytes());
+  match recv_pack_parse(&assemble(&ofs), 4096, 16777216, 8388608) {
+    Ok(objs) => {
+      ok = expect(index_ids(&objs, &blob_id(&ofs_content)) >= 0 && index_ids(&objs, &blob_id(&base)) >= 0, &"delta: the resolved object id is recomputed from its content") && ok;
+    }
+    Err(_) => {
+      ok = fail(&"delta: OFS pack parses") && ok;
+    }
+  }
+  let mut refd = List.new();
+  refd.push(base_entry.clone());
+  refd.push(ref_entry(&blob_id(&base), &delta_append(base.len(), &"?\n".as_bytes())));
+  ok = expect(parse_count(&assemble(&refd)) == 2, &"delta: a REF_DELTA resolves against an object in the same pack") && ok;
+  let mut refd_first = List.new();
+  refd_first.push(ref_entry(&blob_id(&base), &delta_append(base.len(), &"?\n".as_bytes())));
+  refd_first.push(base_entry.clone());
+  ok = expect(parse_count(&assemble(&refd_first)) == 2, &"delta: a REF_DELTA whose base comes later in the pack resolves") && ok;
+  let mut thin = List.new();
+  thin.push(ref_entry(&f.blob1, &delta_append(6, &"?\n".as_bytes())));
+  ok = expect(parse_kind(&assemble(&thin), 4096, 16777216, 8388608) == "unsupported", &"delta: a thin pack (external base) is rejected even if the repository has the base") && ok;
+  let mut missing = List.new();
+  missing.push(ref_entry(&blob_id(&"nope".as_bytes()), &delta_append(4, &"?\n".as_bytes())));
+  ok = expect(parse_kind(&assemble(&missing), 4096, 16777216, 8388608) == "unsupported", &"delta: an unknown REF_DELTA base is a thin pack") && ok;
+  let mut bad_delta = List.new();
+  bad_delta.push(base_entry.clone());
+  bad_delta.push(ofs_entry(base_entry.len(), &delta_append(5, &"!!\n".as_bytes())));
+  ok = expect(parse_kind(&assemble(&bad_delta), 4096, 16777216, 8388608) == "corrupt", &"delta: a delta built for a different base size is corrupt") && ok;
+  ok = expect(parse_kind(&chain_pack(50), 4096, 16777216, 8388608) == "ok", &"delta: a chain of depth 50 is accepted") && ok;
+  ok = expect(parse_kind(&chain_pack(51), 4096, 16777216, 8388608) == "limit", &"delta: a chain of depth 51 exceeds the 0047 limit") && ok;
+  return ok;
+}
+
+fn flip(b: &Bytes, at: Int) -> Bytes
+  intent "at 番目の byte のビットを反転した複製"
+  requires at >= 0 && at < b.len()
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if i == at {
+      out.push(255 - c);
+    } else {
+      out.push(c);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn index_in(l: &List<String>, id: &String) -> Int
+  intent "l の中の id の番号（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < l.len() {
+    match l.get(i) {
+      Some(x) => {
+        if x == id {
+          return i;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn index_ids(objs: &List<RecvObject>, id: &String) -> Int
+  intent "受信オブジェクトの中の id の番号（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < objs.len() {
+    match objs.get(i) {
+      Some(o) => {
+        if o.id == id {
+          return i;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+// ---------------------------------------------------------------------------
+// push の流れ
+// ---------------------------------------------------------------------------
+
+fn has_objs(repo: &Repo, ids: &List<String>) -> Bool
+  intent "ids がすべてリポジトリにあるか"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut i = 0;
+  while i < ids.len() {
+    let id = match ids.get(i) {
+      Some(x) => x.clone(),
+      None => "",
+    };
+    if !odb_has(&repo, &id).unwrap_or(false) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn run_advertisement(f: &Fixture, dir: &String) -> Bool
+  intent "受信広告（空のリポジトリ、参照のあるリポジトリ、query の検査）を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let r = fresh(&dir, &"adv.git", &f.repo);
+  let q = "service=git-receive-pack".as_bytes();
+  let empty = receive_info_refs_reply(&r, &q);
+  ok = expect(empty.status == 200 && empty.content_type == "application/x-git-receive-pack-advertisement", &"adv: 200 with the receive-pack content type") && ok;
+  ok = expect(starts_with_text(&empty.body, &"001f# service=git-receive-pack\n0000"), &"adv: the service line and a flush come first") && ok;
+  ok = expect(has_text(&empty.body, &cat3(&zero(), &" capabilities^{}", &"")) && has_text(&empty.body, &"report-status ofs-delta") && has_text(&empty.body, &"object-format=sha256"), &"adv: an empty repository advertises the zero id with capabilities^{}") && ok;
+  ok = expect(!has_text(&empty.body, &"side-band"), &"adv: side-band is not advertised for receive-pack") && ok;
+  let full = receive_info_refs_reply(&f.repo, &q);
+  ok = expect(full.status == 200 && has_text(&full.body, &cat3(&f.commit2, &" refs/heads/main", &"")) && has_text(&full.body, &"refs/tags/t1") && !has_text(&full.body, &"^{}") && !has_text(&full.body, &"HEAD") && !has_text(&full.body, &"symref"), &"adv: refs without HEAD, symref or peeled lines") && ok;
+  ok = expect(receive_info_refs_reply(&r, &"service=git-upload-pack".as_bytes()).status == 400, &"adv: another service is 400") && ok;
+  ok = expect(receive_info_refs_reply(&r, &"".as_bytes()).status == 400, &"adv: a missing service is 400") && ok;
+  ok = expect(receive_info_refs_reply(&r, &"service=git-receive-pack&service=git-receive-pack".as_bytes()).status == 400, &"adv: a duplicate service is 400") && ok;
+  ok = expect(receive_info_refs_reply(&r, &"service=git-receive-pack&x=1".as_bytes()).status == 400, &"adv: an extra query is 400") && ok;
+  return ok;
+}
+
+fn run_pushes(f: &Fixture, dir: &String) -> Bool
+  intent "単一参照の push の成功と拒否（拒否後に参照が不変であること）を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let r = fresh(&dir, &"push.git", &f.repo);
+  let c1 = f.commit1.clone();
+  let c2 = f.commit2.clone();
+  let c3 = f.commit3.clone();
+  let caps = caps_ok();
+  let ids1 = ids_of(&f, &c1);
+  let ids2 = ids_of(&f, &c2);
+  // 空リポジトリへの初回 push
+  let first = post(&r, &push_body(&zero(), &c1, &"refs/heads/main", &caps, &pack_of(&f, &ids1)));
+  ok = expect(first.status == 200 && first.body == report_ok(&"refs/heads/main"), &"push: the first push to an empty repository reports ok") && ok;
+  ok = expect(ref_is(&r, &"refs/heads/main", &c1) && has_objs(&r, &ids1), &"push: the objects are persisted and the ref points to the new commit") && ok;
+  ok = expect(staging_empty(&r), &"push: no pack is left in staging") && ok;
+  // fast-forward
+  let ff = post(&r, &push_body(&c1, &c2, &"refs/heads/main", &caps, &pack_of(&f, &ids2)));
+  ok = expect(ff.body == report_ok(&"refs/heads/main") && ref_is(&r, &"refs/heads/main", &c2) && has_objs(&r, &ids2), &"push: a fast-forward updates the branch") && ok;
+  // 非 fast-forward: 到達集合は検証できるが main の子孫ではない
+  let ids3 = ids_of(&f, &c3);
+  let nff = post(&r, &push_body(&c2, &c3, &"refs/heads/main", &caps, &pack_of(&f, &ids3)));
+  ok = expect(nff.status == 200 && nff.body == report_ng(&"ok", &"refs/heads/main", &"non_fast_forward"), &"push: a non-fast-forward is rejected with ng") && ok;
+  ok = expect(ref_is(&r, &"refs/heads/main", &c2) && !odb_has(&r, &c3).unwrap_or(true), &"push: a rejected push leaves the ref unchanged and persists nothing") && ok;
+  // 旧値の不一致（CAS）は 409 で、参照は変わらない
+  let stale = post(&r, &push_body(&c1, &c2, &"refs/heads/main", &caps, &empty_pack()));
+  ok = expect(stale.status == 409 && ref_is(&r, &"refs/heads/main", &c2), &"push: a stale old value is a 409 conflict and the ref is unchanged") && ok;
+  let exists = post(&r, &push_body(&zero(), &c1, &"refs/heads/main", &caps, &empty_pack()));
+  ok = expect(exists.status == 409 && ref_is(&r, &"refs/heads/main", &c2), &"push: creating a branch that exists is a 409 conflict") && ok;
+  // 新規ブランチ（既存の commit を指す。pack は空）
+  let feat = post(&r, &push_body(&zero(), &c1, &"refs/heads/feature", &caps, &empty_pack()));
+  ok = expect(feat.body == report_ok(&"refs/heads/feature") && ref_is(&r, &"refs/heads/feature", &c1), &"push: a new branch at an existing commit with an empty pack") && ok;
+  // タグ: 軽量・注釈付き・上書き
+  let lw = post(&r, &push_body(&zero(), &c1, &"refs/tags/lw", &caps, &empty_pack()));
+  ok = expect(lw.body == report_ok(&"refs/tags/lw") && ref_is(&r, &"refs/tags/lw", &c1), &"tag: a lightweight tag is created") && ok;
+  let ann = post(&r, &push_body(&zero(), &f.tag1, &"refs/tags/t1", &caps, &pack_of(&f, &one(&f.tag1))));
+  ok = expect(ann.body == report_ok(&"refs/tags/t1") && ref_is(&r, &"refs/tags/t1", &f.tag1), &"tag: an annotated tag object whose target is in the repository") && ok;
+  let over = post(&r, &push_body(&c1, &c2, &"refs/tags/lw", &caps, &empty_pack()));
+  ok = expect(over.body == report_ng(&"skipped", &"refs/tags/lw", &"tag_exists") && ref_is(&r, &"refs/tags/lw", &c1), &"tag: overwriting a tag is rejected and the tag is unchanged") && ok;
+  let again = post(&r, &push_body(&zero(), &c2, &"refs/tags/lw", &caps, &empty_pack()));
+  ok = expect(again.status == 409 && ref_is(&r, &"refs/tags/lw", &c1), &"tag: re-creating an existing tag is a 409 conflict") && ok;
+  // 先頭が commit でない branch
+  let bad_tip = post(&r, &push_body(&zero(), &f.tag1, &"refs/heads/tagtip", &caps, &empty_pack()));
+  ok = expect(bad_tip.body == report_ng(&"ok", &"refs/heads/tagtip", &"not_a_commit") && ref_is(&r, &"refs/heads/tagtip", &""), &"push: a branch must point to a commit") && ok;
+  let blob_tip = post(&r, &push_body(&zero(), &f.blob1, &"refs/heads/blobtip", &caps, &empty_pack()));
+  ok = expect(blob_tip.body == report_ng(&"ok", &"refs/heads/blobtip", &"not_a_commit") && ref_is(&r, &"refs/heads/blobtip", &""), &"push: a branch cannot point to a blob") && ok;
+  // 方針: 削除・heads/tags 以外・複数参照
+  let del = post(&r, &push_body(&c2, &zero(), &"refs/heads/main", &caps, &empty_pack()));
+  ok = expect(del.body == report_ng(&"skipped", &"refs/heads/main", &"delete_not_allowed") && ref_is(&r, &"refs/heads/main", &c2), &"policy: deleting a branch is rejected and the branch is unchanged") && ok;
+  let notes = post(&r, &push_body(&zero(), &c1, &"refs/notes/x", &caps, &empty_pack()));
+  ok = expect(notes.body == report_ng(&"skipped", &"refs/notes/x", &"unsupported_ref") && ref_is(&r, &"refs/notes/x", &""), &"policy: refs outside heads and tags are rejected") && ok;
+  let mut multi = command_pkt(&zero(), &c1, &"refs/heads/m1", &caps);
+  multi.extend(&command_pkt(&zero(), &c1, &"refs/heads/m2", &""));
+  multi.extend(&pkt_flush());
+  multi.extend(&empty_pack());
+  let mreply = post(&r, &multi);
+  ok = expect(mreply.body == report_ng(&"skipped", &"refs/heads/m1", &"multiple_refs") && ref_is(&r, &"refs/heads/m1", &"") && ref_is(&r, &"refs/heads/m2", &""), &"policy: multiple refs are rejected as a whole") && ok;
+  // 未対応: SHA-1、未知の能力、shallow
+  let sha1 = post(&r, &push_body(&"0000000000000000000000000000000000000000", &"1111111111111111111111111111111111111111", &"refs/heads/s", &caps, &empty_pack()));
+  ok = expect(sha1.status == 200 && starts_with_text(&sha1.body, &"003aERR ") && ref_is(&r, &"refs/heads/s", &""), &"unsupported: SHA-1 ids get an ERR line and nothing changes") && ok;
+  let atomic = post(&r, &push_body(&zero(), &c1, &"refs/heads/at", &"report-status atomic", &empty_pack()));
+  ok = expect(atomic.status == 200 && has_text(&atomic.body, &"ERR ") && ref_is(&r, &"refs/heads/at", &""), &"unsupported: an unknown capability gets an ERR line and nothing changes") && ok;
+  // 壊れた pack・欠落・thin pack は参照を変えない
+  let ids_c1 = pack_of(&f, &ids_of(&f, &c1));
+  let broken = flip(&ids_c1, ids_c1.len() - 1);
+  let bp = post(&r, &push_body(&zero(), &c1, &"refs/heads/broken", &caps, &broken));
+  ok = expect(bp.body == report_ng(&"bad_pack", &"refs/heads/broken", &"unpack_failed") && ref_is(&r, &"refs/heads/broken", &""), &"verify: a corrupt pack reports an unpack failure") && ok;
+  let only_commit = post(&r, &push_body(&zero(), &c3, &"refs/heads/partial", &caps, &pack_of(&f, &one(&c3))));
+  ok = expect(only_commit.body == report_ng(&"ok", &"refs/heads/partial", &"missing_objects") && ref_is(&r, &"refs/heads/partial", &"") && !odb_has(&r, &c3).unwrap_or(true), &"verify: a pack that does not close the graph is rejected and persists nothing") && ok;
+  let mut thin = List.new();
+  thin.push(ref_entry(&f.blob1, &delta_append(6, &"?\n".as_bytes())));
+  let tp = post(&r, &push_body(&zero(), &c1, &"refs/heads/thin", &caps, &assemble(&thin)));
+  ok = expect(tp.body == report_ng(&"thin_pack", &"refs/heads/thin", &"unpack_failed") && ref_is(&r, &"refs/heads/thin", &""), &"verify: a thin pack is rejected") && ok;
+  ok = expect(staging_empty(&r), &"verify: staging is cleaned after rejections") && ok;
+  return ok;
+}
+
+fn run_http_layer(f: &Fixture, dir: &String) -> Bool
+  intent "Content-Encoding・Content-Type・本文の上限・上限の直下／一致／超過を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let r = fresh(&dir, &"http.git", &f.repo);
+  let c1 = f.commit1.clone();
+  let body = push_body(&zero(), &c1, &"refs/heads/main", &caps_ok(), &pack_of(&f, &ids_of(&f, &c1)));
+  let ct = Some("application/x-git-receive-pack-request".as_bytes());
+  let mut gz = List.new();
+  gz.push("gzip".as_bytes());
+  let rg = receive_pack_post(&r, &gz, &ct, &body, &wc_ok());
+  ok = expect(rg.status == 415 && rg.body == "unsupported_content_encoding".as_bytes() && ref_is(&r, &"refs/heads/main", &""), &"encoding: gzip is rejected with 415 for receive-pack") && ok;
+  let mut xgz = List.new();
+  xgz.push("x-gzip".as_bytes());
+  ok = expect(receive_pack_post(&r, &xgz, &ct, &body, &wc_ok()).status == 415, &"encoding: x-gzip is 415") && ok;
+  let mut dfl = List.new();
+  dfl.push("deflate".as_bytes());
+  ok = expect(receive_pack_post(&r, &dfl, &ct, &body, &wc_ok()).status == 415, &"encoding: deflate is 415") && ok;
+  let mut multi = List.new();
+  multi.push("gzip".as_bytes());
+  multi.push("gzip".as_bytes());
+  ok = expect(receive_pack_post(&r, &multi, &ct, &body, &wc_ok()).status == 415, &"encoding: multiple encodings are 415") && ok;
+  let mut ident = List.new();
+  ident.push("identity".as_bytes());
+  let ri = receive_pack_post(&r, &ident, &ct, &body, &wc_ok());
+  ok = expect(ri.status == 200 && ri.body == report_ok(&"refs/heads/main"), &"encoding: identity is accepted") && ok;
+  let r2 = fresh(&dir, &"http2.git", &f.repo);
+  let nct = None;
+  ok = expect(receive_pack_post(&r2, &List.new(), &nct, &body, &wc_ok()).status == 415, &"media: a missing Content-Type is 415") && ok;
+  let wrong = Some("application/x-git-upload-pack-request".as_bytes());
+  ok = expect(receive_pack_post(&r2, &List.new(), &wrong, &body, &wc_ok()).status == 415, &"media: the upload-pack Content-Type is 415") && ok;
+  let mut huge = body.clone();
+  while huge.len() <= 1048576 {
+    huge.push(0);
+  }
+  ok = expect(receive_pack_post(&r2, &List.new(), &ct, &huge, &wc_ok()).status == 413, &"limit: a request body over 1 MiB is 413") && ok;
+  ok = expect(ref_is(&r2, &"refs/heads/main", &""), &"http: nothing was published by the rejected requests") && ok;
+  // 上限の直下・一致・超過（件数・累計・単体・走査）
+  let ids2 = ids_of(&f, &f.commit2);
+  let pack2 = pack_of(&f, &ids2);
+  let body2 = push_body(&zero(), &f.commit2, &"refs/heads/main", &caps_ok(), &pack2);
+  let r3 = fresh(&dir, &"lim3.git", &f.repo);
+  let over_objs = receive_pack_post_limited(&r3, &List.new(), &ct, &body2, &wc_ok(), 5, 16777216, 8388608, 100000);
+  ok = expect(over_objs.body == report_ng(&"pack_limit_exceeded", &"refs/heads/main", &"unpack_failed") && ref_is(&r3, &"refs/heads/main", &""), &"limits: 6 objects over a limit of 5 fail with no success report") && ok;
+  let at_objs = receive_pack_post_limited(&r3, &List.new(), &ct, &body2, &wc_ok(), 6, 16777216, 8388608, 100000);
+  ok = expect(at_objs.body == report_ok(&"refs/heads/main"), &"limits: 6 objects at a limit of 6 succeed") && ok;
+  let r4 = fresh(&dir, &"lim4.git", &f.repo);
+  let over_single = receive_pack_post_limited(&r4, &List.new(), &ct, &body2, &wc_ok(), 4096, 16777216, 2, 100000);
+  ok = expect(over_single.body == report_ng(&"pack_limit_exceeded", &"refs/heads/main", &"unpack_failed") && ref_is(&r4, &"refs/heads/main", &""), &"limits: an object over the single limit fails") && ok;
+  let over_total = receive_pack_post_limited(&r4, &List.new(), &ct, &body2, &wc_ok(), 4096, 10, 8388608, 100000);
+  ok = expect(over_total.body == report_ng(&"pack_limit_exceeded", &"refs/heads/main", &"unpack_failed"), &"limits: a pack over the cumulative limit fails") && ok;
+  let over_walk = receive_pack_post_limited(&r4, &List.new(), &ct, &body2, &wc_ok(), 4096, 16777216, 8388608, 2);
+  ok = expect(over_walk.body == report_ng(&"ok", &"refs/heads/main", &"walk_limit_exceeded") && ref_is(&r4, &"refs/heads/main", &""), &"limits: a graph walk over the limit fails explicitly") && ok;
+  let at_walk = receive_pack_post_limited(&r4, &List.new(), &ct, &body2, &wc_ok(), 4096, 16777216, 8388608, 6);
+  ok = expect(at_walk.body == report_ok(&"refs/heads/main"), &"limits: a graph walk exactly at the limit succeeds") && ok;
+  return ok;
+}
+
+fn run_races(f: &Fixture, dir: &String) -> Bool
+  intent "検証中のオブジェクトの不可視、排他、最新 ACL の再検査、CAS を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let c1 = f.commit1.clone();
+  let ids1 = ids_of(&f, &c1);
+  let body = push_body(&zero(), &c1, &"refs/heads/main", &caps_ok(), &pack_of(&f, &ids1));
+  let rw = join_path(&dir, &"acl_rw.txt");
+  let ro = join_path(&dir, &"acl_ro.txt");
+  let acl_no = join_path(&dir, &"acl_none.txt");
+  let _ = create_synced_file(&rw, &"demo:alice=rw".as_bytes());
+  let _ = create_synced_file(&ro, &"demo:alice".as_bytes());
+  let _ = create_synced_file(&acl_no, &"other:alice=rw".as_bytes());
+  let r = fresh(&dir, &"race.git", &f.repo);
+  match parse_receive_request(&body) {
+    Err(_) => {
+      ok = fail(&"race: the request parses") && ok;
+    }
+    Ok(req) => {
+      match receive_verify(&r, &req, 4096, 16777216, 8388608, 100000) {
+        Err(_) => {
+          ok = fail(&"race: the pack verifies") && ok;
+        }
+        Ok(prepared) => {
+          ok = expect(!odb_has(&r, &c1).unwrap_or(true) && ref_is(&r, &"refs/heads/main", &""), &"isolation: verified objects are not visible in the repository before publication") && ok;
+          let denied_w = receive_commit(&r, &prepared, &new_write_check(ro.clone(), "demo".clone(), "alice".clone(), true));
+          ok = expect(denied_w.status == 403 && ref_is(&r, &"refs/heads/main", &"") && !odb_has(&r, &c1).unwrap_or(true), &"acl: a write permission removed before publication gives 403 and changes nothing") && ok;
+          let denied_r = receive_commit(&r, &prepared, &new_write_check(acl_no.clone(), "demo".clone(), "alice".clone(), true));
+          ok = expect(denied_r.status == 404 && ref_is(&r, &"refs/heads/main", &"") && !odb_has(&r, &c1).unwrap_or(true), &"acl: a read permission removed before publication hides the repository (404)") && ok;
+          let lock_path = join_path(&r.git_dir, &"sigil-receive.lock");
+          let _ = create_synced_file(&lock_path, &"".as_bytes());
+          let busy = receive_commit(&r, &prepared, &new_write_check(rw.clone(), "demo".clone(), "alice".clone(), true));
+          ok = expect(busy.status == 409 && ref_is(&r, &"refs/heads/main", &"") && file_exists(&lock_path).unwrap_or(false), &"lock: an existing repository lock is a 409 conflict and is not removed") && ok;
+          let _ = remove_file_if_exists(&lock_path);
+          let done = receive_commit(&r, &prepared, &new_write_check(rw.clone(), "demo".clone(), "alice".clone(), true));
+          ok = expect(done.body == report_ok(&"refs/heads/main") && ref_is(&r, &"refs/heads/main", &c1) && has_objs(&r, &ids1), &"order: ok is returned after the objects and the ref are published") && ok;
+          ok = expect(!file_exists(&lock_path).unwrap_or(true), &"lock: the repository lock is released") && ok;
+          // 同じ Prepared の再実行は、旧値（ゼロ）が現在値と違うので 409
+          let replay = receive_commit(&r, &prepared, &new_write_check(rw.clone(), "demo".clone(), "alice".clone(), true));
+          ok = expect(replay.status == 409 && ref_is(&r, &"refs/heads/main", &c1), &"cas: replaying a prepared push after the ref moved is a 409 conflict") && ok;
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+pub fn run_receive_tests() -> Bool
+  intent "receive-pack の全テストを実行し全合格なら true を返す。作業用ディレクトリは tmp/ の下に作る"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let suffix = match random_hex(6) {
+    Ok(s) => s,
+    Err(_) => "fallback",
+  };
+  let dir = cat3(&"tmp/r_", &suffix, &"");
+  match make_dirs(&dir) {
+    Err(_) => {
+      return fail(&"cannot create the work directory");
+    }
+    Ok(_) => {}
+  }
+  match init_repo(&join_path(&dir, &"src.git"), true, &"main") {
+    Err(_) => {
+      return fail(&"init the source repository");
+    }
+    Ok(src) => {
+      let f = build_fixture(src);
+      if !f.ok {
+        return fail(&"setup: cannot write the test objects");
+      }
+      let mut ok = true;
+      console.log(&"  request parsing and policy");
+      ok = run_parse(&f) && ok;
+      console.log(&"  pack verification");
+      ok = run_packs(&f) && ok;
+      console.log(&"  advertisement");
+      ok = run_advertisement(&f, &dir) && ok;
+      console.log(&"  pushes");
+      ok = run_pushes(&f, &dir) && ok;
+      console.log(&"  HTTP layer and limits");
+      ok = run_http_layer(&f, &dir) && ok;
+      console.log(&"  isolation, locking, ACL recheck");
+      ok = run_races(&f, &dir) && ok;
+      return ok;
+    }
+  }
+  return false;
+}

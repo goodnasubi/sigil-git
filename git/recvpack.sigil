@@ -1,0 +1,374 @@
+module git.recvpack
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.hash.bytes_to_hex;
+use git.hash.compute_object_id;
+use git.hash.compute_sha256;
+use git.inflate.inflate_zlib;
+use git.limits.max_delta_depth;
+use git.object.ObjectType;
+use git.object.object_type_name;
+use git.pack.apply_delta;
+use git.walk.index_of;
+
+// ADR 0048 決定 1「push」/ 決定 2: 受け取った pack（メモリ上の byte 列）の隔離検証。リポジトリには一切触れない。
+// - 見出し（`PACK`・版 2・件数）、末尾の SHA-256 検査値（先頭から検査値の直前まで）、各エントリの型・長さ・zlib（Adler-32 を含む）、
+//   ちょうど件数ぶんのエントリで検査値の直前に着くこと、を確かめる。
+// - OFS_DELTA は同じ pack 内の前のエントリ、REF_DELTA は同じ pack 内のオブジェクトだけを基底にできる。pack の外の基底（thin pack）は
+//   UnsupportedFormat で拒否する。差分の連鎖の深さは 0047 の上限（max_delta_depth）を超えたら LimitExceeded。
+// - 上限は引数: 件数（object_limit）、展開の累計（total_limit。各エントリの展開後の大きさと、差分を適用した後の大きさを足す）、
+//   単体の展開（single_limit）。超えたら LimitExceeded（途中で打ち切り、自動分割も再試行もしない）。
+// - 各オブジェクトの識別子は型と内容から再計算する（pack の中身を信用しない）。同じ識別子の重複は 1 つにまとめる。
+
+pub struct RecvObject {
+  id: String,
+  kind: Int,
+  content: Bytes,
+}
+
+pub fn new_recv_object(id: String, kind: Int, content: Bytes) -> RecvObject
+  intent "RecvObject を構築する（他のモジュールから構造体リテラルは作れないため）"
+  requires none
+  ensures none
+  effects none
+{
+  return RecvObject { id: id, kind: kind, content: content };
+}
+
+struct Ent {
+  kind: Int,
+  size: Int,
+  data_off: Int,
+  base_off: Int,
+  base_id: String,
+}
+
+pub fn kind_to_type(kind: Int) -> ObjectType
+  intent "pack の型番号 (1 commit, 2 tree, 3 blob, 4 tag) をオブジェクト型にする"
+  requires kind >= 1 && kind <= 4
+  ensures none
+  effects none
+{
+  if kind == 1 {
+    return ObjectType.Commit;
+  }
+  if kind == 2 {
+    return ObjectType.Tree;
+  }
+  if kind == 3 {
+    return ObjectType.Blob;
+  }
+  return ObjectType.Tag;
+}
+
+fn int_at(l: &List<Int>, i: Int) -> Int
+  intent "整数のリストの i 番目（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    // 参照のまま返すと評価器で別名が残る場合があるため、値として読み直す
+    Some(v) => v + 0,
+    None => 0,
+  };
+}
+
+fn str_at(l: &List<String>, i: Int) -> String
+  intent "文字列のリストの i 番目の複製（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v.clone(),
+    None => "",
+  };
+}
+
+fn bytes_at(l: &List<Bytes>, i: Int) -> Bytes
+  intent "Bytes のリストの i 番目の複製（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v.clone(),
+    None => Bytes.new(),
+  };
+}
+
+fn read_header(pack: &Bytes, off: Int, end: Int) -> Result<Ent, GitError>
+  intent "off にあるエントリの見出し（型・宣言された大きさ・OFS／REF の基底）を読む。end（検査値の位置）を越えて読まない"
+  requires none
+  ensures none
+  effects none
+{
+  if off >= end {
+    return Err(GitError.Corrupt("pack entry is outside the pack"));
+  }
+  let c0 = pack.get(off).unwrap_or(0);
+  let kind = c0 / 16 % 8;
+  let mut size = c0 % 16;
+  let mut shift = 4;
+  let mut pos = off + 1;
+  let mut cont = c0 >= 128;
+  while cont {
+    if pos >= end || pos - off > 9 {
+      return Err(GitError.Corrupt("pack entry header is malformed"));
+    }
+    let c = pack.get(pos).unwrap_or(0);
+    size = size + c % 128 * (1 << shift);
+    if size > 1099511627776 {
+      return Err(GitError.LimitExceeded("pack entry declares an excessive size"));
+    }
+    shift = shift + 7;
+    pos = pos + 1;
+    cont = c >= 128;
+  }
+  if kind == 0 || kind == 5 {
+    return Err(GitError.Corrupt("invalid pack entry type"));
+  }
+  let mut base_off = 0 - 1;
+  let mut base_id = "";
+  if kind == 6 {
+    if pos >= end {
+      return Err(GitError.Corrupt("pack OFS_DELTA header is truncated"));
+    }
+    let mut c = pack.get(pos).unwrap_or(0);
+    pos = pos + 1;
+    let mut rel = c % 128;
+    while c >= 128 {
+      if pos >= end || pos - off > 30 {
+        return Err(GitError.Corrupt("pack OFS_DELTA offset is malformed"));
+      }
+      c = pack.get(pos).unwrap_or(0);
+      pos = pos + 1;
+      rel = (rel + 1) * 128 + c % 128;
+      if rel > off {
+        return Err(GitError.Corrupt("pack OFS_DELTA offset is out of range"));
+      }
+    }
+    if rel <= 0 || rel > off - 12 {
+      return Err(GitError.Corrupt("pack OFS_DELTA base is outside the pack"));
+    }
+    base_off = off - rel;
+  } else if kind == 7 {
+    if pos + 32 > end {
+      return Err(GitError.Corrupt("pack REF_DELTA header is truncated"));
+    }
+    let idb = pack.slice(pos, pos + 32).unwrap_or(Bytes.new());
+    base_id = bytes_to_hex(&idb);
+    pos = pos + 32;
+  }
+  return Ok(Ent { kind: kind, size: size, data_off: pos, base_off: base_off, base_id: base_id });
+}
+
+fn inflate_entry(pack: &Bytes, start: Int, size: Int, end: Int) -> Result<Bytes, GitError>
+  intent "エントリの zlib を size を上限に伸長し、宣言された大きさと一致すること、検査値の手前で終わることを確かめて内容を返す。次のエントリの位置は start + 消費量だが、ここでは返さない（呼び出し側が再計算する）"
+  requires size >= 0
+  ensures none
+  effects none
+{
+  match inflate_zlib(&pack, start, size) {
+    Err(e) => {
+      return match e {
+        GitError.LimitExceeded(_) => Err(GitError.Corrupt("pack entry is larger than it declares")),
+        other => Err(other),
+      };
+    }
+    Ok(r) => {
+      if r.data.len() != size {
+        return Err(GitError.Corrupt("pack entry size does not match its declared size"));
+      }
+      if start + r.consumed > end {
+        return Err(GitError.Corrupt("pack entry runs into the trailer"));
+      }
+      return Ok(r.data);
+    }
+  }
+}
+
+fn consumed_of(pack: &Bytes, start: Int, size: Int) -> Result<Int, GitError>
+  intent "エントリの zlib が使った byte 数を返す"
+  requires size >= 0
+  ensures none
+  effects none
+{
+  return match inflate_zlib(&pack, start, size) {
+    Err(e) => Err(e),
+    Ok(r) => Ok(r.consumed),
+  };
+}
+
+pub fn recv_pack_parse(pack: &Bytes, object_limit: Int, total_limit: Int, single_limit: Int) -> Result<List<RecvObject>, GitError>
+  intent "pack を隔離して検証し、含まれるオブジェクト（識別子は再計算、重複なし）を返す。失敗は Corrupt（不正）、UnsupportedFormat（版 2 以外・thin pack）、LimitExceeded（件数・累計・単体・差分の深さ）"
+  requires object_limit >= 0 && total_limit >= 0 && single_limit >= 0
+  ensures none
+  effects none
+{
+  if pack.len() < 12 + 32 {
+    return Err(GitError.Corrupt("pack is too short"));
+  }
+  let magic = pack.slice(0, 4).unwrap_or(Bytes.new());
+  if magic != "PACK".as_bytes() {
+    return Err(GitError.Corrupt("pack signature is missing"));
+  }
+  if pack.read_u32_be(4).unwrap_or(0) != 2 {
+    return Err(GitError.UnsupportedFormat("only pack version 2 is supported"));
+  }
+  let count = pack.read_u32_be(8).unwrap_or(0);
+  if count > object_limit {
+    return Err(GitError.LimitExceeded("pack has too many objects"));
+  }
+  let end = pack.len() - 32;
+  let body = pack.slice(0, end).unwrap_or(Bytes.new());
+  let want_trailer = compute_sha256(&body);
+  let got_trailer = pack.slice(end, pack.len()).unwrap_or(Bytes.new());
+  if want_trailer != got_trailer {
+    return Err(GitError.Corrupt("pack trailer checksum does not match"));
+  }
+  let mut ents = List.new();
+  let mut datas = List.new();
+  let mut offs = List.new();
+  let mut total = 0;
+  let mut off = 12;
+  let mut n = 0;
+  while n < count {
+    let e = read_header(&pack, off, end)?;
+    if e.size > single_limit {
+      return Err(GitError.LimitExceeded("pack entry exceeds the single object limit"));
+    }
+    total = total + e.size;
+    if total > total_limit {
+      return Err(GitError.LimitExceeded("pack exceeds the cumulative inflate limit"));
+    }
+    let data = inflate_entry(&pack, e.data_off, e.size, end)?;
+    let used = consumed_of(&pack, e.data_off, e.size)?;
+    offs.push(off);
+    off = e.data_off + used;
+    ents.push(e);
+    datas.push(data);
+    n = n + 1;
+  }
+  if off != end {
+    return Err(GitError.Corrupt("pack has data between its last entry and its trailer"));
+  }
+  let mut r_ent = List.new();
+  let mut r_off = List.new();
+  let mut r_kind = List.new();
+  let mut r_id = List.new();
+  let mut r_content = List.new();
+  let mut r_depth = List.new();
+  let mut i = 0;
+  while i < ents.len() {
+    let k = match ents.get(i) {
+      Some(e) => e.kind,
+      None => 0,
+    };
+    if k <= 4 {
+      let content = bytes_at(&datas, i);
+      let idb = compute_object_id(&object_type_name(&kind_to_type(k)), &content);
+      r_ent.push(i);
+      r_off.push(int_at(&offs, i));
+      r_kind.push(k);
+      r_id.push(bytes_to_hex(&idb));
+      r_content.push(content);
+      r_depth.push(0);
+    }
+    i = i + 1;
+  }
+  let mut progress = true;
+  while r_ent.len() < ents.len() && progress {
+    progress = false;
+    let mut j = 0;
+    while j < ents.len() {
+      if index_of_int(&r_ent, j) < 0 {
+        let mut b = 0 - 1;
+        match ents.get(j) {
+          Some(e) => {
+            if e.kind == 6 {
+              b = index_of_int(&r_off, e.base_off);
+            } else {
+              b = index_of(&r_id, &e.base_id);
+            }
+          }
+          None => {}
+        }
+        if b >= 0 {
+          let d = int_at(&r_depth, b) + 1;
+          if d > max_delta_depth() {
+            return Err(GitError.LimitExceeded("delta chain is too deep"));
+          }
+          let out = apply_delta(&bytes_at(&r_content, b), &bytes_at(&datas, j))?;
+          if out.len() > single_limit {
+            return Err(GitError.LimitExceeded("delta result exceeds the single object limit"));
+          }
+          total = total + out.len();
+          if total > total_limit {
+            return Err(GitError.LimitExceeded("pack exceeds the cumulative inflate limit"));
+          }
+          let k = int_at(&r_kind, b);
+          let idb = compute_object_id(&object_type_name(&kind_to_type(k)), &out);
+          r_ent.push(j);
+          r_off.push(int_at(&offs, j));
+          r_kind.push(k);
+          r_id.push(bytes_to_hex(&idb));
+          r_content.push(out);
+          r_depth.push(d);
+          progress = true;
+        }
+      }
+      j = j + 1;
+    }
+  }
+  if r_ent.len() < ents.len() {
+    let mut t = 0;
+    while t < ents.len() {
+      if index_of_int(&r_ent, t) < 0 {
+        match ents.get(t) {
+          Some(e) => {
+            if e.kind == 7 && index_of(&r_id, &e.base_id) < 0 {
+              return Err(GitError.UnsupportedFormat("thin pack: a delta base outside the pack is not accepted"));
+            }
+          }
+          None => {}
+        }
+      }
+      t = t + 1;
+    }
+    return Err(GitError.Corrupt("pack has a delta that cannot be resolved"));
+  }
+  let mut out = List.new();
+  let mut seen = List.new();
+  let mut m = 0;
+  while m < r_ent.len() {
+    let id = str_at(&r_id, m);
+    if index_of(&seen, &id) < 0 {
+      seen.push(id.clone());
+      let kk = int_at(&r_kind, m);
+      let cc = bytes_at(&r_content, m);
+      out.push(RecvObject { id: id, kind: kk, content: cc });
+    }
+    m = m + 1;
+  }
+  return Ok(out);
+}
+
+fn index_of_int(l: &List<Int>, v: Int) -> Int
+  intent "整数のリストの中の v の番号（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < l.len() {
+    if int_at(&l, i) == v {
+      return i;
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}

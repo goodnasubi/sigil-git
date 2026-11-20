@@ -5,13 +5,14 @@ module git.acl
 use git.walk.index_of;
 
 // ADR 0048 決定 3 のうち、第 2 段が必要とする最小の認可フック。リポジトリ ACL の本格実装（metadata・可視性・owner・管理 UI）は第 4 段。
-// ここにあるのは、接続試験のための固定の表（`repo:subject,subject;repo:subject`）だけで、永続化・変更・public-read・管理者の例外を持たない。
+// ここにあるのは、接続試験のための固定の表（`repo:subject,subject=rw;repo:subject`。`=rw` の付いた主体は読み書き、付かない主体は読み取りだけ）だけで、永続化・変更・public-read・管理者の例外を持たない。
 // 認証（0037 の Bearer）を通った主体 `sub` だけを渡す。表に無い主体・リポジトリは読めない（既定は拒否）。
 // 読めない主体にはリポジトリの存在を明かさない（呼び出し側が 404 にする）。
 
 pub struct FixedAcl {
   repos: List<String>,
   readers: List<List<String>>,
+  writers: List<List<String>>,
 }
 
 pub fn repo_id_ok(id: &String) -> Bool
@@ -84,6 +85,7 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
 {
   let mut repos = List.new();
   let mut readers = List.new();
+  let mut writers = List.new();
   let entries = split_on(&text, 59);
   let mut i = 0;
   while i < entries.len() {
@@ -101,11 +103,31 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
     if subs.len() == 0 {
       return Err("invalid_acl");
     }
+    let mut names = List.new();
+    let mut writer_names = List.new();
+    let mut k = 0;
+    while k < subs.len() {
+      let item = str_at(&subs, k);
+      let kv = split_on(&item, 61);
+      if kv.len() < 1 || kv.len() > 2 {
+        return Err("invalid_acl");
+      }
+      let name = str_at(&kv, 0);
+      if kv.len() == 2 {
+        if str_at(&kv, 1) != "rw" {
+          return Err("invalid_acl");
+        }
+        writer_names.push(name.clone());
+      }
+      names.push(name);
+      k = k + 1;
+    }
     repos.push(id);
-    readers.push(subs);
+    readers.push(names);
+    writers.push(writer_names);
     i = i + 1;
   }
-  return Ok(FixedAcl { repos: repos, readers: readers });
+  return Ok(FixedAcl { repos: repos, readers: readers, writers: writers });
 }
 
 pub fn can_read(acl: &FixedAcl, subject: &String, repo: &String) -> Bool
@@ -119,6 +141,22 @@ pub fn can_read(acl: &FixedAcl, subject: &String, repo: &String) -> Bool
     return false;
   }
   return match acl.readers.get(at) {
+    Some(subs) => index_of(&subs, &subject) >= 0,
+    None => false,
+  };
+}
+
+pub fn can_write(acl: &FixedAcl, subject: &String, repo: &String) -> Bool
+  intent "認証済みの主体 subject が repo へ書けるか（表で `=rw` の付いた主体だけ true。書けても読めない主体はいない）"
+  requires none
+  ensures none
+  effects none
+{
+  let at = index_of(&acl.repos, &repo);
+  if at < 0 {
+    return false;
+  }
+  return match acl.writers.get(at) {
     Some(subs) => index_of(&subs, &subject) >= 0,
     None => false,
   };
