@@ -247,13 +247,13 @@ fn serve_repo(ctx: &Ctx, repo: &Repo, req: &HttpRequest, is_receive: Bool, recei
   return respond(&ctx, &repo, &req, refs_path);
 }
 
-fn respond_receive(ctx: &Ctx, repo: &Repo, req: &HttpRequest, refs_path: Bool, id: &String, subject: &String) -> HttpResponse
+fn respond_receive(ctx: &Ctx, repo: &Repo, req: &HttpRequest, receive_refs: Bool, id: &String, subject: &String) -> HttpResponse
   intent "認証・認可（read と write）の後に、receive-pack の info/refs か POST を処理する。POST は公開の直前にも最新の ACL を読み直す"
   requires none
   ensures none
   effects console, fs, random
 {
-  if refs_path {
+  if receive_refs {
     return to_receive_response(&receive_info_refs_reply(&repo, &req.query()));
   }
   let body = req.body();

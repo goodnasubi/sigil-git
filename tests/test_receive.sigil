@@ -872,6 +872,11 @@ fn run_pushes(f: &Fixture, dir: &String) -> Bool
   multi.extend(&command_pkt(&zero(), &c1, &"refs/heads/m2", &""));
   multi.extend(&pkt_flush());
   multi.extend(&empty_pack());
+  // 実 Git の削除は pack を伴わず flush で終わる。400 ではなく方針の ng になる
+  let mut del_wire = command_pkt(&c2, &zero(), &"refs/heads/main", &caps);
+  del_wire.extend(&pkt_flush());
+  let del_reply = post(&r, &del_wire);
+  ok = expect(del_reply.status == 200 && del_reply.body == report_ng(&"skipped", &"refs/heads/main", &"delete_not_allowed"), &"policy: a real delete request without a pack gets delete_not_allowed (not 400)") && ok;
   let mreply = post(&r, &multi);
   ok = expect(mreply.body == report_ng(&"skipped", &"refs/heads/m1", &"multiple_refs") && ref_is(&r, &"refs/heads/m1", &"") && ref_is(&r, &"refs/heads/m2", &""), &"policy: multiple refs are rejected as a whole") && ok;
   // 未対応: SHA-1、未知の能力、shallow
@@ -880,8 +885,8 @@ fn run_pushes(f: &Fixture, dir: &String) -> Bool
   let atomic = post(&r, &push_body(&zero(), &c1, &"refs/heads/at", &"report-status atomic", &empty_pack()));
   ok = expect(atomic.status == 200 && has_text(&atomic.body, &"ERR ") && ref_is(&r, &"refs/heads/at", &""), &"unsupported: an unknown capability gets an ERR line and nothing changes") && ok;
   // 壊れた pack・欠落・thin pack は参照を変えない
-  let ids_c1 = pack_of(&f, &ids_of(&f, &c1));
-  let broken = flip(&ids_c1, ids_c1.len() - 1);
+  let ids_c1_pack = pack_of(&f, &ids_of(&f, &c1));
+  let broken = flip(&ids_c1_pack, ids_c1_pack.len() - 1);
   let bp = post(&r, &push_body(&zero(), &c1, &"refs/heads/broken", &caps, &broken));
   ok = expect(bp.body == report_ng(&"bad_pack", &"refs/heads/broken", &"unpack_failed") && ref_is(&r, &"refs/heads/broken", &""), &"verify: a corrupt pack reports an unpack failure") && ok;
   let only_commit = post(&r, &push_body(&zero(), &c3, &"refs/heads/partial", &caps, &pack_of(&f, &one(&c3))));

@@ -296,7 +296,8 @@ pub fn parse_receive_request(body: &Bytes) -> Result<ReceiveRequest, GitError>
     PktLine.Flush => {}
   }
   let pack = body.slice(second.next, body.len()).unwrap_or(Bytes.new());
-  if pack.len() == 0 {
+  // 削除（new がゼロ）は pack を伴わない（実 Git の要求は flush で終わる）。方針の検査で delete_not_allowed に至らせる
+  if pack.len() == 0 && cmd.new_id != zeros64() {
     return Err(GitError.Corrupt("pack is missing"));
   }
   return Ok(ReceiveRequest { cmd: cmd, multiple: false, pack: pack });

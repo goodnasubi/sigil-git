@@ -268,7 +268,7 @@ pub fn recv_pack_parse(pack: &Bytes, object_limit: Int, total_limit: Int, single
       Some(e) => e.kind,
       None => 0,
     };
-    if k <= 4 {
+    if k >= 1 && k <= 4 {
       let content = bytes_at(&datas, i);
       let idb = compute_object_id(&object_type_name(&kind_to_type(k)), &content);
       r_ent.push(i);

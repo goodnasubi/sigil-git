@@ -66,7 +66,6 @@ head = b"sigil1." + b(payload)
 print((head + b"." + b(hmac.new(key, head, hashlib.sha256).digest())).decode())
 PY
 TOKEN="$(python3 -I "$W/mint.py" $KEY $AUD alice)"
-TOKEN_BOB="$(python3 -I "$W/mint.py" $KEY $AUD bob)"
 
 mkdir -p "$W/repos"
 ACLF="$W/acl.txt"
@@ -187,7 +186,9 @@ def pkt(b): return b"%04x" % (len(b) + 4) + b
 caps = b"report-status object-format=sha256"
 if mode == "atomic": caps = b"report-status atomic object-format=sha256"
 cmd = pkt(old.encode() + b" " + new.encode() + b" " + ref.encode() + b"\0" + caps) + b"0000"
-if mode == "thin":
+if mode == "delete":
+    pack = b""
+elif mode == "thin":
     revs = new + "\n^" + base + "\n"
     pack = subprocess.run([git, "-C", repo, "pack-objects", "--revs", "--thin", "--stdout"], input=revs.encode(), capture_output=True, check=True).stdout
 elif mode == "empty":
@@ -226,6 +227,11 @@ unchanged thin-pack
 test "$(rawpost plain "$Z" "$NEWC" refs/heads/main)" = 409 || fail "creating an existing branch should be 409"
 test "$(rawpost plain "$(w rev-parse main~2)" "$NEWC" refs/heads/main)" = 409 || fail "stale old should be 409"
 unchanged cas
+# 削除の真の電文（pack なし、flush で終わる）は 400 ではなく方針の ng（delete_not_allowed）になり、参照は変わらない
+# （実 Git は delete-refs を広告しないサーバーには削除を送らないので、生の要求で確かめる）
+test "$(rawpost delete "$HEAD_NOW" "$Z" refs/heads/main)" = 200 || fail "delete wire request should be 200 with ng"
+grep -aq "ng refs/heads/main delete_not_allowed" "$W/raw.out" || fail "delete should be ng delete_not_allowed: $(head -c 300 "$W/raw.out")"
+unchanged delete-wire
 # gzip は 415
 test "$(rawpost gzip "$HEAD_NOW" "$NEWC" refs/heads/main -H 'Content-Encoding: gzip')" = 415 || fail "gzip receive-pack should be 415"
 test "$(rawpost plain "$HEAD_NOW" "$NEWC" refs/heads/main -H 'Content-Encoding: x-gzip')" = 415 || fail "x-gzip should be 415"
