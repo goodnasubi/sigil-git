@@ -1,0 +1,275 @@
+module git.gzip
+  targets server
+  trust none
+
+use git.crc32.crc32_table;
+use git.crc32.crc32_update;
+use git.error.GitError;
+use git.fsio.string_starts_with;
+use git.inflate.inflate_deflate;
+
+// ADR 0052 / ADR 0048 決定 1: upload-pack POST の gzip 要求本文の復号と、Content-Encoding の方針。
+// 単一の gzip member だけを受理し、ヘッダ（任意項目と FHCRC を含む）、deflate の終端、trailer の CRC-32 と ISIZE、
+// 入力の全消費を検証する。検証に成功した出力だけを返し、失敗では部分出力を返さない。
+// gzip には窓の宣言欄がないので、後方参照は出力済みの範囲と DEFLATE の最大距離 32 KiB の両方に収める。
+// 展開量は out_limit に収める（ISIZE の宣言には基づいて割り当てない）。符号化入力は enc_limit に収める。
+
+pub struct Rejection {
+  status: Int,
+  reason: String,
+}
+
+fn gzip_window() -> Int
+  intent "DEFLATE の最大距離（32 KiB）を返す"
+  requires none
+  ensures result == 32768
+  effects none
+{
+  return 32768;
+}
+
+fn byte_at(data: &Bytes, i: Int) -> Result<Int, GitError>
+  intent "i 番目の byte を読む。入力が尽きていたら打切り（truncated）"
+  requires none
+  ensures none
+  effects none
+{
+  return match data.get(i) {
+    Some(b) => Ok(b),
+    None => Err(GitError.Corrupt("truncated gzip header")),
+  };
+}
+
+fn le32_at(data: &Bytes, i: Int) -> Int
+  intent "i 番目から little endian の 4 byte を読む（呼び出し側が範囲を確かめる）"
+  requires none
+  ensures none
+  effects none
+{
+  return data.get(i).unwrap_or(0) + data.get(i + 1).unwrap_or(0) * 256 + data.get(i + 2).unwrap_or(0) * 65536 + data.get(i + 3).unwrap_or(0) * 16777216;
+}
+
+fn skip_zero_terminated(data: &Bytes, pos: Int) -> Result<Int, GitError>
+  intent "終端 0 までの文字列項目を読み飛ばし、次の位置を返す。終端が無ければ打切り"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = pos;
+  while i < data.len() {
+    if data.get(i).unwrap_or(0) == 0 {
+      return Ok(i + 1);
+    }
+    i = i + 1;
+  }
+  return Err(GitError.Corrupt("truncated gzip header"));
+}
+
+pub fn gzip_decode_limited(data: &Bytes, out_limit: Int, enc_limit: Int) -> Result<Bytes, GitError>
+  intent "単一の gzip member を検証して展開する。符号化入力が enc_limit、展開量が out_limit を超えたら LimitExceeded。ヘッダ・deflate・trailer を入力順に検査し、最初の失敗で止まる。全検証に成功したときだけ出力を返す"
+  requires out_limit >= 0 && enc_limit >= 0
+  ensures none
+  effects none
+{
+  if data.len() > enc_limit {
+    return Err(GitError.LimitExceeded("encoded body exceeds the limit"));
+  }
+  if byte_at(&data, 0)? != 31 {
+    return Err(GitError.Corrupt("invalid gzip magic"));
+  }
+  if byte_at(&data, 1)? != 139 {
+    return Err(GitError.Corrupt("invalid gzip magic"));
+  }
+  if byte_at(&data, 2)? != 8 {
+    return Err(GitError.Corrupt("invalid gzip method"));
+  }
+  let flg = byte_at(&data, 3)?;
+  if flg >= 32 {
+    return Err(GitError.Corrupt("invalid gzip reserved flags"));
+  }
+  byte_at(&data, 9)?;
+  let mut pos = 10;
+  if (flg & 4) != 0 {
+    let lo = byte_at(&data, pos)?;
+    let hi = byte_at(&data, pos + 1)?;
+    let xlen = lo + hi * 256;
+    pos = pos + 2;
+    if pos + xlen > data.len() {
+      return Err(GitError.Corrupt("truncated gzip header"));
+    }
+    pos = pos + xlen;
+  }
+  if (flg & 8) != 0 {
+    pos = skip_zero_terminated(&data, pos)?;
+  }
+  if (flg & 16) != 0 {
+    pos = skip_zero_terminated(&data, pos)?;
+  }
+  let table = crc32_table();
+  if (flg & 2) != 0 {
+    let lo = byte_at(&data, pos)?;
+    let hi = byte_at(&data, pos + 1)?;
+    let want = lo + hi * 256;
+    let have = (crc32_update(&table, 4294967295, &data, 0, pos) ^ 4294967295) & 65535;
+    if have != want {
+      return Err(GitError.Corrupt("invalid gzip header check"));
+    }
+    pos = pos + 2;
+  }
+  let body = inflate_deflate(&data, pos, out_limit, gzip_window())?;
+  let p = pos + body.consumed;
+  if p + 4 > data.len() {
+    return Err(GitError.Corrupt("truncated gzip trailer"));
+  }
+  let out_crc = crc32_update(&table, 4294967295, &body.data, 0, body.data.len()) ^ 4294967295;
+  if out_crc != le32_at(&data, p) {
+    return Err(GitError.Corrupt("invalid gzip CRC-32"));
+  }
+  if p + 8 > data.len() {
+    return Err(GitError.Corrupt("truncated gzip trailer"));
+  }
+  if body.data.len() % 4294967296 != le32_at(&data, p + 4) {
+    return Err(GitError.Corrupt("invalid gzip ISIZE"));
+  }
+  if p + 8 != data.len() {
+    return Err(GitError.Corrupt("trailing data after the gzip member"));
+  }
+  return Ok(body.data);
+}
+
+pub fn gzip_decode(data: &Bytes) -> Result<Bytes, GitError>
+  intent "upload-pack POST の固定上限（符号化 2 MiB、展開後 1 MiB）で gzip 本文を検証して展開する"
+  requires none
+  ensures none
+  effects none
+{
+  return gzip_decode_limited(&data, 1048576, 2097152);
+}
+
+fn corrupt_reason(m: &String) -> String
+  intent "Corrupt の文言から固定理由を選ぶ（打切り・余剰・その他）"
+  requires none
+  ensures none
+  effects none
+{
+  if string_starts_with(&m, &"truncated") {
+    return "truncated_compressed_data";
+  }
+  if string_starts_with(&m, &"trailing") {
+    return "trailing_compressed_data";
+  }
+  return "invalid_compressed_data";
+}
+
+fn unsupported_reason(m: &String) -> String
+  intent "UnsupportedFormat の文言から固定理由を選ぶ"
+  requires none
+  ensures none
+  effects none
+{
+  if string_starts_with(&m, &"zlib preset") {
+    return "unsupported_preset_dictionary";
+  }
+  return "unsupported_content_encoding";
+}
+
+pub fn compression_reason(err: &GitError) -> String
+  intent "圧縮の失敗を ADR 0052 の固定理由に変換する。入力の内容・内部の文言は含めない"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.LimitExceeded(_) => "compression_limit_exceeded",
+    GitError.UnsupportedFormat(m) => unsupported_reason(&m),
+    GitError.Corrupt(m) => corrupt_reason(&m),
+    _ => "invalid_compressed_data",
+  };
+}
+
+pub fn compression_status(reason: &String) -> Int
+  intent "固定理由に対応する HTTP 状態（400／413／415）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if reason == "compression_limit_exceeded" {
+    return 413;
+  }
+  if reason == "unsupported_content_encoding" {
+    return 415;
+  }
+  return 400;
+}
+
+pub fn rejection_of(err: &GitError) -> Rejection
+  intent "圧縮の失敗を固定理由と HTTP 状態の組にする"
+  requires none
+  ensures none
+  effects none
+{
+  let reason = compression_reason(&err);
+  let status = compression_status(&reason);
+  return Rejection { status: status, reason: reason };
+}
+
+fn lower_ascii(b: Int) -> Int
+  intent "ASCII の大文字を小文字にする"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 65 && b <= 90 {
+    return b + 32;
+  }
+  return b;
+}
+
+pub fn trimmed_lower(v: &Bytes) -> Bytes
+  intent "前後の SP／HTAB を除いて ASCII 小文字にした値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut s = 0;
+  let mut e = v.len();
+  while s < e && (v.get(s).unwrap_or(0) == 32 || v.get(s).unwrap_or(0) == 9) {
+    s = s + 1;
+  }
+  while e > s && (v.get(e - 1).unwrap_or(0) == 32 || v.get(e - 1).unwrap_or(0) == 9) {
+    e = e - 1;
+  }
+  let mut out = Bytes.new();
+  let mut i = s;
+  while i < e {
+    out.push(lower_ascii(v.get(i).unwrap_or(0)));
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn select_encoding(values: &List<Bytes>, upload_pack_post: Bool) -> Result<Bool, Rejection>
+  intent "Content-Encoding の全ヘッダ行から符号化を選ぶ（ADR 0052 検査順序 1）。指定なしと単一の identity は false、upload-pack POST の単一の gzip は true。x-gzip を含む別名・多重符号化（複数行、カンマ区切り）・それ以外は unsupported_content_encoding（415）"
+  requires none
+  ensures none
+  effects none
+{
+  if values.len() == 0 {
+    return Ok(false);
+  }
+  let bad = Rejection { status: 415, reason: "unsupported_content_encoding" };
+  if values.len() > 1 {
+    return Err(bad);
+  }
+  let v = match values.get(0) {
+    Some(f) => trimmed_lower(&f),
+    None => Bytes.new(),
+  };
+  if v == "identity".as_bytes() {
+    return Ok(false);
+  }
+  if v == "gzip".as_bytes() && upload_pack_post {
+    return Ok(true);
+  }
+  return Err(bad);
+}

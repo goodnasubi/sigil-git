@@ -20,6 +20,7 @@ struct Bits {
   pos: Int,
   buf: Int,
   cnt: Int,
+  maxd: Int,
 }
 
 struct Huff {
@@ -36,7 +37,7 @@ fn take_bits(data: &Bytes, st: &mut Bits, n: Int) -> Result<Int, GitError>
   while st.cnt < n {
     match data.get(st.pos) {
       None => {
-        return Err(GitError.Corrupt("deflate stream is truncated"));
+        return Err(GitError.Corrupt("truncated deflate stream"));
       }
       Some(b) => {
         st.buf = st.buf | b << st.cnt;
@@ -198,7 +199,7 @@ fn inflate_codes(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int, lit: 
         return Err(GitError.Corrupt("invalid distance symbol"));
       }
       let d = at(&dbase, ds) + take_bits(&data, &mut st, at(&dext, ds))?;
-      if d > out.len() {
+      if d > out.len() || d > st.maxd {
         return Err(GitError.Corrupt("distance is too far back"));
       }
       let mut k = 0;
@@ -359,27 +360,16 @@ fn inflate_stored(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> R
   return Ok(true);
 }
 
-pub fn inflate_zlib(z: &Bytes, start: Int, limit: Int) -> Result<InflateResult, GitError>
-  intent "z の start 位置から始まる zlib ストリームを伸長する。出力が limit byte を超えたら LimitExceeded。Adler-32 を検証し、ストリームが使った byte 数（start から末尾の検査値まで）を consumed に入れる。ストリームの後ろに続く byte は読まない"
-  requires limit >= 0
+pub fn inflate_deflate(z: &Bytes, start: Int, limit: Int, max_dist: Int) -> Result<InflateResult, GitError>
+  intent "z の start 位置から始まる生の deflate ストリーム（RFC 1951）を伸長する。後方参照の距離は既に出力した範囲と max_dist の両方に収める（ADR 0052）。出力が limit byte を超えたら LimitExceeded。終端ブロックの直後までを consumed（byte 数）に入れ、後ろの byte は読まない"
+  requires limit >= 0 && max_dist >= 1
   ensures none
   effects none
 {
-  if start < 0 || start + 2 > z.len() {
-    return Err(GitError.Corrupt("zlib stream too short"));
+  if start < 0 || start > z.len() {
+    return Err(GitError.Corrupt("truncated deflate stream"));
   }
-  let cmf = z.get(start).unwrap_or(0);
-  let flg = z.get(start + 1).unwrap_or(0);
-  if cmf % 16 != 8 || cmf / 16 > 7 {
-    return Err(GitError.Corrupt("invalid zlib header (not deflate)"));
-  }
-  if (cmf * 256 + flg) % 31 != 0 {
-    return Err(GitError.Corrupt("invalid zlib header check"));
-  }
-  if flg / 32 % 2 == 1 {
-    return Err(GitError.UnsupportedFormat("zlib preset dictionary is not supported"));
-  }
-  let mut st = Bits { pos: start + 2, buf: 0, cnt: 0 };
+  let mut st = Bits { pos: start, buf: 0, cnt: 0, maxd: max_dist };
   let mut out = Bytes.new();
   let mut last = false;
   while !last {
@@ -398,13 +388,38 @@ pub fn inflate_zlib(z: &Bytes, start: Int, limit: Int) -> Result<InflateResult, 
       return Err(GitError.Corrupt("invalid deflate block type"));
     }
   }
-  let p = st.pos;
+  return Ok(InflateResult { data: out, consumed: st.pos - start });
+}
+
+pub fn inflate_zlib(z: &Bytes, start: Int, limit: Int) -> Result<InflateResult, GitError>
+  intent "z の start 位置から始まる zlib ストリームを伸長する。出力が limit byte を超えたら LimitExceeded。Adler-32 を検証し、ストリームが使った byte 数（start から末尾の検査値まで）を consumed に入れる。後方参照の距離は CINFO が宣言した窓にも収める（ADR 0052）。ストリームの後ろに続く byte は読まない"
+  requires limit >= 0
+  ensures none
+  effects none
+{
+  if start < 0 || start + 2 > z.len() {
+    return Err(GitError.Corrupt("truncated zlib header"));
+  }
+  let cmf = z.get(start).unwrap_or(0);
+  let flg = z.get(start + 1).unwrap_or(0);
+  if cmf % 16 != 8 || cmf / 16 > 7 {
+    return Err(GitError.Corrupt("invalid zlib header (not deflate)"));
+  }
+  if (cmf * 256 + flg) % 31 != 0 {
+    return Err(GitError.Corrupt("invalid zlib header check"));
+  }
+  if flg / 32 % 2 == 1 {
+    return Err(GitError.UnsupportedFormat("zlib preset dictionary is not supported"));
+  }
+  let window = 1 << cmf / 16 + 8;
+  let body = inflate_deflate(&z, start + 2, limit, window)?;
+  let p = start + 2 + body.consumed;
   if p + 4 > z.len() {
-    return Err(GitError.Corrupt("zlib stream is missing the Adler-32 check"));
+    return Err(GitError.Corrupt("truncated zlib trailer"));
   }
   let want = z.get(p).unwrap_or(0) * 16777216 + z.get(p + 1).unwrap_or(0) * 65536 + z.get(p + 2).unwrap_or(0) * 256 + z.get(p + 3).unwrap_or(0);
-  if adler32(&out) != want {
+  if adler32(&body.data) != want {
     return Err(GitError.Corrupt("zlib Adler-32 mismatch"));
   }
-  return Ok(InflateResult { data: out, consumed: p + 4 - start });
+  return Ok(InflateResult { data: body.data, consumed: p + 4 - start });
 }

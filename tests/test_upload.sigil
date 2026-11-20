@@ -1,0 +1,923 @@
+module tests.test_upload
+  targets server
+  trust none
+
+use git.commit.encode_commit;
+use git.commit.new_commit_object_str;
+use git.crc32.crc32;
+use git.fsio.cat3;
+use git.fsio.join_path;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.hash.hex_to_bytes;
+use git.object.ObjectType;
+use git.odb.odb_write;
+use git.odb.open_packs;
+use git.pktline.PktLine;
+use git.pktline.pkt_encode_str;
+use git.pktline.pkt_flush;
+use git.pktline.pkt_read;
+use git.refs.create_branch;
+use git.refs.create_tag;
+use git.refs.set_head_symbolic;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.tag.encode_tag;
+use git.tag.new_tag_object_str;
+use git.tree.TreeEntry;
+use git.tree.encode_tree;
+use git.tree.new_tree_entry_str;
+use git.upload.frame_advertisement;
+use git.upload.info_refs_reply;
+use git.upload.parse_upload_request;
+use git.upload.reachable_objects;
+use git.upload.sideband_frames;
+use git.upload.upload_pack_post;
+use git.upload.upload_pack_post_limited;
+use git.upload.upload_pack_respond;
+use git.upload.upload_pack_respond_limited;
+use git.wirepack.wire_pack_build;
+
+// ADR 0048 第 2 段: upload-pack の参照広告・want／have／done の交渉・pack 応答・gzip 要求・上限を試す。
+// 本物の Git クライアントとの接続は interop_upload.sh で確かめる。
+
+fn fail(label: &String) -> Bool
+  intent "失敗したラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&cat3(&"  FAILED: ", &label, &""));
+  return false;
+}
+
+fn expect(cond: Bool, label: &String) -> Bool
+  intent "cond が偽ならラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  if !cond {
+    return fail(&label);
+  }
+  return true;
+}
+
+fn write_obj(repo: &Repo, t: &ObjectType, content: &Bytes) -> String
+  intent "オブジェクトを書いて識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return match odb_write(&repo, &t, &content) {
+    Ok(id) => id,
+    Err(_) => "",
+  };
+}
+
+fn tree_of(repo: &Repo, entries: &List<TreeEntry>) -> String
+  intent "tree を符号化して書き、識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return match encode_tree(&entries) {
+    Ok(c) => write_obj(&repo, &ObjectType.Tree, &c),
+    Err(_) => "",
+  };
+}
+
+fn commit_of(repo: &Repo, tree: &String, parents: &List<String>, msg: &String) -> String
+  intent "commit を符号化して書き、識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let c = new_commit_object_str(tree.clone(), parents.clone(), "A <a@example.com> 1700000000 +0000", "A <a@example.com> 1700000000 +0000", List.new(), msg.clone());
+  return match encode_commit(&c) {
+    Ok(b) => write_obj(&repo, &ObjectType.Commit, &b),
+    Err(_) => "",
+  };
+}
+
+fn tag_of(repo: &Repo, target: &String, target_type: &String, name: &String) -> String
+  intent "注釈付きタグを符号化して書き、識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let t = new_tag_object_str(target.clone(), target_type.clone(), name.clone(), "A <a@example.com> 1700000000 +0000", "tag\n");
+  return match encode_tag(&t) {
+    Ok(b) => write_obj(&repo, &ObjectType.Tag, &b),
+    Err(_) => "",
+  };
+}
+
+fn one(a: &String) -> List<String>
+  intent "要素 1 つのリストを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a.clone());
+  return l;
+}
+
+fn two(a: &String, b: &String) -> List<String>
+  intent "要素 2 つのリストを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a.clone());
+  l.push(b.clone());
+  return l;
+}
+
+fn pkt(text: &String) -> Bytes
+  intent "文字列を pkt-line にする"
+  requires none
+  ensures none
+  effects none
+{
+  return pkt_encode_str(&text).unwrap_or(Bytes.new());
+}
+
+fn str_at(l: &List<String>, i: Int) -> String
+  intent "文字列のリストの i 番目の複製を返す（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v.clone(),
+    None => "",
+  };
+}
+
+fn request(wants: &List<String>, caps: &String, haves: &List<String>, done: Bool) -> Bytes
+  intent "v0 の upload-pack 要求本文を作る。done が偽なら have の後を flush で終える"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < wants.len() {
+    if i == 0 && caps != "" {
+      out.extend(&pkt(&cat3(&cat3(&"want ", &str_at(&wants, i), &" "), &caps, &"\n")));
+    } else {
+      out.extend(&pkt(&cat3(&"want ", &str_at(&wants, i), &"\n")));
+    }
+    i = i + 1;
+  }
+  out.extend(&pkt_flush());
+  let mut j = 0;
+  while j < haves.len() {
+    out.extend(&pkt(&cat3(&"have ", &str_at(&haves, j), &"\n")));
+    j = j + 1;
+  }
+  if done {
+    out.extend(&pkt(&"done\n"));
+  } else {
+    out.extend(&pkt_flush());
+  }
+  return out;
+}
+
+fn starts_with_bytes(b: &Bytes, prefix: &Bytes) -> Bool
+  intent "b が prefix で始まるか"
+  requires none
+  ensures none
+  effects none
+{
+  if b.len() < prefix.len() {
+    return false;
+  }
+  return b.slice(0, prefix.len()).unwrap_or(Bytes.new()) == prefix.clone();
+}
+
+fn tail_from(b: &Bytes, pos: Int) -> Bytes
+  intent "b の pos 以降を返す"
+  requires pos >= 0
+  ensures none
+  effects none
+{
+  return b.slice(pos, b.len()).unwrap_or(Bytes.new());
+}
+
+pub struct Unframed {
+  pack: Bytes,
+  error: String,
+  ended: Bool,
+  valid: Bool,
+}
+
+fn unframe(body: &Bytes, start: Int) -> Unframed
+  intent "side-band-64k の応答を start から読み、channel 1 の内容（pack）、channel 3 の文言、flush で終わったかを返す"
+  requires start >= 0
+  ensures none
+  effects none
+{
+  let mut pack = Bytes.new();
+  let mut error = "";
+  let mut pos = start;
+  let mut ended = false;
+  while pos < body.len() && !ended {
+    match pkt_read(&body, pos) {
+      Err(_) => {
+        return Unframed { pack: pack, error: error, ended: false, valid: false };
+      }
+      Ok(r) => {
+        pos = r.next;
+        match r.line {
+          PktLine.Flush => {
+            ended = true;
+          }
+          PktLine.Data(p) => {
+            let ch = p.get(0).unwrap_or(0);
+            let rest = tail_from(&p, 1);
+            if ch == 1 {
+              pack.extend(&rest);
+            } else if ch == 3 {
+              error = rest.to_string_utf8().unwrap_or("");
+            } else {
+              return Unframed { pack: pack, error: error, ended: false, valid: false };
+            }
+          }
+        }
+      }
+    }
+  }
+  return Unframed { pack: pack, error: error, ended: ended && pos == body.len(), valid: true };
+}
+
+fn pack_count(pack: &Bytes) -> Int
+  intent "pack のオブジェクト数を読む（PACK・版 2 を確かめ、違えば -1）"
+  requires none
+  ensures none
+  effects none
+{
+  if pack.len() < 12 || tail_from(&pack, 0).slice(0, 8).unwrap_or(Bytes.new()) != bytes_hex8() {
+    return 0 - 1;
+  }
+  return pack.read_u32_be(8).unwrap_or(0 - 1);
+}
+
+fn bytes_hex8() -> Bytes
+  intent "PACK と版 2 の 8 byte を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(80);
+  b.push(65);
+  b.push(67);
+  b.push(75);
+  b.push(0);
+  b.push(0);
+  b.push(0);
+  b.push(2);
+  return b;
+}
+
+fn contains_pack_magic(b: &Bytes) -> Bool
+  intent "b のどこかに PACK の 4 byte があるか（応答に pack が混じっていないことの確認用）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i + 4 <= b.len() {
+    if b.get(i).unwrap_or(0) == 80 && b.get(i + 1).unwrap_or(0) == 65 && b.get(i + 2).unwrap_or(0) == 67 && b.get(i + 3).unwrap_or(0) == 75 {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+pub struct Fixture {
+  repo: Repo,
+  blob1: String,
+  blob2: String,
+  secret: String,
+  tree1: String,
+  tree2: String,
+  commit1: String,
+  commit2: String,
+  commit3: String,
+  commit4: String,
+  tag1: String,
+  tag4: String,
+  ok: Bool,
+}
+
+fn build_fixture(repo: Repo) -> Fixture
+  intent "テスト用の履歴を作る。main = commit2（親 commit1）、feature = commit1、注釈付きタグ t1 → commit2、軽量タグ lw → commit1、注釈付きタグ t4 → commit4（先端ではない）。commit3 と secret はどの参照からも到達できない（未公開）"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let blob1 = write_obj(&repo, &ObjectType.Blob, &"hello\n".as_bytes());
+  let blob2 = write_obj(&repo, &ObjectType.Blob, &"second file\n".as_bytes());
+  let secret = write_obj(&repo, &ObjectType.Blob, &"secret\n".as_bytes());
+  let mut e1 = List.new();
+  e1.push(new_tree_entry_str(100644, "a.txt", hex_to_bytes(&blob1).unwrap_or(Bytes.new())));
+  let tree1 = tree_of(&repo, &e1);
+  let mut e2 = List.new();
+  e2.push(new_tree_entry_str(100644, "a.txt", hex_to_bytes(&blob1).unwrap_or(Bytes.new())));
+  e2.push(new_tree_entry_str(100644, "b.txt", hex_to_bytes(&blob2).unwrap_or(Bytes.new())));
+  let tree2 = tree_of(&repo, &e2);
+  let mut e3 = List.new();
+  e3.push(new_tree_entry_str(100644, "s.txt", hex_to_bytes(&secret).unwrap_or(Bytes.new())));
+  let tree3 = tree_of(&repo, &e3);
+  let commit1 = commit_of(&repo, &tree1, &List.new(), &"first\n");
+  let commit2 = commit_of(&repo, &tree2, &one(&commit1), &"second\n");
+  let commit3 = commit_of(&repo, &tree3, &one(&commit1), &"unpublished\n");
+  let commit4 = commit_of(&repo, &tree2, &one(&commit1), &"tagged only\n");
+  let tag1 = tag_of(&repo, &commit2, &"commit", &"t1");
+  let tag4 = tag_of(&repo, &commit4, &"commit", &"t4");
+  let ok = blob1 != "" && blob2 != "" && secret != "" && tree1 != "" && tree2 != "" && tree3 != "" && commit1 != "" && commit2 != "" && commit3 != "" && commit4 != "" && tag1 != "" && tag4 != "";
+  let _ = create_branch(&repo, &"main", &commit2);
+  let _ = create_branch(&repo, &"feature", &commit1);
+  let _ = set_head_symbolic(&repo, &"refs/heads/main");
+  let _ = create_tag(&repo, &"t1", &tag1);
+  let _ = create_tag(&repo, &"lw", &commit1);
+  let _ = create_tag(&repo, &"t4", &tag4);
+  return Fixture { repo: repo, blob1: blob1, blob2: blob2, secret: secret, tree1: tree1, tree2: tree2, commit1: commit1, commit2: commit2, commit3: commit3, commit4: commit4, tag1: tag1, tag4: tag4, ok: ok };
+}
+
+fn expected_pack(f: &Fixture, tip: &String) -> Bytes
+  intent "tip からの到達集合から第 1 段の wire pack を作った期待値を返す（失敗すれば空）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut ids = List.new();
+  match open_packs(&f.repo) {
+    Ok(packs) => {
+      match reachable_objects(&f.repo, &packs, &one(&tip), 4096, 100000) {
+        Ok(l) => {
+          ids = l;
+        }
+        Err(_) => {
+          return Bytes.new();
+        }
+      }
+    }
+    Err(_) => {
+      return Bytes.new();
+    }
+  }
+  return match wire_pack_build(&f.repo, &ids) {
+    Ok(p) => p,
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn run_advertisement(f: &Fixture) -> Bool
+  intent "GET info/refs の応答（前置き・Content-Type・query の検査・全体 1 MiB）を試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut ok = true;
+  let r = info_refs_reply(&f.repo, &"service=git-upload-pack".as_bytes());
+  ok = expect(r.status == 200 && r.content_type == "application/x-git-upload-pack-advertisement", &"adv: status and content type") && ok;
+  let mut prefix = pkt(&"# service=git-upload-pack\n");
+  prefix.extend(&pkt_flush());
+  ok = expect(starts_with_bytes(&r.body, &prefix), &"adv: service header and flush") && ok;
+  let head_line = cat3(&f.commit2, &" HEAD\u{0}object-format=sha256 symref=HEAD:refs/heads/main side-band-64k\n", &"");
+  ok = expect(starts_with_bytes(&tail_from(&r.body, prefix.len()), &pkt(&head_line)), &"adv: HEAD line carries the capabilities") && ok;
+  let bad = words(&"|service=git-receive-pack|service=git-upload-pack&x=1|service=git-upload-pack&service=git-upload-pack|x=1|service=git-upload-pack&|service=|Service=git-upload-pack|service=git-upload-pack%20");
+  let mut i = 0;
+  while i < bad.len() {
+    let rb = info_refs_reply(&f.repo, &str_at(&bad, i).as_bytes());
+    ok = expect(rb.status == 400 && rb.body == "invalid_query".as_bytes(), &"adv: bad query is rejected with 400") && ok;
+    i = i + 1;
+  }
+  // 前置きを含めた全体が上限ちょうどなら通り、1 byte 超えれば拒否される。
+  let mut body = Bytes.new();
+  let mut k = 0;
+  while k < 100 {
+    body.push(97);
+    k = k + 1;
+  }
+  let total = 34 + body.len();
+  ok = expect(frame_advertisement(&body, total).is_ok(), &"adv: framed advertisement exactly at the limit") && ok;
+  ok = expect(frame_advertisement(&body, total - 1).is_err(), &"adv: framed advertisement one byte over") && ok;
+  return ok;
+}
+
+fn words(s: &String) -> List<String>
+  intent "| 区切りの文字列を分割する（空の項目も 1 件として扱う）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut out = List.new();
+  let mut cur = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 124 {
+      out.push(cur.to_string_utf8().unwrap_or(""));
+      cur = Bytes.new();
+    } else {
+      cur.push(c);
+    }
+    i = i + 1;
+  }
+  out.push(cur.to_string_utf8().unwrap_or(""));
+  return out;
+}
+
+fn run_clone(f: &Fixture) -> Bool
+  intent "have なし・done の clone（side-band あり・なし、注釈付きタグ、複数 want）を試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut ok = true;
+  let pack = expected_pack(&f, &f.commit2);
+  ok = expect(pack_count(&pack) == 6, &"clone: closure of main has 6 objects (2 commits, 2 trees, 2 blobs)") && ok;
+  let nak = pkt(&"NAK\n");
+  let sb = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"side-band-64k object-format=sha256", &List.new(), true));
+  ok = expect(sb.status == 200 && sb.content_type == "application/x-git-upload-pack-result", &"clone: side-band status and content type") && ok;
+  ok = expect(starts_with_bytes(&sb.body, &nak), &"clone: NAK comes first") && ok;
+  let u = unframe(&sb.body, nak.len());
+  ok = expect(u.valid && u.ended && u.error == "" && u.pack == pack, &"clone: side-band pack equals the closure pack and ends with flush") && ok;
+  let plain_resp = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &List.new(), true));
+  ok = expect(plain_resp.body == cat_bytes(&nak, &pack), &"clone: without side-band the raw pack follows NAK") && ok;
+  // 注釈付きタグの先端: tag オブジェクト → commit → ... の到達集合（tag 1 + 6）
+  let tag_resp = upload_pack_respond(&f.repo, &request(&one(&f.tag1), &"object-format=sha256", &List.new(), true));
+  let tag_pack = tail_from(&tag_resp.body, nak.len());
+  ok = expect(pack_count(&tag_pack) == 7, &"clone: annotated tag tip adds the tag object") && ok;
+  // 複数 want（main と feature）と重複した want は 1 度だけ数える
+  let mut wants = two(&f.commit2, &f.commit1);
+  wants.push(f.commit2.clone());
+  let multi = upload_pack_respond(&f.repo, &request(&wants, &"object-format=sha256", &List.new(), true));
+  ok = expect(pack_count(&tail_from(&multi.body, nak.len())) == 6, &"clone: several wants share one closure") && ok;
+  // 軽量タグ・HEAD の先端
+  let lw = upload_pack_respond(&f.repo, &request(&one(&f.commit1), &"object-format=sha256", &List.new(), true));
+  ok = expect(pack_count(&tail_from(&lw.body, nak.len())) == 3, &"clone: commit1 closure has 3 objects") && ok;
+  // 要求なし（want なし）の flush だけ
+  let empty = upload_pack_respond(&f.repo, &pkt_flush());
+  ok = expect(empty.status == 200 && empty.body.len() == 0, &"clone: an empty request gets an empty result") && ok;
+  return ok;
+}
+
+fn cat_bytes(a: &Bytes, b: &Bytes) -> Bytes
+  intent "2 つのバイト列を連結する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = a.clone();
+  out.extend(&b);
+  return out;
+}
+
+fn run_negotiation(f: &Fixture) -> Bool
+  intent "want の限定と have の応答（情報を漏らさない）、ACK／NAK を試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut ok = true;
+  let err_not_ours = pkt(&"ERR upload-pack: not our ref");
+  // peeled 行だけを根拠にした OID・未公開 OID・存在しない OID の want は、同じ ERR で拒否する。
+  let missing = "1111111111111111111111111111111111111111111111111111111111111111";
+  let mut cases = List.new();
+  cases.push(f.commit4.clone());
+  cases.push(f.commit3.clone());
+  cases.push(f.secret.clone());
+  cases.push(f.tree1.clone());
+  cases.push(f.blob1.clone());
+  cases.push(missing.clone());
+  let mut i = 0;
+  while i < cases.len() {
+    let r = upload_pack_respond(&f.repo, &request(&one(&str_at(&cases, i)), &"object-format=sha256", &List.new(), true));
+    ok = expect(r.status == 200 && r.body == err_not_ours, &"want: only advertised ref tips are accepted (identical refusal)") && ok;
+    i = i + 1;
+  }
+  // 先端のタグオブジェクトは受理する（peeled の commit4 は不可）。
+  let t4 = upload_pack_respond(&f.repo, &request(&one(&f.tag4), &"object-format=sha256", &List.new(), true));
+  ok = expect(pack_count(&tail_from(&t4.body, 8)) == 7, &"want: the annotated tag tip is accepted") && ok;
+  // 良い want と悪い want が混ざれば全体を拒否する（部分的な成功にしない）。
+  let mixed = upload_pack_respond(&f.repo, &request(&two(&f.commit2, &f.commit3), &"object-format=sha256", &List.new(), true));
+  ok = expect(mixed.body == err_not_ours, &"want: one bad want rejects the whole request") && ok;
+  // have: done の要求で、公開した履歴にある commit は ACK（done の無い要求は常に NAK。upload.sigil の negotiate を参照）、未公開・存在しないものは見分けのつかない NAK。
+  let ack = pkt(&cat3(&"ACK ", &f.commit1, &"\n"));
+  let h1 = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &one(&f.commit1), false));
+  ok = expect(h1.body == pkt(&"NAK\n"), &"have: before done the answer is NAK only, even with a published commit (stateless basic ACK)") && ok;
+  let h2 = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &one(&f.commit3), false));
+  let h3 = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &one(&missing), false));
+  ok = expect(h2.body == pkt(&"NAK\n") && h3.body == h2.body, &"have: unpublished and missing ids give the same NAK") && ok;
+  let d2 = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &one(&f.commit3), true));
+  let d3 = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &one(&missing), true));
+  ok = expect(d2.body == d3.body && starts_with_bytes(&d2.body, &pkt(&"NAK\n")), &"have+done: unpublished and missing ids give identical responses") && ok;
+  // 複数の have は最初の共通だけ ACK し、done の後は pack（完全な到達集合）。
+  let mut haves = two(&f.commit3, &f.commit1);
+  haves.push(f.commit2.clone());
+  let d4 = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &haves, true));
+  let pack = expected_pack(&f, &f.commit2);
+  ok = expect(d4.body == cat_bytes(&ack, &pack), &"have+done: first common ACK then the full closure") && ok;
+  // 共通が無く flush で終わる要求（done なし）は NAK だけ。
+  let n1 = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &List.new(), false));
+  ok = expect(n1.body == pkt(&"NAK\n"), &"flush without haves: NAK only") && ok;
+  // 未公開の blob の内容は応答のどこにも現れない。
+  ok = expect(!contains_text(&d4.body, &"secret\n") && !contains_text(&d2.body, &"secret\n"), &"leak: unpublished content is never sent") && ok;
+  return ok;
+}
+
+fn contains_text(b: &Bytes, text: &String) -> Bool
+  intent "b に text の byte 列が含まれるか"
+  requires none
+  ensures none
+  effects none
+{
+  let t = text.as_bytes();
+  let mut i = 0;
+  while i + t.len() <= b.len() {
+    if b.slice(i, i + t.len()).unwrap_or(Bytes.new()) == t {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn upper_hex(s: &String) -> String
+  intent "16 進文字列の a〜f を大文字にする（大文字 hex を拒否することの確認用）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c >= 97 && c <= 102 {
+      out.push(c - 32);
+    } else {
+      out.push(c);
+    }
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn run_unsupported(f: &Fixture) -> Bool
+  intent "未対応の能力・要求行と不正な要求が黙って成功せず、拒否されることを試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut ok = true;
+  let w = f.commit2.clone();
+  let unsupported = pkt(&"ERR upload-pack: unsupported request");
+  let caps = words(&"multi_ack|multi_ack_detailed|thin-pack|no-done|include-tag|ofs-delta|shallow|deepen-since|filter|agent=git/2.43.0|side-band|no-progress|object-format=sha1|allow-tip-sha1-in-want");
+  let mut i = 0;
+  while i < caps.len() {
+    let r = upload_pack_respond(&f.repo, &request(&one(&w), &str_at(&caps, i), &List.new(), true));
+    ok = expect(r.status == 200 && r.body == unsupported, &"caps: an unsupported capability is refused") && ok;
+    i = i + 1;
+  }
+  // 未対応の要求行（shallow／deepen／filter）
+  let lines = words(&"shallow 1111111111111111111111111111111111111111111111111111111111111111|deepen 1|deepen-since 1700000000|deepen-not refs/heads/x|deepen-relative|filter blob:none");
+  let mut j = 0;
+  while j < lines.len() {
+    let mut body = Bytes.new();
+    body.extend(&pkt(&cat3(&cat3(&"want ", &w, &" object-format=sha256\n"), &"", &"")));
+    body.extend(&pkt(&cat3(&str_at(&lines, j), &"\n", &"")));
+    body.extend(&pkt_flush());
+    body.extend(&pkt(&"done\n"));
+    let r = upload_pack_respond(&f.repo, &body);
+    ok = expect(r.status == 200 && r.body == unsupported, &"lines: an unsupported request line is refused") && ok;
+    j = j + 1;
+  }
+  // 不正な要求は 400（pkt-line の長さ・hex・終端・余剰・能力の位置）
+  let up = upper_hex(&w);
+  let mut bad = List.new();
+  bad.push(cat_bytes(&pkt(&cat3(&"want ", &w, &"\n")), &pkt_flush()));
+  let mut trunc = request(&one(&w), &"object-format=sha256", &List.new(), true);
+  trunc = trunc.slice(0, trunc.len() - 3).unwrap_or(Bytes.new());
+  bad.push(trunc);
+  let mut trailing = request(&one(&w), &"object-format=sha256", &List.new(), true);
+  trailing.push(48);
+  bad.push(trailing);
+  bad.push(request(&one(&up), &"object-format=sha256", &List.new(), true));
+  bad.push(request(&one(&"abc"), &"object-format=sha256", &List.new(), true));
+  bad.push("zzzz".as_bytes());
+  bad.push(pkt(&"hello\n"));
+  let mut second_caps = Bytes.new();
+  second_caps.extend(&pkt(&cat3(&"want ", &w, &" object-format=sha256\n")));
+  second_caps.extend(&pkt(&cat3(&"want ", &f.commit1, &" side-band-64k\n")));
+  second_caps.extend(&pkt_flush());
+  second_caps.extend(&pkt(&"done\n"));
+  bad.push(second_caps);
+  let mut k = 0;
+  while k < bad.len() {
+    let b = match bad.get(k) {
+      Some(v) => v.clone(),
+      None => Bytes.new(),
+    };
+    let r = upload_pack_respond(&f.repo, &b);
+    ok = expect(r.status == 400 && r.body == "invalid_request".as_bytes(), &"request: malformed requests are refused with 400") && ok;
+    k = k + 1;
+  }
+  // 0001・0002（v0 に無い pkt-line）は未対応、65521 の長さは上限超過。
+  let r1 = upload_pack_respond(&f.repo, &"0001".as_bytes());
+  ok = expect(r1.status == 200 && r1.body == unsupported, &"request: delimiter-pkt is unsupported") && ok;
+  let r2 = upload_pack_respond(&f.repo, &"fff1".as_bytes());
+  ok = expect(r2.status == 413, &"request: pkt-line over 65520 bytes is 413") && ok;
+  ok = expect(parse_upload_request(&request(&one(&w), &"side-band-64k", &two(&w, &w), true)).is_ok(), &"parse: duplicate haves are tolerated") && ok;
+  return ok;
+}
+
+fn run_limits(f: &Fixture) -> Bool
+  intent "オブジェクト数・走査件数・応答の上限の直下・一致・超過で、超過時に pack を送らず明示的に失敗することを試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut ok = true;
+  let req_sb = request(&one(&f.commit2), &"side-band-64k object-format=sha256", &List.new(), true);
+  let req_raw = request(&one(&f.commit2), &"object-format=sha256", &List.new(), true);
+  // オブジェクト数: main の到達集合は 6 個。
+  let a = upload_pack_respond_limited(&f.repo, &req_sb, 6, 100000, 1048576);
+  ok = expect(!contains_text(&a.body, &"limit exceeded") && contains_pack_magic(&a.body), &"limit: 6 objects at the object limit succeed") && ok;
+  let b = upload_pack_respond_limited(&f.repo, &req_sb, 5, 100000, 1048576);
+  ok = expect(contains_text(&b.body, &"upload-pack: limit exceeded") && !contains_pack_magic(&b.body) && starts_with_bytes(&b.body, &pkt(&"NAK\n")), &"limit: 7th object is refused on channel 3 with no pack") && ok;
+  let ub = unframe(&b.body, 8);
+  ok = expect(ub.valid && ub.ended && ub.error == "upload-pack: limit exceeded\n" && ub.pack.len() == 0, &"limit: the side-band failure is a channel-3 message followed by flush") && ok;
+  let c = upload_pack_respond_limited(&f.repo, &req_raw, 5, 100000, 1048576);
+  ok = expect(c.body == cat_bytes(&pkt(&"NAK\n"), &pkt(&"ERR upload-pack: limit exceeded")), &"limit: without side-band the failure is an ERR line") && ok;
+  // 走査件数: 成功する最小の予算を探し、その直下は失敗する。
+  let mut budget = 0;
+  let mut found = 0 - 1;
+  while budget < 40 && found < 0 {
+    let r = upload_pack_respond_limited(&f.repo, &req_raw, 4096, budget, 1048576);
+    if contains_pack_magic(&r.body) {
+      found = budget;
+    }
+    budget = budget + 1;
+  }
+  ok = expect(found > 0, &"limit: a graph walk budget that fits exists") && ok;
+  if found > 0 {
+    let under = upload_pack_respond_limited(&f.repo, &req_raw, 4096, found - 1, 1048576);
+    ok = expect(!contains_pack_magic(&under.body), &"limit: one item under the walk budget gives no pack") && ok;
+  }
+  // 応答全体（ACK／NAK・side-band・flush を含む）が上限ちょうどなら成功し、1 byte 超えれば pack を送らない。
+  let full = upload_pack_respond_limited(&f.repo, &req_sb, 4096, 100000, 1048576);
+  let total = full.body.len();
+  let at = upload_pack_respond_limited(&f.repo, &req_sb, 4096, 100000, total);
+  ok = expect(at.body == full.body, &"limit: a response exactly at the response limit succeeds") && ok;
+  let over = upload_pack_respond_limited(&f.repo, &req_sb, 4096, 100000, total - 1);
+  ok = expect(!contains_pack_magic(&over.body) && contains_text(&over.body, &"limit exceeded"), &"limit: one byte over the response limit sends no pack") && ok;
+  // side-band の分割: 65515 byte ちょうど・1 byte 超で枠が変わる。
+  let mut big = Bytes.new();
+  let mut n = 0;
+  while n < 65515 {
+    big.push(n % 256);
+    n = n + 1;
+  }
+  match sideband_frames(&big) {
+    Ok(s) => {
+      ok = expect(s.len() == 4 + 1 + 65515 + 4, &"sideband: 65515 bytes fit one pkt-line") && ok;
+    }
+    Err(_) => {
+      ok = fail(&"sideband: 65515 bytes");
+    }
+  }
+  big.push(1);
+  match sideband_frames(&big) {
+    Ok(s) => {
+      ok = expect(s.len() == 4 + 1 + 65515 + (4 + 1 + 1) + 4, &"sideband: one more byte needs a second pkt-line") && ok;
+    }
+    Err(_) => {
+      ok = fail(&"sideband: 65516 bytes");
+    }
+  }
+  return ok;
+}
+
+fn stored_block(data: &Bytes, final: Bool) -> Bytes
+  intent "stored ブロック 1 つの deflate 表現を作る"
+  requires data.len() <= 65535
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  if final {
+    out.push(1);
+  } else {
+    out.push(0);
+  }
+  let n = data.len();
+  out.push(n % 256);
+  out.push(n / 256);
+  out.push((65535 - n) % 256);
+  out.push((65535 - n) / 256);
+  out.extend(&data);
+  return out;
+}
+
+fn le32(out: &mut Bytes, v: Int)
+  intent "32 bit を little endian で追記する"
+  requires v >= 0
+  ensures none
+  effects none
+{
+  out.push(v % 256);
+  out.push(v / 256 % 256);
+  out.push(v / 65536 % 256);
+  out.push(v / 16777216 % 256);
+}
+
+fn gzip_stored(plain: &Bytes) -> Bytes
+  intent "plain を stored ブロック 1 つの gzip member にする（65535 byte 以下）"
+  requires plain.len() <= 65535
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push(31);
+  out.push(139);
+  out.push(8);
+  out.push(0);
+  out.push(0);
+  out.push(0);
+  out.push(0);
+  out.push(0);
+  out.push(0);
+  out.push(3);
+  out.extend(&stored_block(&plain, true));
+  le32(&mut out, crc32(&plain));
+  le32(&mut out, plain.len());
+  return out;
+}
+
+fn ct_req() -> Option<Bytes>
+  intent "upload-pack の要求の Content-Type を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return Some("application/x-git-upload-pack-request".as_bytes());
+}
+
+fn encs(v: &String) -> List<Bytes>
+  intent "Content-Encoding の値 1 つのリスト（空文字列なら空のリスト）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  if v != "" {
+    l.push(v.as_bytes());
+  }
+  return l;
+}
+
+fn run_http_post(f: &Fixture) -> Bool
+  intent "POST の入口（Content-Encoding・Content-Type・gzip・本文の上限）を試す"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let mut ok = true;
+  let plain = request(&one(&f.commit2), &"side-band-64k object-format=sha256", &List.new(), true);
+  let base = upload_pack_respond(&f.repo, &plain);
+  let id = upload_pack_post(&f.repo, &encs(&""), &ct_req(), &plain);
+  ok = expect(id.status == 200 && id.body == base.body, &"post: identity equals the direct response") && ok;
+  let id2 = upload_pack_post(&f.repo, &encs(&"identity"), &ct_req(), &plain);
+  ok = expect(id2.body == base.body, &"post: explicit identity") && ok;
+  let gz = upload_pack_post(&f.repo, &encs(&"gzip"), &ct_req(), &gzip_stored(&plain));
+  ok = expect(gz.status == 200 && gz.body == base.body, &"post: gzip is verified, inflated and handled like identity") && ok;
+  let gz_up = upload_pack_post(&f.repo, &encs(&"GZIP"), &ct_req(), &gzip_stored(&plain));
+  ok = expect(gz_up.body == base.body, &"post: the coding name is case-insensitive") && ok;
+  // 拒否: 未対応の符号化は 415（本文は処理されない）
+  let xg = upload_pack_post(&f.repo, &encs(&"x-gzip"), &ct_req(), &gzip_stored(&plain));
+  ok = expect(xg.status == 415 && xg.body == "unsupported_content_encoding".as_bytes(), &"post: x-gzip is unsupported (415)") && ok;
+  let df = upload_pack_post(&f.repo, &encs(&"deflate"), &ct_req(), &plain);
+  ok = expect(df.status == 415, &"post: deflate is unsupported (415)") && ok;
+  let multi = upload_pack_post(&f.repo, &encs(&"gzip, gzip"), &ct_req(), &gzip_stored(&plain));
+  ok = expect(multi.status == 415, &"post: multiple codings are unsupported (415)") && ok;
+  // gzip の破損は 400、拒否時は pkt-line の要求処理が始まらない（応答は固定理由だけ）。
+  let mut broken = gzip_stored(&plain);
+  let last = broken.len() - 9;
+  let flipped = (broken.get(last).unwrap_or(0) + 1) % 256;
+  let mut b2 = broken.slice(0, last).unwrap_or(Bytes.new());
+  b2.push(flipped);
+  b2.extend(&tail_from(&broken, last + 1));
+  let bad = upload_pack_post(&f.repo, &encs(&"gzip"), &ct_req(), &b2);
+  ok = expect(bad.status == 400 && bad.content_type == "text/plain" && !contains_text(&bad.body, &"NAK"), &"post: a corrupt gzip is 400 and no request is processed") && ok;
+  let mut trailing = gzip_stored(&plain);
+  trailing.push(0);
+  let tr = upload_pack_post(&f.repo, &encs(&"gzip"), &ct_req(), &trailing);
+  ok = expect(tr.status == 400 && tr.body == "trailing_compressed_data".as_bytes(), &"post: trailing data after the gzip member is 400") && ok;
+  let cut = gzip_stored(&plain).slice(0, 20).unwrap_or(Bytes.new());
+  let tc = upload_pack_post(&f.repo, &encs(&"gzip"), &ct_req(), &cut);
+  ok = expect(tc.status == 400 && tc.body == "truncated_compressed_data".as_bytes(), &"post: a truncated gzip is 400") && ok;
+  // 展開後 1 MiB: gzip の中身が 1 MiB を超えれば 413（stored ブロックを重ねて作る）。
+  let mut chunk = Bytes.new();
+  let mut q = 0;
+  while q < 65535 {
+    chunk.push(48);
+    q = q + 1;
+  }
+  let mut deflate = Bytes.new();
+  let mut blocks = 0;
+  while blocks < 17 {
+    deflate.extend(&stored_block(&chunk, false));
+    blocks = blocks + 1;
+  }
+  deflate.extend(&stored_block(&Bytes.new(), true));
+  let mut big = Bytes.new();
+  big.push(31);
+  big.push(139);
+  big.push(8);
+  big.push(0);
+  big.push(0);
+  big.push(0);
+  big.push(0);
+  big.push(0);
+  big.push(0);
+  big.push(3);
+  big.extend(&deflate);
+  le32(&mut big, 0);
+  le32(&mut big, 0);
+  let over = upload_pack_post(&f.repo, &encs(&"gzip"), &ct_req(), &big);
+  ok = expect(over.status == 413 && over.body == "compression_limit_exceeded".as_bytes(), &"post: inflated body over 1 MiB is 413") && ok;
+  // Content-Type
+  let none_ct = upload_pack_post(&f.repo, &encs(&""), &None, &plain);
+  ok = expect(none_ct.status == 415 && none_ct.body == "unsupported_media_type".as_bytes(), &"post: a missing Content-Type is 415") && ok;
+  let wrong = upload_pack_post(&f.repo, &encs(&""), &Some("application/x-git-receive-pack-request".as_bytes()), &plain);
+  ok = expect(wrong.status == 415, &"post: a wrong Content-Type is 415") && ok;
+  // identity の本文は 1 MiB まで。
+  let mut huge = Bytes.new();
+  let mut z = 0;
+  while z < 17 {
+    huge.extend(&chunk);
+    z = z + 1;
+  }
+  let hr = upload_pack_post(&f.repo, &encs(&""), &ct_req(), &huge);
+  ok = expect(hr.status == 413, &"post: an identity body over 1 MiB is 413") && ok;
+  // 上限つきの入口にも同じ gzip の経路を使う。
+  let lim = upload_pack_post_limited(&f.repo, &encs(&"gzip"), &ct_req(), &gzip_stored(&plain), 5, 100000, 1048576);
+  ok = expect(lim.status == 200 && contains_text(&lim.body, &"limit exceeded"), &"post: limits apply to gzip requests too") && ok;
+  return ok;
+}
+
+pub fn run_upload_tests() -> Bool
+  intent "upload-pack の全テストを実行し全合格なら true を返す。作業用ディレクトリは tmp/ の下に作る"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let suffix = match random_hex(6) {
+    Ok(s) => s,
+    Err(_) => "fallback",
+  };
+  let dir = cat3(&"tmp/u_", &suffix, &"");
+  match make_dirs(&dir) {
+    Err(_) => {
+      return fail(&"cannot create the work directory");
+    }
+    Ok(_) => {}
+  }
+  match init_repo(&join_path(&dir, &"up.git"), true, &"main") {
+    Err(_) => {
+      return fail(&"init the repository");
+    }
+    Ok(repo) => {
+      let f = build_fixture(repo);
+      if !f.ok {
+        return fail(&"setup: cannot write the test objects");
+      }
+      let mut ok = true;
+      console.log(&"  advertisement");
+      ok = run_advertisement(&f) && ok;
+      console.log(&"  clone");
+      ok = run_clone(&f) && ok;
+      console.log(&"  negotiation");
+      ok = run_negotiation(&f) && ok;
+      console.log(&"  unsupported and malformed requests");
+      ok = run_unsupported(&f) && ok;
+      console.log(&"  limits");
+      ok = run_limits(&f) && ok;
+      console.log(&"  POST entry");
+      ok = run_http_post(&f) && ok;
+      return ok;
+    }
+  }
+  return false;
+}

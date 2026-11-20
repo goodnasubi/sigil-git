@@ -7,6 +7,7 @@ use tests.test_compat.run_compat_tests;
 use tests.test_fault.run_fault_tests;
 use tests.test_fixture.run_fixture_tests;
 use tests.test_fuzz.run_fuzz_tests;
+use tests.test_gzip.run_gzip_tests;
 use tests.test_inflate.run_inflate_tests;
 use tests.test_limits.run_limits_tests;
 use tests.test_object.run_object_tests;
@@ -16,6 +17,7 @@ use tests.test_repo.run_repo_tests;
 use tests.test_tag.run_tag_tests;
 use tests.test_transfer.run_transfer_tests;
 use tests.test_tree.run_tree_tests;
+use tests.test_upload.run_upload_tests;
 use tests.test_validate.run_validate_tests;
 use tests.test_wirepack.run_wirepack_tests;
 use tests.test_xcheck.run_xcheck_tests;
@@ -133,6 +135,18 @@ pub fn main() -> Int
   if !run_xcheck_transfer_tests() {
     console.log(&"FAIL: transfer xcheck tests");
     return 18;
+  }
+
+  console.log(&"Running tests: gzip frames, CRC-32, fixed reasons, Content-Encoding");
+  if !run_gzip_tests() {
+    console.log(&"FAIL: gzip tests");
+    return 19;
+  }
+
+  console.log(&"Running tests: upload-pack (advertisement, negotiation, pack response, limits)");
+  if !run_upload_tests() {
+    console.log(&"FAIL: upload-pack tests");
+    return 20;
   }
 
   console.log(&"ALL TESTS PASSED SUCCESSFULLY");
