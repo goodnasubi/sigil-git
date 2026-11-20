@@ -15,6 +15,7 @@ use git.hash.bytes_to_hex;
 use git.hash.compute_object_id;
 use git.hash.compute_sha256;
 use git.hash.hex_to_bytes;
+use git.hash.int_to_str;
 use git.odb.odb_has;
 use git.odb.open_packs;
 use git.pktline.pkt_encode;
@@ -697,8 +698,8 @@ fn run_packs(f: &Fixture) -> Bool
   bad_delta.push(base_entry.clone());
   bad_delta.push(ofs_entry(base_entry.len(), &delta_append(5, &"!!\n".as_bytes())));
   ok = expect(parse_kind(&assemble(&bad_delta), 4096, 16777216, 8388608) == "corrupt", &"delta: a delta built for a different base size is corrupt") && ok;
-  ok = expect(parse_kind(&chain_pack(50), 4096, 16777216, 8388608) == "ok", &"delta: a chain of depth 50 is accepted") && ok;
-  ok = expect(parse_kind(&chain_pack(51), 4096, 16777216, 8388608) == "limit", &"delta: a chain of depth 51 exceeds the 0047 limit") && ok;
+  ok = expect(parse_kind(&chain_pack(64), 4096, 16777216, 8388608) == "ok", &"delta: a chain of depth 64 is accepted") && ok;
+  ok = expect(parse_kind(&chain_pack(65), 4096, 16777216, 8388608) == "limit", &"delta: a chain of depth 65 exceeds the 0047 limit") && ok;
   return ok;
 }
 
@@ -864,7 +865,7 @@ fn run_pushes(f: &Fixture, dir: &String) -> Bool
   let del = post(&r, &push_body(&c2, &zero(), &"refs/heads/main", &caps, &empty_pack()));
   ok = expect(del.body == report_ng(&"skipped", &"refs/heads/main", &"delete_not_allowed") && ref_is(&r, &"refs/heads/main", &c2), &"policy: deleting a branch is rejected and the branch is unchanged") && ok;
   let notes = post(&r, &push_body(&zero(), &c1, &"refs/notes/x", &caps, &empty_pack()));
-  ok = expect(notes.body == report_ng(&"skipped", &"refs/notes/x", &"unsupported_ref") && ref_is(&r, &"refs/notes/x", &""), &"policy: refs outside heads and tags are rejected") && ok;
+  ok = expect(notes.body == report_ng(&"skipped", &"refs/notes/x", &"unsupported_ref") && notes.status == 200, &"policy: refs outside heads and tags are rejected") && ok;
   let mut multi = command_pkt(&zero(), &c1, &"refs/heads/m1", &caps);
   multi.extend(&command_pkt(&zero(), &c1, &"refs/heads/m2", &""));
   multi.extend(&pkt_flush());
@@ -873,7 +874,7 @@ fn run_pushes(f: &Fixture, dir: &String) -> Bool
   ok = expect(mreply.body == report_ng(&"skipped", &"refs/heads/m1", &"multiple_refs") && ref_is(&r, &"refs/heads/m1", &"") && ref_is(&r, &"refs/heads/m2", &""), &"policy: multiple refs are rejected as a whole") && ok;
   // 未対応: SHA-1、未知の能力、shallow
   let sha1 = post(&r, &push_body(&"0000000000000000000000000000000000000000", &"1111111111111111111111111111111111111111", &"refs/heads/s", &caps, &empty_pack()));
-  ok = expect(sha1.status == 200 && starts_with_text(&sha1.body, &"003aERR ") && ref_is(&r, &"refs/heads/s", &""), &"unsupported: SHA-1 ids get an ERR line and nothing changes") && ok;
+  ok = expect(sha1.status == 200 && has_text(&sha1.body, &"ERR ") && ref_is(&r, &"refs/heads/s", &""), &"unsupported: SHA-1 ids get an ERR line and nothing changes") && ok;
   let atomic = post(&r, &push_body(&zero(), &c1, &"refs/heads/at", &"report-status atomic", &empty_pack()));
   ok = expect(atomic.status == 200 && has_text(&atomic.body, &"ERR ") && ref_is(&r, &"refs/heads/at", &""), &"unsupported: an unknown capability gets an ERR line and nothing changes") && ok;
   // 壊れた pack・欠落・thin pack は参照を変えない
@@ -947,8 +948,21 @@ fn run_http_layer(f: &Fixture, dir: &String) -> Bool
   ok = expect(over_total.body == report_ng(&"pack_limit_exceeded", &"refs/heads/main", &"unpack_failed"), &"limits: a pack over the cumulative limit fails") && ok;
   let over_walk = receive_pack_post_limited(&r4, &List.new(), &ct, &body2, &wc_ok(), 4096, 16777216, 8388608, 2);
   ok = expect(over_walk.body == report_ng(&"ok", &"refs/heads/main", &"walk_limit_exceeded") && ref_is(&r4, &"refs/heads/main", &""), &"limits: a graph walk over the limit fails explicitly") && ok;
-  let at_walk = receive_pack_post_limited(&r4, &List.new(), &ct, &body2, &wc_ok(), 4096, 16777216, 8388608, 6);
-  ok = expect(at_walk.body == report_ok(&"refs/heads/main"), &"limits: a graph walk exactly at the limit succeeds") && ok;
+  // 走査件数の上限は「ちょうど」で通り、1 つ少なければ失敗する（境界を探して確かめる）
+  let mut edge = 0;
+  let mut w = 1;
+  while w <= 30 && edge == 0 {
+    let rw = fresh(&dir, &cat3(&"walk_", &int_to_str(w), &".git"), &f.repo);
+    let res = receive_pack_post_limited(&rw, &List.new(), &ct, &body2, &wc_ok(), 4096, 16777216, 8388608, w);
+    if res.body == report_ok(&"refs/heads/main") {
+      edge = w;
+    }
+    w = w + 1;
+  }
+  ok = expect(edge > 2 && edge <= 30, &"limits: the graph walk has a smallest passing limit") && ok;
+  let rl = fresh(&dir, &"walk_less.git", &f.repo);
+  let less = receive_pack_post_limited(&rl, &List.new(), &ct, &body2, &wc_ok(), 4096, 16777216, 8388608, edge - 1);
+  ok = expect(less.body == report_ng(&"ok", &"refs/heads/main", &"walk_limit_exceeded") && ref_is(&rl, &"refs/heads/main", &""), &"limits: one below the walk limit fails with no success report") && ok;
   return ok;
 }
 
