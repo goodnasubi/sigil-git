@@ -33,7 +33,11 @@ unset GIT_PROTOCOL
 G="$STAGE5_GIT"
 t=1700000000
 tick() { t=$((t + 60)); export GIT_AUTHOR_DATE="$t +0000" GIT_COMMITTER_DATE="$t +0000"; }
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() {
+  echo "FAIL: $*" >&2
+  for f in "$W"/*.err "$W"/server.log; do [ -f "$f" ] && { echo "--- $f" >&2; head -n 40 "$f" >&2; }; done
+  exit 1
+}
 
 $SIGIL build --root . upload_server.sigil main -o "$W/upload_server"
 
