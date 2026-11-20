@@ -17,7 +17,7 @@ pub fn fuzz() -> Int
   intent "ファジング試験の実行"
   requires none
   ensures none
-  effects console
+  effects console, fs
 {
   if !run_fuzz_tests() {
     return 1;

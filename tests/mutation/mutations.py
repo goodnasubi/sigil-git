@@ -2,7 +2,8 @@
 # ADR 0047 決定 6 変異試験（意図した誤りが検出されるかの測定）。
 # 5 つの変異（識別子の検証省略、オブジェクト未同期、ロック無視、パス検査省略、symlink検査省略）を
 # 1 つずつ埋め、試験群（mutation_runner.sigil）が落ちることを確かめる。
-# 全変異が DETECTED となれば終了コード 0、未検出（UNDETECTED）があれば終了コード 1。
+# 検出（DETECTED）または許可された持ち越し（ALLOWED_UNDETECTED）であることを確認する。
+# 許可リスト以外の未検出（UNDETECTED）またはビルド失敗（BUILD_ERROR）があれば終了コード 1。
 
 import os
 import shutil
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 
+ALLOWED_UNDETECTED = {"object_sync_omitted"}
 M = []
 
 def mut(name, desc, path, old, new, entries):
@@ -29,10 +31,10 @@ mut(
 # 2. 参照の更新前にオブジェクトを同期しない
 mut(
     "object_sync_omitted",
-    "オブジェクトファイルの書き込み時に fsync (sync_all) 失敗時のエラー返却を省く",
+    "オブジェクトファイル書き込み時の fsync (sync_all) 呼び出しを完全に省略する",
     "git/fsio.sigil",
     '      match file.sync_all() {\n        Err(_) => {\n          let _ = file.close();\n          return Err(GitError.Io("failed to sync file"));\n        }\n        Ok(_) => {}\n      }',
-    '      let _ = file.sync_all();',
+    '      // sync_all call omitted',
     ["fault"],
 )
 
@@ -149,8 +151,15 @@ def main():
     detected_count = sum(1 for _, _, s, _, _ in results if s == "DETECTED")
     undetected_count = sum(1 for _, _, s, _, _ in results if s == "UNDETECTED")
     print(f"\n変異試験集計: {detected_count} DETECTED, {undetected_count} UNDETECTED")
-    if undetected_count > 0:
-        print("注意: UNDETECTED の変異（object_sync_omitted）は実 FS 上で fsync 失敗を起こせないため未検出。"
+
+    unexpected_undetected = [name for name, _, s, _, _ in results if s == "UNDETECTED" and name not in ALLOWED_UNDETECTED]
+    if unexpected_undetected:
+        print(f"\nエラー: 許可されていない未検出の変異が存在します: {unexpected_undetected}", file=sys.stderr)
+        sys.exit(1)
+
+    allowed_undetected = [name for name, _, s, _, _ in results if s == "UNDETECTED" and name in ALLOWED_UNDETECTED]
+    if allowed_undetected:
+        print(f"\n注意: 許可された未検出の変異（{', '.join(allowed_undetected)}）は実 OS ページキャッシュ環境のため未検出。"
               "ADR 0047 の定めに従い、本変異は未検証（持ち越し）として記録します。")
 
     sys.exit(0)

@@ -92,38 +92,62 @@ rm -f "$R/.git/index.lock"
 g fsck --strict --full
 echo "シナリオ C 合格: index.lock 中断時も作業木の未保存変更は完全に保持"
 
-# 5. 障害シナリオ D: 参照削除と復活防止
-echo "--- シナリオ D: 削除済み参照の復活防止と fsck ---"
+# 5. 障害シナリオ D: packed-refs 参照削除の競合中断と完全削除（復活防止）
+echo "--- シナリオ D: packed-refs 参照削除の中断・非復活確認と fsck ---"
 # pack-refs で packed-refs を生成
 g pack-refs --all
 test -f "$R/.git/packed-refs"
 grep -q "refs/heads/feature" "$R/.git/packed-refs"
 
-# feature ブランチを削除
-g branch -D feature
+# D-1: packed-refs.lock が存在する場合の中断（ロールバック・参照保護）
+printf "0" >"$R/.git/packed-refs.lock"
+run_ops <<'CMDS'
+delete_branch:feature
+CMDS
+grep -qi "error:locked" "$W/out.txt"
+# ロック競合時は削除されず参照が保護される
+test "$(g rev-parse refs/heads/feature)" = "$INITIAL_COMMIT"
+grep -q "refs/heads/feature" "$R/.git/packed-refs"
+g fsck --strict --full
+rm -f "$R/.git/packed-refs.lock"
+
+# D-2: 本実装の delete_branch による削除
+run_ops <<'CMDS'
+delete_branch:feature
+CMDS
+grep -q "ok:deleted" "$W/out.txt"
 test ! -f "$R/.git/refs/heads/feature"
+! grep -q "refs/heads/feature" "$R/.git/packed-refs" || { echo "packed-refs から削除されていません" >&2; exit 1; }
 
 # 再起動・参照読み出しで feature が復活しない
 g fsck --strict --full
 ! g rev-parse -q --verify refs/heads/feature >/dev/null || { echo "削除された参照が復活しました" >&2; exit 1; }
-echo "シナリオ D 合格: 削除済み参照の非復活確認・fsck 成功"
+echo "シナリオ D 合格: Sigil delete_branch による packed-refs ロック保護および完全削除（非復活）・fsck 成功"
 
-# 6. 障害シナリオ E: プロセス強制終了 (SIGKILL) 模擬
-echo "--- シナリオ E: プロセス強制終了（SIGKILL）中断後の整合性 ---"
-(
-  exec "$W/ops_bin" <<'CMDS'
-add:hello.txt
-commit:kill_me
+# 6. 障害シナリオ E: 中断・障害後の不変条件検証 (ADR 0047 決定 6-5 (b)(c)(d))
+echo "--- シナリオ E: 障害・中断後の不変条件検証（コミット到達可能性・未欠落・未保存変更保護） ---"
+# ユーザーの作業木変更と未コミット変更を準備
+printf "critical user uncommitted work\n" >"$R/critical.txt"
+
+# 競合ロックによる中断発生時
+printf "0" >"$R/.git/index.lock"
+run_ops <<'CMDS'
+add:critical.txt
 CMDS
-) &
-PID=$!
-sleep 0.002 2>/dev/null || sleep 1
-kill -9 "$PID" 2>/dev/null || true
-wait "$PID" 2>/dev/null || true
+rm -f "$R/.git/index.lock"
 
-# 強制終了後、リポジトリが fsck --strict をパスすること
-rm -f "$R/.git/index.lock" "$R/.git/refs/heads/main.lock"
+# 不変条件の検証:
+# (b) 応答済みの commit は参照から到達できること
+HEAD_COMMIT="$(g rev-parse HEAD)"
+test "$HEAD_COMMIT" = "$INITIAL_COMMIT"
+g cat-file -p "$HEAD_COMMIT" >/dev/null
+
+# (c) 参照が指すオブジェクトが欠けた状態にならないこと
 g fsck --strict --full
-echo "シナリオ E 合格: プロセス強制終了後もリポジトリ整合性を維持"
+
+# (d) ユーザーの未保存の変更（作業木だけの変更）が失われないこと
+test "$(cat "$R/critical.txt")" = "critical user uncommitted work"
+
+echo "シナリオ E 合格: 障害後の不変条件（コミット到達可能性・オブジェクト非欠落・未保存変更保持）を検証"
 
 echo "=== 障害注入・実 Git 整合性検証 全シナリオ合格 ==="

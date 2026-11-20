@@ -50,16 +50,21 @@ OS キャッシュとディスクの同期境界（fsync）の振る舞いをモ
 - **孤立インデックスロック (`index.lock`)**: コミットや追加処理がロック検出で `Locked` となり、作業ツリー内の未保存変更ファイル（`dirty.txt`）を破壊・変更しない。
 - **削除済み参照の復活防止**: `topic` ブランチ削除後、`read_ref` が `Ok(None)` を返し、過去の参照値が復活しないことを確認。
 
-### 3.3 プロセス中断・実 Git 整合性検証 (`tests/fault_interop.sh`)
-実 Git (2.43.0) を用いて、各障害注入状態およびプロセス強制終了後のリポジトリを `git fsck --strict --full` で検証:
-- **シナリオ A (tmp_obj_* 残存)**: `tmp_obj_*` が残存しても `git fsck --strict --full` が成功し、応答済みコミットが HEAD から完全に到達可能。
-- **シナリオ B (<ref>.lock 残存)**: 孤立ロック下でのコミット試行が安全に拒絶され、実 Git の `git rev-parse HEAD` および `git fsck --strict --full` が正常パス。
-- **シナリオ C (index.lock 残存)**: 未コミットの変更ファイルおよび作業ツリーの変更（`hello.txt`, `unsaved.txt`）が完全に保持され、`git fsck --strict --full` が成功。
-- **シナリオ D (packed-refs 削除)**: `git pack-refs --all` 後のブランチ削除において、削除された参照が再浮上せず `git fsck --strict --full` が成功。
-- **シナリオ E (SIGKILL 強制終了)**: Sigil のコミット操作プロセスに `kill -9` を送信して強制終了した後、孤立ロックを除去した状態で `git fsck --strict --full` が成功。
+### 3.3 孤立ファイル残存・ロック競合・Sigil 参照削除の実 Git 整合性検証 (`tests/fault_interop.sh`)
+実 Git (2.43.0) を用いて、孤立ファイル・ロック残存および Sigil による `packed-refs` 削除後のリポジトリを `git fsck --strict --full` で検証:
+- **シナリオ A (孤立 tmp_obj_* 残存時の耐性)**: `tmp_obj_*` が残存しても `git fsck --strict --full` が成功し、応答済みコミットが HEAD から完全に到達可能。
+- **シナリオ B (孤立 <ref>.lock 残存時の排他保護と HEAD 不変)**: 孤立ロック下でのコミット試行が安全に拒絶され、実 Git の `git rev-parse HEAD` および `git fsck --strict --full` が正常パス。
+- **シナリオ C (孤立 index.lock 残存時の未保存変更保護)**: 未コミットの変更ファイルおよび作業ツリーの変更（`hello.txt`, `unsaved.txt`）が完全に保持され、`git fsck --strict --full` が成功。
+- **シナリオ D (packed-refs 参照削除の中断・非復活確認)**:
+  - Git 2.43.0 `pack-refs --all` 後のリポジトリに対し、`packed-refs.lock` 残存時は Sigil の `delete_branch` が `Locked` で中断し参照が保護されること。
+  - 本実装の `delete_branch` による削除実行後、`packed-refs` および loose refs から完全に消去され、実 Git の再起動・`rev-parse` で再浮上せず `git fsck --strict --full` が成功することを確認。
+- **シナリオ E (障害・中断後の不変条件検証)**:
+  - ADR 0047 決定 6-5 に従い、操作中断後における (b) 応答済みコミット到達可能性、(c) オブジェクト非欠落（`git fsck --strict --full`）、(d) ユーザー未保存変更保持（作業木・未コミット変更）を実証。
 
 > [!NOTE]
-> **持ち越し事項（カーネル障害注入）**: システムコール中間での短小書き込み（short write）や `ENOSPC`, `EIO` などのカーネルレベルの I/O エラー注入は、root 権限および専用カーネルモジュール（dm-flakey 等）を要するため本環境では実施できず、上位の統合テスト環境への持ち越しとします。
+> **持ち越し事項（障害注入）**:
+> 1. **カーネル空間 I/O 障害注入**: システムコール中間での短小書き込み（short write）や `ENOSPC`, `EIO` などのカーネルレベルのエラー注入は、専用の故障注入ファイルシステム（dm-flakey 等）を要するため持ち越し。
+> 2. **ステップ単位のプロセス強制終了**: オブジェクト書込・参照更新・索引更新・チェックアウト・参照削除の各ステップ（一時ファイル作成・書込・同期・rename・親同期・ロック解放）の前後での決定論的プロセス中断は、コアエンジンへの同期フック未組込のため持ち越し。
 
 ---
 
@@ -68,7 +73,7 @@ OS キャッシュとディスクの同期境界（fsync）の振る舞いをモ
 乱数および構造認識変異によるロバストネス検証を実施した（`tests/test_fuzz.sigil`）。
 
 - **擬似乱数シード**: `20261120`（完全再現可能な決定的 PRNG）
-- **ファジング対象 10 領域（各 100 反復、計 1,000 回試行）**:
+- **ファジング対象 12 領域（各 100 反復、計 1,200 回試行）**:
   1. `fuzz_headers`: 巨大サイズ（オーバーフロー）、負のサイズ、数字以外の文字、終端ヌル欠落、空サイズ、ランダム列
   2. `fuzz_trees`: 切り詰められた SHA-256（32バイト未満）、ファイル名内の NUL バイト、順不同（未ソート）エントリ、モード欠落、ランダム列
   3. `fuzz_commits`: 必須 `tree` ヘッダ欠落、不正な親コミット ID、メッセージ前の空行欠落、切り詰め author/committer、ランダム列
@@ -79,6 +84,8 @@ OS キャッシュとディスクの同期境界（fsync）の振る舞いをモ
   8. `fuzz_delta`: ソース長不一致、copy オペコードのオフセット超過（offset > base 長）、復元後サイズ超過、ランダム列
   9. `fuzz_config`: 閉じ括弧のないセクション、未終了の引用符付きサブセクション、等号のないキー行、ランダム列
   10. `fuzz_paths_and_refs`: ランダムバイト列によるパスおよび参照名検証の網羅的投入
+  11. `fuzz_pack_index`: pack index v2（マジック `\xfftOc` 破損、非対応バージョン、非単調 fanout テーブル、切り詰めテーブル、SHA-256 チェックサム破損）
+  12. `fuzz_pack_file`: pack v2（`PACK` マジック破損、非対応バージョン、インデックスとのオブジェクト数不一致、切り詰めエントリ、チェックサム破損）
 - **悪意ある入力・境界回帰コーパス**:
   - パストラバーサル (`../escaped`, `a/../../b`, `\`)
   - NTFS 代替ストリーム (`.git::$DATA`)、`.git/config`、`a/.git/hooks`、絶対パス (`/absolute/path`)
@@ -87,9 +94,9 @@ OS キャッシュとディスクの同期境界（fsync）の振る舞いをモ
   - 長大参照名: 1050 文字（上限 1024 超過）
   - 壊れたオブジェクト構造: SHA-256 欠落 tree、tree 欠落 commit、非 hex ID tag、不正ハッシュ packed-refs、範囲外 copy delta
 - **検証結果**:
-  - 総試行回数: 1,000 反復 + 回帰コーパス
-  - 所要時間: 約 1.2 秒
-  - パニック・異常終了: **0 件**（全件 `GitError` で適切に拒絶）
+  - 総試行回数: 1,200 反復 + 回帰コーパス
+  - 所要時間: 約 1.3 秒
+  - 異常終了（パニック/クラッシュ）: **0 件**（すべての破損・不正入力に対し安全に処理され、適切な `GitError` で拒絶または制御下で処理されることを確認）
 
 ---
 
@@ -97,19 +104,32 @@ OS キャッシュとディスクの同期境界（fsync）の振る舞いをモ
 
 初版仕様に基づいて生成・保管された永続データが、将来のバージョンや新しい reader で互換性を保って読み取れることを検証した（`fixtures/v1/`, `tests/test_compat.sigil`）。
 
-- **来歴 (Provenance)**:
+- **来歴および再現手順 (Provenance & Reproduction)**:
   - 公式 Git 2.43.0（`--object-format=sha256`）および Sigil 初版相互運用ツールを用いて生成。
+  - 再現手順:
+    ```bash
+    git init --object-format=sha256 repo
+    printf "hello world\n" > repo/file.txt && git -C repo add file.txt
+    GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@example.com GIT_AUTHOR_DATE="1700000000 +0000" \
+    GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@example.com GIT_COMMITTER_DATE="1700000000 +0000" \
+    git -C repo commit -m "initial commit"
+    GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@example.com GIT_COMMITTER_DATE="1700000000 +0000" \
+    git -C repo tag -a -m "v1.0" v1.0 HEAD
+    git -C repo pack-refs --all
+    git -C repo repack -a -d
+    ```
   - `git fsck --strict --full` で受理確認済み。
 - **保管 fixture (`fixtures/v1/`)**:
   - `blob.obj`: ルーズ blob（オブジェクト ID: `2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4`、ファイル SHA-256: `f619a4e2af93fa7a910cdcf963722a0cdb06e0e3bb9620d6fc7ec06808e73e1d`）
   - `tree.obj`: ルーズ tree（オブジェクト ID: `ea3b6ce0df88dc227083adba05c43d15da3a824a98da9bcaaf1930277fb07f30`、ファイル SHA-256: `3d0ae9ecbb8e36c8074f41827c46f910c01a7c54247925ff7c4f2af50be2dd33`）
   - `commit.obj`: ルーズ commit（オブジェクト ID: `b1e071267937c1c2a8baa1a9ee2c6a448dc9e35685da97521b1f019e9d3e5fe6`、ファイル SHA-256: `553787eaaf2aff86decb2ff33a2b1177fa47d5dd74303b70b4c29f0deb48d3b4`）
   - `tag.obj`: ルーズ tag（オブジェクト ID: `ffa044a306d0cebaa2987aadd19bd5de0aa1cdc6bf5bfc18e4f76094d3cb16b0`、ファイル SHA-256: `4e8af5f359365b638c19f6fe3712c0ce32ad985799e79ee80f86dcc8105fc69b`）
-  - `sample.pack` / `sample.idx`: Packfile v2 および Index v2（ファイル SHA-256: `e282df7e...`, `92411c77...`）
-  - `packed-refs`: packed-refs ファイル（ファイル SHA-256: `7f920260...`）
-  - `manifest.txt`: 上記オブジェクト ID および全ファイルの SHA-256 チェックサムを固定記録
+  - `sample.pack`: Packfile v2（ファイル SHA-256: `e282df7ee43e4eaaa10c9494fbac01d165dd2bb0f21205e3f4fef39b207dceaf`）
+  - `sample.idx`: Index v2（ファイル SHA-256: `92411c77e447f6a3cb7b3024f0026da5249b5f24be5b63d2aaee22cf9439e2de`）
+  - `packed-refs`: packed-refs ファイル（ファイル SHA-256: `7f920260ee89bbb26b7c4ed16ba98e88dc4ac6c47a84a5a83af179bf24944cc3`）
+  - `manifest.txt`: 上記オブジェクト ID、全ファイルの SHA-256 チェックサムおよび生成手順を記録。`test.sh` にて `sha256sum -c` による自動照合を実施。
 - **検証結果**:
-  - `tests/test_compat.sigil` において、全 v1 オブジェクト・インデックス・パックファイル・参照ファイルが最新の reader 実装から完全にパース・検証可能であることを確認。
+  - `tests/test_compat.sigil` において、全 v1 オブジェクト・インデックス・パックファイル・参照ファイルが最新の reader 実装から完全にパース・検証可能であることを確認。また `test.sh` にて fixture ファイル自体のチェックサム固定一致を確認。
 
 ---
 
@@ -146,13 +166,16 @@ Sigil の 2 つの実行基盤である「SIR 評価器（インタープリタ:
   - 作業ツリーのチェックアウト
 - **実測結果**:
   - **ネイティブ実行 (`sigil build`, 50 反復)**:
-    - 経過時間 (Wall clock): 1.57 秒
+    - 経過時間 (Wall clock): 1.57 秒（反復あたり約 31.4 ms）
     - ユーザー CPU 時間: 0.93 秒
     - 最大常駐メモリサイズ (Max RSS): 1,204 KB（約 1.17 MB）
   - **SIR 評価器 (`sigil run`, 10 反復)**:
-    - 経過時間 (Wall clock): 1.29 秒
+    - 経過時間 (Wall clock): 1.29 秒（反復あたり約 129.0 ms）
     - ユーザー CPU 時間: 1.00 秒
     - 最大常駐メモリサイズ (Max RSS): 33,808 KB（約 33 MB）
+  - **注意（反復数の相違について）**:
+    - SIR 評価器はインタープリタ実行のオーバーヘッドがあるため 10 反復、ネイティブ実行は 50 反復で測定している。1 反復あたりの所要時間はネイティブが約 31.4 ms に対し SIR 評価器が約 129 ms であり、ネイティブ実行は約 4.1 倍高速である。
+
 - **再現手順**:
   ```bash
   # ネイティブ実行の測定
@@ -172,27 +195,29 @@ Sigil の 2 つの実行基盤である「SIR 評価器（インタープリタ:
 | 変異体 ID | 変異内容の概要 | 注入箇所（本体コード） | 検出結果 | 検出契機・備考 | 所要時間 |
 |---|---|---|---|---|---|
 | `id_verification_omitted` | オブジェクト読み取り時にハッシュの再計算・照合を省略する | `git/object.sigil` | **DETECTED** | 試験失敗 (entry object) | 0.6s |
-| `object_sync_omitted` | オブジェクトファイルの書き込み時に fsync (sync_all) 失敗時のエラー返却を省く | `git/fsio.sigil` | **UNDETECTED** | 試験通過 (未検出・持ち越し) | 1.0s |
+| `object_sync_omitted` | オブジェクトファイル書き込み時の fsync (sync_all) 呼び出しを完全に省略する | `git/fsio.sigil` | **UNDETECTED** | 試験通過 (未検出・持ち越し) | 1.0s |
 | `lock_ignored` | ロックファイルが存在しても排他作成せず上書きする | `git/fsio.sigil` | **DETECTED** | 試験失敗 (entry fault) | 1.0s |
 | `path_validation_omitted` | `validate_path` をバイパスして常に Ok(true) を返す | `git/validate.sigil` | **DETECTED** | 試験失敗 (entry validate) | 0.6s |
-| `symlink_check_omitted` | checkout 時に symlink (120000) エントリの拒否検査を省略する | `git/checkout.sigil` | **DETECTED** | 試験失敗 (entry ops) | 2.3s |
+| `symlink_check_omitted` | checkout 時に symlink (120000) エントリの拒否検査を省略する | `git/checkout.sigil` | **DETECTED** | 試験失敗 (entry ops) | 2.1s |
 
 - **変異検出結果**: **4 DETECTED / 1 UNDETECTED**
-- **UNDETECTED 変異の扱い**:
-  - `object_sync_omitted` は実 FS 上で fsync 失敗を注入できないため、単一プロセス内での実行では検出されず UNDETECTED となります。
-  - ADR 0047「検出されない変異を検証済みとしない」の定めに従い、本項目は検証済みとせず、カーネルレベルの障害注入基盤での検証課題として**持ち越し**と記録します。
+- **UNDETECTED 変異の扱いとホワイトリスト判定**:
+  - `mutations.py` に `ALLOWED_UNDETECTED = {"object_sync_omitted"}` を導入し、意図した持ち越し以外の未検出が発生した場合は即座に exit 1 で異常終了するよう制御。
+  - `object_sync_omitted` は同一プロセス・OS ページキャッシュ環境下では直後の読み取りがキャッシュからヒットするため未検出となります。
+  - ADR 0047「検出されない変異を検証済みとしない」の定めに従い、本項目は検証済みとせず、電源断・クラッシュシミュレーション環境での検証課題として**持ち越し**と記録します。
 
 ---
 
 ## 9. 結論と持ち越し
 
 本第 6 段の実装および検証において:
-- 障害注入・プロセス中断時のリポジトリ健全性（`git fsck --strict --full` 成功、未保存変更の保持、削除済み参照の非復活）を実証。
-- 10 領域の構造認識ファジング（1,000 反復）および回帰コーパスによるロバスト性を確認。
-- 初版互換 fixture (v1) の読み取りと来歴・チェックサムの固定を完了。
+- 孤立ファイル残存・ロック競合・Sigil による `packed-refs` 削除時のリポジトリ健全性（`git fsck --strict --full` 成功、未保存変更の保持、削除済み参照の非復活）を実証。
+- 12 領域の構造認識ファジング（1,200 反復、pack/index を含む）および回帰コーパスによるロバスト性を確認。
+- 初版互換 fixture (v1) の読み取りと来歴・チェックサムの固定（`test.sh` による自動検証）を完了。
 - SIR 評価器とネイティブ実行の動作一致（固定期待値 `ebce0bda...` との 3 者一致）を実証。
-- 本体コードに対する変異試験を実施し、4 件の検出および 1 件の持ち越しを明記。
+- 本体コードに対する変異試験を実施し、4 件の検出および 1 件の持ち越し（ホワイトリスト管理）を明記。
 
 ### 持ち越し事項 (Carried Over)
-1. **カーネルレベルの I/O 障害注入**: `ENOSPC`, `EIO`, short write mid-syscall などのハードウェア/カーネルレベルの障害注入は、root 権限を要するため上位テスト環境に持ち越し。
-2. **変異 `object_sync_omitted` の検証**: 実 FS 上での fsync 失敗エミュレーションを伴う環境にて検出性を再検証すること。
+1. **カーネルレベルの I/O 障害注入**: `ENOSPC`, `EIO`, short write mid-syscall などのハードウェア/カーネルレベルの障害注入（dm-flakey 等を要する試験）。
+2. **ステップ単位のプロセス強制終了**: オブジェクト書込・参照更新・索引更新・チェックアウト・参照削除の各ステップ（一時ファイル作成・書込・同期・rename・親同期・ロック解放）の前後での決定論的プロセス強制終了試験。
+3. **変異 `object_sync_omitted` の検証**: 電源断や OS クラッシュを伴う環境における未同期データ喪失の検出性再検証。

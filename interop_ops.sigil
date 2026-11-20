@@ -13,8 +13,10 @@ use git.fsio.string_starts_with;
 use git.ops.add_paths;
 use git.ops.commit;
 use git.ops.new_ident;
+use git.refs.ExpectOld;
 use git.refs.HeadState;
 use git.refs.create_branch;
+use git.refs.delete_branch;
 use git.refs.read_head;
 use git.refs.read_ref;
 use git.repo.Repo;
@@ -62,6 +64,11 @@ fn step(repo: &Repo, line: &String) -> Result<String, GitError>
     let head = current_commit(&repo)?;
     create_branch(&repo, &string_slice(&line, 7, line.as_bytes().len()), &head)?;
     return Ok("branched");
+  }
+  if string_starts_with(&line, &"delete_branch:") {
+    let b = string_slice(&line, 14, line.as_bytes().len());
+    delete_branch(&repo, &b, ExpectOld.Any)?;
+    return Ok("deleted");
   }
   if string_starts_with(&line, &"wtwrite:") {
     write_worktree_file(&repo.work_dir, &string_slice(&line, 8, line.as_bytes().len()), &"pwn\n".as_bytes(), false)?;

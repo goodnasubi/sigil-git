@@ -64,6 +64,8 @@ SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_ops.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_history.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" bash tests/fault_interop.sh
+grep -E '^# [0-9a-f]{64}' fixtures/v1/manifest.txt | sed 's/^# //' | (cd fixtures/v1 && sha256sum -c - >/dev/null)
+echo "Fixture v1 SHA-256 checksums verified!"
 
 echo "=== 6. Execution path equivalence (SIR evaluator vs Native binary) ==="
 EXPECTED_DIGEST="ebce0bdaaee7081c671596c80c526ab634eaacb2d0dcd4c1b5b0787a69f227f6"

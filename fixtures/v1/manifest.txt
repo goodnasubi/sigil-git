@@ -5,9 +5,17 @@ tree_id: ea3b6ce0df88dc227083adba05c43d15da3a824a98da9bcaaf1930277fb07f30
 commit_id: b1e071267937c1c2a8baa1a9ee2c6a448dc9e35685da97521b1f019e9d3e5fe6
 tag_id: ffa044a306d0cebaa2987aadd19bd5de0aa1cdc6bf5bfc18e4f76094d3cb16b0
 
-# Provenance:
-# Generated using official Git 2.43.0 with object-format=sha256 and Sigil interop tools.
-# Validated with `git fsck --strict --full`.
+# Provenance & Reproduction with Git 2.43.0:
+# 1. git init --object-format=sha256 repo
+# 2. printf "hello world\n" > repo/file.txt && git -C repo add file.txt
+# 3. GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@example.com GIT_AUTHOR_DATE="1700000000 +0000" \
+#    GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@example.com GIT_COMMITTER_DATE="1700000000 +0000" \
+#    git -C repo commit -m "initial commit"
+# 4. GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@example.com GIT_COMMITTER_DATE="1700000000 +0000" \
+#    git -C repo tag -a -m "v1.0" v1.0 HEAD
+# 5. git -C repo pack-refs --all
+# 6. git -C repo repack -a -d
+# Verified with Git 2.43.0 `git fsck --strict --full`.
 
 # File SHA-256 checksums:
 # f619a4e2af93fa7a910cdcf963722a0cdb06e0e3bb9620d6fc7ec06808e73e1d  blob.obj
