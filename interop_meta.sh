@@ -66,6 +66,7 @@ ADMIN_TOKEN="$(python3 -I "$W/mint.py" $KEY $AUD admin)"
 ALICE_TOKEN="$(python3 -I "$W/mint.py" $KEY $AUD alice)"
 BOB_TOKEN="$(python3 -I "$W/mint.py" $KEY $AUD bob)"
 CHARLIE_TOKEN="$(python3 -I "$W/mint.py" $KEY $AUD charlie)"
+DAVE_TOKEN="$(python3 -I "$W/mint.py" $KEY $AUD dave)"
 
 mkdir -p "$W/repos"
 start_server() {
@@ -206,8 +207,36 @@ tick
 test "$(code -X POST -H "Authorization: Bearer $CHARLIE_TOKEN" -H "Content-Type: application/x-git-receive-pack-request" \
   "$REPO_URL/git-receive-pack" -d 'dummy')" = 403 || fail "charlie push should be 403"
 
-# 7. デフォルトブランチ更新
-echo "Testing default branch update..."
+# 7. デフォルトブランチ更新と存在秘匿検証
+echo "Testing existence hiding and default branch update..."
+# 未知リポジトリへの POST は 404
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $ALICE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/nonexistent/visibility" \
+  -d '{"visibility":"public-read"}')" = 404 || fail "nonexistent repo visibility update should be 404"
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $ALICE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/nonexistent/acl" \
+  -d '{"owners":["alice"],"writers":[],"readers":[]}')" = 404 || fail "nonexistent repo acl update should be 404"
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $ALICE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/nonexistent/default-branch" \
+  -d '{"default_branch":"trunk"}')" = 404 || fail "nonexistent repo default-branch update should be 404"
+
+# 存在秘匿: private リポジトリに対する未認可ユーザー Dave の POST は 404（403 や 400 ではなく存在秘匿）
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $DAVE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/visibility" \
+  -d '{"visibility":"public-read"}')" = 404 || fail "unauthorized user visibility update should be 404"
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $DAVE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/acl" \
+  -d '{"owners":["dave"],"writers":[],"readers":[]}')" = 404 || fail "unauthorized user acl update should be 404"
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $DAVE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/default-branch" \
+  -d '{"default_branch":"trunk"}')" = 404 || fail "unauthorized user default-branch update should be 404"
+
+# 閲覧権限はあるが管理権限のない Charlie の POST は 403 (存在は知っているため 403)
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $CHARLIE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/visibility" \
+  -d '{"visibility":"public-read"}')" = 403 || fail "reader user visibility update should be 403"
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $CHARLIE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/acl" \
+  -d '{"owners":["charlie"],"writers":[],"readers":[]}')" = 403 || fail "reader user acl update should be 403"
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $CHARLIE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/default-branch" \
+  -d '{"default_branch":"trunk"}')" = 403 || fail "reader user default-branch update should be 403"
+
+# 不正なブランチ名（ダブルクォート等）の拒否 -> 400
+test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $ALICE_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/default-branch" \
+  -d '{"default_branch":"bad\"branch"}')" = 400 || fail "unsafe default-branch should be 400"
+
 # 非 owner の Bob は更新不可 -> 403
 test "$(code -X POST -H "Origin: $ORIGIN" -H "Authorization: Bearer $BOB_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:$PORT/api/repos/myrepo/default-branch" \
   -d '{"default_branch":"trunk"}')" = 403 || fail "bob update default-branch should be 403"
@@ -245,5 +274,14 @@ echo "corrupted-json-data" > "$W/repos/myrepo.git/sigil-metadata"
 test "$("$G" ls-remote "$REPO_URL" 2>&1 >/dev/null || true)" != ""
 # 認証済みアクセス -> 404
 test "$("$G" -c http.extraHeader="Authorization: Bearer $ALICE_TOKEN" ls-remote "$REPO_URL" 2>&1 >/dev/null || true)" != ""
+
+# 10. 管理サーバーにおいて metadata 欠落・不明版のリポジトリが 404 で拒否されること（固定 ACL へのフォールバック禁止）
+echo "Testing no fallback to legacy ACL on managed server..."
+"$G" init -q --bare --object-format=sha256 "$W/repos/nometa.git"
+test "$(code -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:$PORT/repos/nometa/info/refs?service=git-upload-pack")" = 404 || fail "missing metadata should return 404"
+
+"$G" init -q --bare --object-format=sha256 "$W/repos/badver.git"
+printf 'version=999\nid=badver\nvisibility=public-read\ndefault_branch=main\nowners=alice\n' > "$W/repos/badver.git/sigil-metadata"
+test "$(code -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:$PORT/repos/badver/info/refs?service=git-upload-pack")" = 404 || fail "unknown metadata version should return 404"
 
 echo "interop_meta: ALL OK"

@@ -309,6 +309,27 @@ fn check_no_empty_items_in_comma(s: &String) -> Bool
   return true;
 }
 
+pub fn ref_name_safe(name: &String) -> Bool
+  intent "ブランチ名として安全か（ダブルクオート、バックスラッシュ、空白、制御文字を含まない）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = name.as_bytes();
+  if b.len() == 0 || b.len() > 255 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c <= 32 || c == 34 || c == 92 || c == 127 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
 pub fn parse_meta(data: &Bytes, expected_id: &String) -> Result<RepoMeta, String>
   intent "バイト列から RepoMeta を解読する。不明版・破損・空の主体・上限超過・id 不一致は Err"
   requires none
@@ -436,7 +457,7 @@ pub fn parse_meta(data: &Bytes, expected_id: &String) -> Result<RepoMeta, String
   if visibility != "private" && visibility != "public-read" {
     return Err("invalid_visibility");
   }
-  if default_branch.len() == 0 || validate_ref_name(&cat3(&"refs/heads/", &default_branch, &"")).is_err() {
+  if default_branch.len() == 0 || !ref_name_safe(&default_branch) || validate_ref_name(&cat3(&"refs/heads/", &default_branch, &"")).is_err() {
     return Err("invalid_default_branch");
   }
   if owners.len() < 1 {
@@ -578,7 +599,7 @@ pub fn create_repo_managed(root: &String, id: &String, owner: &String, default_b
   if branch.len() == 0 {
     branch = "main";
   }
-  if validate_ref_name(&cat3(&"refs/heads/", &branch, &"")).is_err() {
+  if !ref_name_safe(&branch) || validate_ref_name(&cat3(&"refs/heads/", &branch, &"")).is_err() {
     return Err("invalid_default_branch");
   }
 
@@ -602,27 +623,44 @@ pub fn create_repo_managed(root: &String, id: &String, owner: &String, default_b
   owners.push(owner.clone());
   let meta = RepoMeta { id: id.clone(), version: 1, visibility: "private", default_branch: branch, owners: owners, writers: List.new(), readers: List.new() };
 
-  return match save_meta_atomic(&git_dir, &meta) {
-    Ok(_) => Ok(meta),
-    Err(_) => Err("storage_failure"),
-  };
+  match save_meta_atomic(&git_dir, &meta) {
+    Ok(_) => {
+      return Ok(meta);
+    }
+    Err(_) => {
+      let _ = remove_file_if_exists(&join_path(&git_dir, &"HEAD"));
+      let _ = remove_file_if_exists(&join_path(&git_dir, &"config"));
+      return Err("storage_failure");
+    }
+  }
 }
 
 pub fn update_visibility_managed(root: &String, id: &String, new_vis: &String, caller: &String) -> Result<RepoMeta, String>
-  intent "owner のみが可視性を変更できる。排他ロック下で再検査・atomic 更新する"
+  intent "owner のみが可視性を変更できる。読取権限のない主体には 404（not_found）を返し存在を隠蔽する。排他ロック下で再検査・atomic 更新する"
   requires none
   ensures none
   effects fs, random
 {
   if !repo_id_ok(&id) {
-    return Err("invalid_id");
+    return Err("not_found");
   }
   if new_vis != "private" && new_vis != "public-read" {
     return Err("invalid_visibility");
   }
   let r_id2 = cat3(&root, &"/", &id);
   let git_dir = cat3(&r_id2, &".git", &"");
-  let cur_meta = load_meta(&git_dir, &id)?;
+  let mut cur_meta = empty_meta();
+  match load_meta(&git_dir, &id) {
+    Ok(m) => {
+      cur_meta = m;
+    }
+    Err(_) => {
+      return Err("not_found");
+    }
+  }
+  if !can_read(&cur_meta, &Some(caller.clone())) {
+    return Err("not_found");
+  }
   if !can_manage(&cur_meta, &Some(caller.clone())) {
     return Err("forbidden");
   }
@@ -642,10 +680,14 @@ pub fn update_visibility_managed(root: &String, id: &String, new_vis: &String, c
     Ok(m) => {
       locked_meta = m;
     }
-    Err(e) => {
+    Err(_) => {
       let _ = remove_file_if_exists(&lock_path);
-      return Err(e);
+      return Err("not_found");
     }
+  }
+  if !can_read(&locked_meta, &Some(caller.clone())) {
+    let _ = remove_file_if_exists(&lock_path);
+    return Err("not_found");
   }
   if !can_manage(&locked_meta, &Some(caller.clone())) {
     let _ = remove_file_if_exists(&lock_path);
@@ -666,20 +708,31 @@ pub fn update_visibility_managed(root: &String, id: &String, new_vis: &String, c
 }
 
 pub fn update_default_branch_managed(root: &String, id: &String, new_branch: &String, caller: &String) -> Result<RepoMeta, String>
-  intent "owner のみが既定ブランチを変更できる。排他ロック下で再検査・atomic 更新する"
+  intent "owner のみが既定ブランチを変更できる。読取権限のない主体には 404（not_found）を返し存在を隠蔽する。排他ロック下で再検査・atomic 更新する"
   requires none
   ensures none
   effects fs, random
 {
   if !repo_id_ok(&id) {
-    return Err("invalid_id");
+    return Err("not_found");
   }
-  if new_branch.len() == 0 || validate_ref_name(&cat3(&"refs/heads/", &new_branch, &"")).is_err() {
+  if new_branch.len() == 0 || !ref_name_safe(&new_branch) || validate_ref_name(&cat3(&"refs/heads/", &new_branch, &"")).is_err() {
     return Err("invalid_default_branch");
   }
   let r_id3 = cat3(&root, &"/", &id);
   let git_dir = cat3(&r_id3, &".git", &"");
-  let cur_meta = load_meta(&git_dir, &id)?;
+  let mut cur_meta = empty_meta();
+  match load_meta(&git_dir, &id) {
+    Ok(m) => {
+      cur_meta = m;
+    }
+    Err(_) => {
+      return Err("not_found");
+    }
+  }
+  if !can_read(&cur_meta, &Some(caller.clone())) {
+    return Err("not_found");
+  }
   if !can_manage(&cur_meta, &Some(caller.clone())) {
     return Err("forbidden");
   }
@@ -699,10 +752,14 @@ pub fn update_default_branch_managed(root: &String, id: &String, new_branch: &St
     Ok(m) => {
       locked_meta = m;
     }
-    Err(e) => {
+    Err(_) => {
       let _ = remove_file_if_exists(&lock_path);
-      return Err(e);
+      return Err("not_found");
     }
+  }
+  if !can_read(&locked_meta, &Some(caller.clone())) {
+    let _ = remove_file_if_exists(&lock_path);
+    return Err("not_found");
   }
   if !can_manage(&locked_meta, &Some(caller.clone())) {
     let _ = remove_file_if_exists(&lock_path);
@@ -722,11 +779,15 @@ pub fn update_default_branch_managed(root: &String, id: &String, new_branch: &St
         Ok(_) => {
           let _ = rename_file(&head_tmp, &head_path);
           let _ = sync_dir(&git_dir);
+          let _ = remove_file_if_exists(&lock_path);
+          return Ok(locked_meta);
         }
-        Err(_) => {}
+        Err(_) => {
+          let _ = remove_file_if_exists(&head_tmp);
+          let _ = remove_file_if_exists(&lock_path);
+          return Err("storage_failure");
+        }
       }
-      let _ = remove_file_if_exists(&lock_path);
-      return Ok(locked_meta);
     }
     Err(_) => {
       let _ = remove_file_if_exists(&lock_path);
@@ -736,13 +797,13 @@ pub fn update_default_branch_managed(root: &String, id: &String, new_branch: &St
 }
 
 pub fn update_acl_managed(root: &String, id: &String, new_owners: &List<String>, new_writers: &List<String>, new_readers: &List<String>, caller: &String) -> Result<RepoMeta, String>
-  intent "owner のみが ACL を変更できる。最後の owner の削除および空の主体名は拒否する。排他ロック下で再検査・atomic 更新する"
+  intent "owner のみが ACL を変更できる。読取権限のない主体には 404（not_found）を返し存在を隠蔽する。排他ロック下で再検査・atomic 更新する"
   requires none
   ensures none
   effects fs, random
 {
   if !repo_id_ok(&id) {
-    return Err("invalid_id");
+    return Err("not_found");
   }
   if new_owners.len() < 1 {
     return Err("owner_required");
@@ -753,7 +814,18 @@ pub fn update_acl_managed(root: &String, id: &String, new_owners: &List<String>,
 
   let r_id4 = cat3(&root, &"/", &id);
   let git_dir = cat3(&r_id4, &".git", &"");
-  let cur_meta = load_meta(&git_dir, &id)?;
+  let mut cur_meta = empty_meta();
+  match load_meta(&git_dir, &id) {
+    Ok(m) => {
+      cur_meta = m;
+    }
+    Err(_) => {
+      return Err("not_found");
+    }
+  }
+  if !can_read(&cur_meta, &Some(caller.clone())) {
+    return Err("not_found");
+  }
   if !can_manage(&cur_meta, &Some(caller.clone())) {
     return Err("forbidden");
   }
@@ -773,10 +845,14 @@ pub fn update_acl_managed(root: &String, id: &String, new_owners: &List<String>,
     Ok(m) => {
       locked_meta = m;
     }
-    Err(e) => {
+    Err(_) => {
       let _ = remove_file_if_exists(&lock_path);
-      return Err(e);
+      return Err("not_found");
     }
+  }
+  if !can_read(&locked_meta, &Some(caller.clone())) {
+    let _ = remove_file_if_exists(&lock_path);
+    return Err("not_found");
   }
   if !can_manage(&locked_meta, &Some(caller.clone())) {
     let _ = remove_file_if_exists(&lock_path);
@@ -825,6 +901,14 @@ pub fn calc_repo_storage(git_dir: &String) -> Result<RepoUsage, GitError>
   }
   let config_path = join_path(&git_dir, &"config");
   match open_read(&config_path) {
+    Ok(f) => {
+      total_bytes = total_bytes + file_size(&f)?;
+      let _ = f.close();
+    }
+    Err(_) => {}
+  }
+  let packed_path = join_path(&git_dir, &"packed-refs");
+  match open_read(&packed_path) {
     Ok(f) => {
       total_bytes = total_bytes + file_size(&f)?;
       let _ = f.close();
@@ -1030,8 +1114,82 @@ fn copy_dir_rec(src: &String, dst: &String) -> Result<Bool, GitError>
   return Ok(true);
 }
 
+fn backup_inner(repo_dir: &String, backup_dir: &String) -> Result<Bool, GitError>
+  intent "排他ロック内でファイルを複写し検証する"
+  requires none
+  ensures none
+  effects fs
+{
+  let meta_path = meta_file_path(&repo_dir);
+  if !file_exists(&meta_path)? {
+    return Err(GitError.Corrupt("missing metadata for backup"));
+  }
+  let mut meta_data = Bytes.new();
+  match read_file_opt(&meta_path, 16384, false)? {
+    Some(d) => {
+      meta_data = d;
+    }
+    None => {
+      return Err(GitError.Corrupt("missing metadata for backup"));
+    }
+  }
+
+  make_dirs(&backup_dir)?;
+  let mark_path = join_path(&backup_dir, &"sigil-backup.complete");
+  let _ = remove_file_if_exists(&mark_path);
+
+  let config_path = join_path(&repo_dir, &"config");
+  if file_exists(&config_path)? {
+    copy_file_synced(&config_path, &join_path(&backup_dir, &"config"))?;
+  }
+  let head_path = join_path(&repo_dir, &"HEAD");
+  if file_exists(&head_path)? {
+    copy_file_synced(&head_path, &join_path(&backup_dir, &"HEAD"))?;
+  } else {
+    return Err(GitError.Corrupt("missing HEAD for backup"));
+  }
+  let packed_path = join_path(&repo_dir, &"packed-refs");
+  if file_exists(&packed_path)? {
+    copy_file_synced(&packed_path, &join_path(&backup_dir, &"packed-refs"))?;
+  }
+
+  copy_file_synced(&meta_path, &join_path(&backup_dir, &"sigil-metadata"))?;
+
+  let src_obj = join_path(&repo_dir, &"objects");
+  if dir_exists(&src_obj)? {
+    copy_dir_rec(&src_obj, &join_path(&backup_dir, &"objects"))?;
+  }
+
+  let src_refs = join_path(&repo_dir, &"refs");
+  if dir_exists(&src_refs)? {
+    copy_dir_rec(&src_refs, &join_path(&backup_dir, &"refs"))?;
+  }
+
+  // 複写後の検証: sigil-metadata が正しく複写され、HEAD が存在するか
+  let b_meta = join_path(&backup_dir, &"sigil-metadata");
+  let mut copied_data = Bytes.new();
+  match read_file_opt(&b_meta, 16384, false)? {
+    Some(d) => {
+      copied_data = d;
+    }
+    None => {
+      return Err(GitError.Corrupt("verification failed: missing copied metadata"));
+    }
+  }
+  if copied_data != meta_data {
+    return Err(GitError.Corrupt("verification failed: metadata mismatch"));
+  }
+  if !file_exists(&join_path(&backup_dir, &"HEAD"))? {
+    return Err(GitError.Corrupt("verification failed: missing copied HEAD"));
+  }
+
+  create_synced_file(&mark_path, &"complete\n".as_bytes())?;
+  sync_dir(&backup_dir)?;
+  return Ok(true);
+}
+
 pub fn backup_repo(repo_dir: &String, backup_dir: &String) -> Result<Bool, GitError>
-  intent "排他ロックの下で、objects・refs・metadata を同じ確定点で複写・検証し、完了印を置く。ACL を欠く復元を許さない"
+  intent "排他ロックの下で、objects・refs・metadata を同じ確定点で複写・検証し、完了印を置く。失敗時もロックを確実に解放する"
   requires none
   ensures none
   effects fs
@@ -1046,54 +1204,42 @@ pub fn backup_repo(repo_dir: &String, backup_dir: &String) -> Result<Bool, GitEr
     }
   }
 
-  let meta_path = meta_file_path(&repo_dir);
-  if !file_exists(&meta_path)? {
-    let _ = remove_file_if_exists(&lock_path);
-    return Err(GitError.Corrupt("missing metadata for backup"));
-  }
-
-  make_dirs(&backup_dir)?;
-  let config_path = join_path(&repo_dir, &"config");
-  if file_exists(&config_path)? {
-    copy_file_synced(&config_path, &join_path(&backup_dir, &"config"))?;
-  }
-  let head_path = join_path(&repo_dir, &"HEAD");
-  if file_exists(&head_path)? {
-    copy_file_synced(&head_path, &join_path(&backup_dir, &"HEAD"))?;
-  }
-  copy_file_synced(&meta_path, &join_path(&backup_dir, &"sigil-metadata"))?;
-
-  let src_obj = join_path(&repo_dir, &"objects");
-  if dir_exists(&src_obj)? {
-    copy_dir_rec(&src_obj, &join_path(&backup_dir, &"objects"))?;
-  }
-
-  let src_refs = join_path(&repo_dir, &"refs");
-  if dir_exists(&src_refs)? {
-    copy_dir_rec(&src_refs, &join_path(&backup_dir, &"refs"))?;
-  }
-
-  let mark_path = join_path(&backup_dir, &"sigil-backup.complete");
-  create_synced_file(&mark_path, &"complete\n".as_bytes())?;
-  sync_dir(&backup_dir)?;
-
+  let res = backup_inner(&repo_dir, &backup_dir);
   let _ = remove_file_if_exists(&lock_path);
-  return Ok(true);
+  return res;
 }
 
 pub fn restore_repo(backup_dir: &String, target_dir: &String) -> Result<Bool, GitError>
-  intent "完了印と ACL（metadata）を備えたバックアップから、空の宛先ディレクトリへ復元する"
+  intent "完了印と ACL（metadata）を備えたバックアップから、空の宛先ディレクトリへ復元する。metadata は全データ復元後にアトミックに配置する"
   requires none
   ensures none
-  effects fs
+  effects fs, random
 {
   let mark_path = join_path(&backup_dir, &"sigil-backup.complete");
   if !file_exists(&mark_path)? {
-    return Err(GitError.Corrupt("incomplete backup"));
+    return Err(GitError.Corrupt("incomplete backup: missing completion mark"));
   }
   let meta_path = join_path(&backup_dir, &"sigil-metadata");
   if !file_exists(&meta_path)? {
     return Err(GitError.Corrupt("missing metadata in backup"));
+  }
+  let mut meta_bytes = Bytes.new();
+  match read_file_opt(&meta_path, 16384, false)? {
+    Some(b) => {
+      meta_bytes = b;
+    }
+    None => {
+      return Err(GitError.Corrupt("cannot read metadata in backup"));
+    }
+  }
+  let mut verified_meta = empty_meta();
+  match parse_meta(&meta_bytes, &"") {
+    Ok(m) => {
+      verified_meta = m;
+    }
+    Err(_) => {
+      return Err(GitError.Corrupt("corrupt or invalid metadata in backup"));
+    }
   }
 
   if dir_exists(&target_dir)? {
@@ -1104,6 +1250,7 @@ pub fn restore_repo(backup_dir: &String, target_dir: &String) -> Result<Bool, Gi
   }
 
   make_dirs(&target_dir)?;
+
   let config_path = join_path(&backup_dir, &"config");
   if file_exists(&config_path)? {
     copy_file_synced(&config_path, &join_path(&target_dir, &"config"))?;
@@ -1112,7 +1259,10 @@ pub fn restore_repo(backup_dir: &String, target_dir: &String) -> Result<Bool, Gi
   if file_exists(&head_path)? {
     copy_file_synced(&head_path, &join_path(&target_dir, &"HEAD"))?;
   }
-  copy_file_synced(&meta_path, &join_path(&target_dir, &"sigil-metadata"))?;
+  let packed_path = join_path(&backup_dir, &"packed-refs");
+  if file_exists(&packed_path)? {
+    copy_file_synced(&packed_path, &join_path(&target_dir, &"packed-refs"))?;
+  }
 
   let src_obj = join_path(&backup_dir, &"objects");
   if dir_exists(&src_obj)? {
@@ -1126,14 +1276,88 @@ pub fn restore_repo(backup_dir: &String, target_dir: &String) -> Result<Bool, Gi
 
   sync_dir(&target_dir)?;
 
+  match save_meta_atomic(&target_dir, &verified_meta) {
+    Ok(_) => {}
+    Err(e) => {
+      return Err(e);
+    }
+  }
+
   return match open_repo(&target_dir) {
     Ok(_) => Ok(true),
     Err(e) => Err(e),
   };
 }
 
+pub fn escape_json_string(s: &String) -> String
+  intent "JSON 文字列として安全にエスケープする（ダブルクオート、バックスラッシュ、制御文字）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 34 {
+      out.push(92);
+      out.push(34);
+    } else if c == 92 {
+      out.push(92);
+      out.push(92);
+    } else if c == 8 {
+      out.push(92);
+      out.push(98);
+    } else if c == 12 {
+      out.push(92);
+      out.push(102);
+    } else if c == 10 {
+      out.push(92);
+      out.push(110);
+    } else if c == 13 {
+      out.push(92);
+      out.push(114);
+    } else if c == 9 {
+      out.push(92);
+      out.push(116);
+    } else if c < 32 {
+      out.push(92);
+      out.push(117);
+      out.push(48);
+      out.push(48);
+      let hi = c / 16;
+      let lo = c % 16;
+      if hi < 10 {
+        out.push(48 + hi);
+      } else {
+        out.push(87 + hi);
+      }
+      if lo < 10 {
+        out.push(48 + lo);
+      } else {
+        out.push(87 + lo);
+      }
+    } else {
+      out.push(c);
+    }
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("");
+}
+
+pub fn json_quote(s: &String) -> String
+  intent "エスケープした上でダブルクオートで囲む"
+  requires none
+  ensures none
+  effects none
+{
+  let escaped = escape_json_string(&s);
+  return cat3(&"\"", &escaped, &"\"");
+}
+
 pub fn list_to_json_array(l: &List<String>) -> String
-  intent "文字列リストを JSON 配列文字列にする"
+  intent "文字列リストを JSON 配列文字列にする（各要素をエスケープ）"
   requires none
   ensures none
   effects none
@@ -1146,8 +1370,7 @@ pub fn list_to_json_array(l: &List<String>) -> String
         if i > 0 {
           out = cat2(&out, &",");
         }
-        out = cat3(&out, &"\"", &s);
-        out = cat2(&out, &"\"");
+        out = cat2(&out, &json_quote(&s));
       }
       None => {}
     }
@@ -1157,20 +1380,20 @@ pub fn list_to_json_array(l: &List<String>) -> String
 }
 
 pub fn meta_to_json(meta: &RepoMeta) -> String
-  intent "RepoMeta を JSON 文字列にする"
+  intent "RepoMeta を JSON 文字列にする（各フィールドをエスケープ）"
   requires none
   ensures none
   effects none
 {
-  let mut out = "{\"id\":\"";
-  out = cat2(&out, &meta.id);
-  out = cat2(&out, &"\",\"version\":");
+  let mut out = "{\"id\":";
+  out = cat2(&out, &json_quote(&meta.id));
+  out = cat2(&out, &",\"version\":");
   out = cat2(&out, &int_to_str(meta.version));
-  out = cat2(&out, &",\"visibility\":\"");
-  out = cat2(&out, &meta.visibility);
-  out = cat2(&out, &"\",\"default_branch\":\"");
-  out = cat2(&out, &meta.default_branch);
-  out = cat2(&out, &"\",\"owners\":[");
+  out = cat2(&out, &",\"visibility\":");
+  out = cat2(&out, &json_quote(&meta.visibility));
+  out = cat2(&out, &",\"default_branch\":");
+  out = cat2(&out, &json_quote(&meta.default_branch));
+  out = cat2(&out, &",\"owners\":[");
   out = cat2(&out, &list_to_json_array(&meta.owners));
   out = cat2(&out, &"],\"writers\":[");
   out = cat2(&out, &list_to_json_array(&meta.writers));
@@ -1181,20 +1404,20 @@ pub fn meta_to_json(meta: &RepoMeta) -> String
 }
 
 pub fn repo_detail_to_json(meta: &RepoMeta, usage: &RepoUsage) -> String
-  intent "RepoMeta と RepoUsage を JSON 文字列にする"
+  intent "RepoMeta と RepoUsage を JSON 文字列にする（各フィールドをエスケープ）"
   requires none
   ensures none
   effects none
 {
-  let mut out = "{\"id\":\"";
-  out = cat2(&out, &meta.id);
-  out = cat2(&out, &"\",\"version\":");
+  let mut out = "{\"id\":";
+  out = cat2(&out, &json_quote(&meta.id));
+  out = cat2(&out, &",\"version\":");
   out = cat2(&out, &int_to_str(meta.version));
-  out = cat2(&out, &",\"visibility\":\"");
-  out = cat2(&out, &meta.visibility);
-  out = cat2(&out, &"\",\"default_branch\":\"");
-  out = cat2(&out, &meta.default_branch);
-  out = cat2(&out, &"\",\"owners\":[");
+  out = cat2(&out, &",\"visibility\":");
+  out = cat2(&out, &json_quote(&meta.visibility));
+  out = cat2(&out, &",\"default_branch\":");
+  out = cat2(&out, &json_quote(&meta.default_branch));
+  out = cat2(&out, &",\"owners\":[");
   out = cat2(&out, &list_to_json_array(&meta.owners));
   out = cat2(&out, &"],\"writers\":[");
   out = cat2(&out, &list_to_json_array(&meta.writers));
