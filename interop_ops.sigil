@@ -96,7 +96,7 @@ fn run_line(root: &String, line: &String) -> Result<String, GitError>
 }
 
 pub fn main() -> Int
-  intent "tmp/interop_ops/cmds.txt のコマンドを 1 行ずつ tmp/interop_ops/repo（SHA-256）に対して実行し、結果を 1 行ずつ出力する（成功は ok:結果、失敗は error:種別）。コマンドが読めなければ 1"
+  intent "tmp/interop_ops/cmds.txt のコマンドを 1 行ずつ tmp/interop_ops/repo（SHA-256）に対して実行し、結果を 1 行ずつ出力する（成功は ok:結果、失敗は error:種別）。行 failfast があれば、以降は最初の失敗で止まる。コマンドが読めなければ 1"
   requires none
   ensures none
   effects console, fs, random
@@ -112,16 +112,25 @@ pub fn main() -> Int
   }
   let lines = cmds.lines();
   let mut i = 0;
-  while i < lines.len() {
+  let mut failfast = false;
+  let mut stopped = false;
+  while i < lines.len() && !stopped {
     match lines.get(i) {
       None => {}
       Some(line) => {
-        match run_line(&root, &line) {
-          Ok(v) => {
-            console.log(&cat3(&"ok:", &v, &""));
-          }
-          Err(e) => {
-            console.log(&cat2(&"error:", &error_kind_name(&e)));
+        if line == "failfast" {
+          failfast = true;
+        } else {
+          match run_line(&root, &line) {
+            Ok(v) => {
+              console.log(&cat3(&"ok:", &v, &""));
+            }
+            Err(e) => {
+              console.log(&cat2(&"error:", &error_kind_name(&e)));
+              if failfast {
+                stopped = true;
+              }
+            }
           }
         }
       }
