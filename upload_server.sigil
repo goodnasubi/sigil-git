@@ -7,10 +7,29 @@ use git.acl.can_read;
 use git.acl.can_write;
 use git.acl.parse_fixed_acl;
 use git.acl.repo_id_ok;
+use git.fsio.cat2;
 use git.fsio.cat3;
+use git.fsio.file_exists;
+use git.fsio.join_path;
 use git.fsio.read_file_opt;
+use git.fsio.string_starts_with;
 use git.gzip.gzip_decode;
 use git.hash.int_to_str;
+use git.meta.calc_repo_storage;
+use git.meta.create_repo_managed;
+use git.meta.empty_meta;
+use git.meta.json_str;
+use git.meta.json_string_list;
+use git.meta.list_accessible_repos;
+use git.meta.load_meta;
+use git.meta.meta_can_read;
+use git.meta.meta_can_write;
+use git.meta.meta_to_json;
+use git.meta.repo_detail_to_json;
+use git.meta.repos_list_to_json;
+use git.meta.update_acl_managed;
+use git.meta.update_default_branch_managed;
+use git.meta.update_visibility_managed;
 use git.receive.ReceiveReply;
 use git.receive.new_write_check;
 use git.receive.receive_info_refs_reply;
@@ -22,21 +41,18 @@ use git.upload.UploadReply;
 use git.upload.info_refs_reply;
 use git.upload.upload_pack_post;
 
-// ADR 0048 第 2 段の接続試験用サーバー。本物の Git クライアントが clone／fetch できる最小の Smart HTTP v0 の upload-pack だけを持つ。
-//   GET  /repos/<id>/info/refs?service=git-upload-pack
-//   POST /repos/<id>/git-upload-pack
-// 認証は ADR 0037 の固定 HMAC Bearer 検証器（std.web）。認可は git.acl の固定の表だけ（本格的な ACL は第 4 段）。
-// 順序: 経路の形と query の形 → Bearer 認証（401）→ 認可（読めなければ存在を明かさず 404）→ Content-Encoding の検査 → 本文の処理。
-// 環境変数: SIGIL_GIT_REPO_ROOT（`<id>.git` の置き場）、SIGIL_GIT_ACL（`repo:subject,subject;...`）、SIGIL_AUTH_HMAC_KEY_HEX、SIGIL_AUTH_AUDIENCE、
-// receive-pack（第 3 段）: GET info/refs?service=git-receive-pack と POST /repos/<id>/git-receive-pack。read に加えて write 権限（`repo:sub=rw`）が要る。
-// SIGIL_GIT_ACL_FILE を指定すると要求ごとに ACL を読み直し、公開の直前にも再検査する（ACL 変更と push の競合の試験用）。
-// SIGIL_GIT_SERVE_CONNS（受け付ける接続の数。既定 64）、SIGIL_GIT_LOG_REQUESTS=1（POST の符号化前後の本文サイズを標準出力へ出す。試験用）。
+// ADR 0048 第 4 段: metadata・ACL と管理 UI・管理 API。
+// Git エンドポイント（upload-pack／receive-pack）の認可は確定済み metadata を参照する。
+// public-read は匿名 clone/fetch を許可、private は存在を秘匿（404）。
+// 管理 API は同一 Origin のみ、CORS なし、変更は POST+JSON+Origin 完全一致。
+// UI は HTML+JS（インメモリ Bearer のみ、XSS 防止のテキストエスケープ）。
 
 struct Ctx {
   router: Router,
   acl: FixedAcl,
   acl_file: String,
   root: String,
+  admin_subject: String,
   log: Bool,
 }
 
@@ -64,6 +80,12 @@ fn build_router() -> Result<Router, ConfigError>
   router = router.route("GET", "/repos/:id/info/refs", RouteHandler { handle: authorize }).unwrap_or(Router.new());
   router = router.route("POST", "/repos/:id/git-upload-pack", RouteHandler { handle: authorize }).unwrap_or(Router.new());
   router = router.route("POST", "/repos/:id/git-receive-pack", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("GET", "/api/repos", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("POST", "/api/repos", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("GET", "/api/repos/:id", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("POST", "/api/repos/:id/visibility", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("POST", "/api/repos/:id/default-branch", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("POST", "/api/repos/:id/acl", RouteHandler { handle: authorize }).unwrap_or(Router.new());
   return Ok(router);
 }
 
@@ -187,13 +209,332 @@ fn encodings_of(req: &HttpRequest) -> List<Bytes>
   return out;
 }
 
+fn json_response(status: Int, body: &String) -> HttpResponse
+  intent "JSON 応答を作る（Cache-Control: no-store 付き）"
+  requires 200 <= status && status <= 599
+  ensures none
+  effects none
+{
+  return no_store(HttpResponse.new(status, body.as_bytes()).with_header(&"content-type", &"application/json".as_bytes()));
+}
+
+fn ui_response() -> HttpResponse
+  intent "管理 UI HTML を返す（Cache-Control: no-store 付き）"
+  requires none
+  ensures none
+  effects none
+{
+  return no_store(HttpResponse.new(200, ui_html().as_bytes()).with_header(&"content-type", &"text/html; charset=utf-8".as_bytes()));
+}
+
+fn ui_html() -> String
+  intent "管理 UI の静的 HTML を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return "<!DOCTYPE html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n<title>Sigil Git Management</title>\n<style>\nbody { font-family: sans-serif; margin: 2rem; background: #f8f9fa; color: #333; }\nh1, h2 { color: #1a1a1a; }\n.card { background: white; border: 1px solid #ddd; border-radius: 4px; padding: 1rem; margin-bottom: 1.5rem; }\n.form-group { margin-bottom: 0.8rem; }\nlabel { display: block; font-weight: bold; margin-bottom: 0.3rem; }\ninput[type=\"text\"], input[type=\"password\"], select { width: 100%; max-width: 400px; padding: 0.4rem; box-sizing: border-box; }\nbutton { padding: 0.4rem 0.8rem; background: #0066cc; color: white; border: none; border-radius: 3px; cursor: pointer; }\nbutton:hover { background: #0052a3; }\ntable { width: 100%; border-collapse: collapse; margin-top: 1rem; }\nth, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; }\nth { background: #f1f3f5; }\n.status { margin-top: 0.5rem; font-weight: bold; }\n.error { color: #d9534f; }\n.success { color: #5cb85c; }\n</style>\n</head>\n<body>\n<h1>Sigil Git Management</h1>\n<div class=\"card\">\n<h2>Authentication</h2>\n<p>Bearer token is kept strictly in page memory and never stored in cookies, storage, or URL.</p>\n<div class=\"form-group\">\n<label for=\"token\">Bearer Token:</label>\n<input type=\"password\" id=\"token\" placeholder=\"Bearer Token\">\n</div>\n<button id=\"set-token-btn\">Set Token</button>\n<span id=\"auth-status\" class=\"status\"></span>\n</div>\n<div class=\"card\">\n<h2>Create Repository</h2>\n<div class=\"form-group\">\n<label for=\"new-id\">Repository ID:</label>\n<input type=\"text\" id=\"new-id\" placeholder=\"e.g. my-repo\">\n</div>\n<div class=\"form-group\">\n<label for=\"new-owner\">Owner:</label>\n<input type=\"text\" id=\"new-owner\" placeholder=\"e.g. alice\">\n</div>\n<div class=\"form-group\">\n<label for=\"new-branch\">Default Branch:</label>\n<input type=\"text\" id=\"new-branch\" value=\"main\">\n</div>\n<button id=\"create-btn\">Create Repository</button>\n<div id=\"create-msg\" class=\"status\"></div>\n</div>\n<div class=\"card\">\n<h2>Repositories</h2>\n<button id=\"refresh-btn\">Refresh List</button>\n<div id=\"repos-container\"></div>\n</div>\n<script>\nlet inMemoryToken = \"\";\nfunction getHeaders(isJson) {\n  const h = {};\n  if (inMemoryToken) {\n    h[\"Authorization\"] = \"Bearer \" + inMemoryToken;\n  }\n  if (isJson) {\n    h[\"Content-Type\"] = \"application/json\";\n  }\n  return h;\n}\ndocument.getElementById(\"set-token-btn\").addEventListener(\"click\", () => {\n  inMemoryToken = document.getElementById(\"token\").value;\n  const s = document.getElementById(\"auth-status\");\n  s.textContent = inMemoryToken ? \"Token loaded in memory\" : \"Anonymous mode\";\n  s.className = \"status success\";\n  loadRepos();\n});\ndocument.getElementById(\"refresh-btn\").addEventListener(\"click\", () => {\n  loadRepos();\n});\ndocument.getElementById(\"create-btn\").addEventListener(\"click\", async () => {\n  const id = document.getElementById(\"new-id\").value;\n  const owner = document.getElementById(\"new-owner\").value;\n  const branch = document.getElementById(\"new-branch\").value || \"main\";\n  const msg = document.getElementById(\"create-msg\");\n  msg.textContent = \"\";\n  try {\n    const res = await fetch(\"/api/repos\", {\n      method: \"POST\",\n      headers: getHeaders(true),\n      body: JSON.stringify({ id: id, owner: owner, default_branch: branch })\n    });\n    if (res.ok) {\n      msg.textContent = \"Repository created successfully\";\n      msg.className = \"status success\";\n      document.getElementById(\"new-id\").value = \"\";\n      document.getElementById(\"new-owner\").value = \"\";\n      loadRepos();\n    } else {\n      const err = await res.text();\n      msg.textContent = \"Error (\" + res.status + \"): \" + err;\n      msg.className = \"status error\";\n    }\n  } catch (e) {\n    msg.textContent = \"Network error: \" + e.message;\n    msg.className = \"status error\";\n  }\n});\nasync function loadRepos() {\n  const container = document.getElementById(\"repos-container\");\n  container.textContent = \"Loading...\";\n  try {\n    const res = await fetch(\"/api/repos\", {\n      method: \"GET\",\n      headers: getHeaders(false)\n    });\n    if (!res.ok) {\n      container.textContent = \"Failed to load repositories: \" + res.status;\n      return;\n    }\n    const repos = await res.json();\n    container.textContent = \"\";\n    if (repos.length === 0) {\n      container.textContent = \"No accessible repositories found.\";\n      return;\n    }\n    const table = document.createElement(\"table\");\n    const thead = document.createElement(\"thead\");\n    const trH = document.createElement(\"tr\");\n    [\"ID\", \"Visibility\", \"Default Branch\", \"Owners\", \"Writers\", \"Readers\", \"Actions\"].forEach(t => {\n      const th = document.createElement(\"th\");\n      th.textContent = t;\n      trH.appendChild(th);\n    });\n    thead.appendChild(trH);\n    table.appendChild(thead);\n    const tbody = document.createElement(\"tbody\");\n    repos.forEach(repo => {\n      const tr = document.createElement(\"tr\");\n      const tdId = document.createElement(\"td\");\n      tdId.textContent = repo.id;\n      tr.appendChild(tdId);\n      const tdVis = document.createElement(\"td\");\n      tdVis.textContent = repo.visibility;\n      tr.appendChild(tdVis);\n      const tdBr = document.createElement(\"td\");\n      tdBr.textContent = repo.default_branch;\n      tr.appendChild(tdBr);\n      const tdOwn = document.createElement(\"td\");\n      tdOwn.textContent = (repo.owners || []).join(\", \");\n      tr.appendChild(tdOwn);\n      const tdWr = document.createElement(\"td\");\n      tdWr.textContent = (repo.writers || []).join(\", \");\n      tr.appendChild(tdWr);\n      const tdRd = document.createElement(\"td\");\n      tdRd.textContent = (repo.readers || []).join(\", \");\n      tr.appendChild(tdRd);\n      const tdAct = document.createElement(\"td\");\n      const inspectBtn = document.createElement(\"button\");\n      inspectBtn.textContent = \"Usage\";\n      inspectBtn.onclick = async () => {\n        const ures = await fetch(\"/api/repos/\" + encodeURIComponent(repo.id), {\n          method: \"GET\",\n          headers: getHeaders(false)\n        });\n        if (ures.ok) {\n          const detail = await ures.json();\n          alert(\"Storage: \" + detail.usage_bytes + \" / \" + detail.max_storage_bytes + \" bytes\\nObjects: \" + detail.object_count + \" / \" + detail.max_objects);\n        } else {\n          alert(\"Error: \" + ures.status);\n        }\n      };\n      tdAct.appendChild(inspectBtn);\n      const visBtn = document.createElement(\"button\");\n      visBtn.textContent = repo.visibility === \"private\" ? \"Make Public\" : \"Make Private\";\n      visBtn.style.marginLeft = \"0.5rem\";\n      visBtn.onclick = async () => {\n        const nextVis = repo.visibility === \"private\" ? \"public-read\" : \"private\";\n        const vres = await fetch(\"/api/repos/\" + encodeURIComponent(repo.id) + \"/visibility\", {\n          method: \"POST\",\n          headers: getHeaders(true),\n          body: JSON.stringify({ visibility: nextVis })\n        });\n        if (vres.ok) {\n          loadRepos();\n        } else {\n          alert(\"Failed to change visibility: \" + vres.status);\n        }\n      };\n      tdAct.appendChild(visBtn);\n      tr.appendChild(tdAct);\n      tbody.appendChild(tr);\n    });\n    table.appendChild(tbody);\n    container.appendChild(table);\n  } catch (e) {\n    container.textContent = \"Error: \" + e.message;\n  }\n}\n</script>\n</body>\n</html>\n";
+}
+
+fn handle_api(ctx: &Ctx, req: &HttpRequest, segs: &List<String>) -> HttpResponse
+  intent "管理 API の要求を処理する"
+  requires none
+  ensures none
+  effects clock, console, db, env, fs, random, task
+{
+  if req.body().len() > 16384 {
+    return plain(413, &"payload_too_large");
+  }
+  if req.method() == "DELETE" {
+    return plain(405, &"method_not_allowed");
+  }
+  if segs.len() >= 2 && seg_at(&segs, 1) == "auth" {
+    return plain(400, &"unsupported_operation");
+  }
+  if segs.len() >= 4 && seg_at(&segs, 1) == "repos" {
+    let act = seg_at(&segs, 3);
+    if act == "rename" || act == "quota" || act == "token" {
+      return plain(400, &"unsupported_operation");
+    }
+  }
+  if req.method() == "POST" {
+    let origin = match req.header(&"origin") {
+      Some(b) => b.to_string_utf8().unwrap_or(""),
+      None => "",
+    };
+    if origin.len() == 0 {
+      return plain(403, &"forbidden");
+    }
+    let host = match req.header(&"host") {
+      Some(b) => b.to_string_utf8().unwrap_or(""),
+      None => "",
+    };
+    if host.len() == 0 {
+      return plain(403, &"forbidden");
+    }
+    let expected_http = cat2(&"http://", &host);
+    let expected_https = cat2(&"https://", &host);
+    if origin != expected_http && origin != expected_https {
+      return plain(403, &"forbidden");
+    }
+    let ct = match req.header(&"content-type") {
+      Some(b) => b.to_string_utf8().unwrap_or(""),
+      None => "",
+    };
+    if !string_starts_with(&ct, &"application/json") {
+      return plain(415, &"unsupported_media_type");
+    }
+  }
+
+  let has_auth = match req.header(&"authorization") {
+    Some(b) => b.len() > 0,
+    None => false,
+  };
+  let mut subject = None;
+  if has_auth {
+    let auth = ctx.router.dispatch(&req);
+    if auth.status() != 200 {
+      return no_store(auth);
+    }
+    subject = Some(auth.body().to_string_utf8().unwrap_or(""));
+  }
+
+  if seg_at(&segs, 1) == "repos" {
+    if segs.len() == 2 {
+      if req.method() == "GET" {
+        let repos = list_accessible_repos(&ctx.root, &subject);
+        return json_response(200, &repos_list_to_json(&repos));
+      }
+      if req.method() == "POST" {
+        let mut caller = "";
+        match subject {
+          Some(s) => {
+            caller = s;
+          }
+          None => {
+            return plain(401, &"unauthorized");
+          }
+        }
+        if ctx.admin_subject.len() == 0 || caller != ctx.admin_subject {
+          return plain(403, &"forbidden");
+        }
+        match json.parse(&req.body()) {
+          Err(_) => {
+            return plain(400, &"invalid_json");
+          }
+          Ok(val) => {
+            let id = json_str(&val, &"id").unwrap_or("");
+            let mut owner = json_str(&val, &"owner").unwrap_or("");
+            if owner.len() == 0 {
+              match json_string_list(&val, &"owners") {
+                Some(l) => {
+                  if l.len() > 0 {
+                    match l.get(0) {
+                      Some(s) => {
+                        owner = s.clone();
+                      }
+                      None => {}
+                    }
+                  }
+                }
+                None => {}
+              }
+            }
+            let branch = json_str(&val, &"default_branch").unwrap_or("main");
+            if id.len() == 0 || owner.len() == 0 {
+              return plain(400, &"invalid_request");
+            }
+            match create_repo_managed(&ctx.root, &id, &owner, &branch, &ctx.admin_subject, &caller) {
+              Ok(meta) => {
+                return json_response(201, &meta_to_json(&meta));
+              }
+              Err(err) => {
+                if err == "conflict" {
+                  return plain(409, &"conflict");
+                }
+                if err == "forbidden" {
+                  return plain(403, &"forbidden");
+                }
+                return plain(400, &"invalid_request");
+              }
+            }
+          }
+        }
+      }
+      return plain(405, &"method_not_allowed");
+    }
+    if segs.len() == 3 {
+      let id = seg_at(&segs, 2);
+      if req.method() == "GET" {
+        let repo_dir = cat3(&cat3(&ctx.root, &"/", &id), &".git", &"");
+        match load_meta(&repo_dir, &id) {
+          Err(_) => {
+            return plain(404, &"not found");
+          }
+          Ok(meta) => {
+            if !meta_can_read(&meta, &subject) {
+              return plain(404, &"not found");
+            }
+            return match calc_repo_storage(&repo_dir) {
+              Err(_) => plain(500, &"internal_error"),
+              Ok(usage) => json_response(200, &repo_detail_to_json(&meta, &usage)),
+            };
+          }
+        }
+      }
+      return plain(405, &"method_not_allowed");
+    }
+    if segs.len() == 4 {
+      let id = seg_at(&segs, 2);
+      let action = seg_at(&segs, 3);
+      let mut caller = "";
+      match subject {
+        Some(s) => {
+          caller = s;
+        }
+        None => {
+          return plain(401, &"unauthorized");
+        }
+      }
+      if action == "visibility" && req.method() == "POST" {
+        match json.parse(&req.body()) {
+          Err(_) => {
+            return plain(400, &"invalid_json");
+          }
+          Ok(val) => {
+            let vis = json_str(&val, &"visibility").unwrap_or("");
+            match update_visibility_managed(&ctx.root, &id, &vis, &caller) {
+              Ok(meta) => {
+                return json_response(200, &meta_to_json(&meta));
+              }
+              Err(err) => {
+                if err == "not_found" {
+                  return plain(404, &"not found");
+                }
+                if err == "forbidden" {
+                  return plain(403, &"forbidden");
+                }
+                if err == "conflict" {
+                  return plain(409, &"conflict");
+                }
+                return plain(400, &"invalid_request");
+              }
+            }
+          }
+        }
+      }
+      if action == "default-branch" && req.method() == "POST" {
+        match json.parse(&req.body()) {
+          Err(_) => {
+            return plain(400, &"invalid_json");
+          }
+          Ok(val) => {
+            let branch = json_str(&val, &"default_branch").unwrap_or("");
+            match update_default_branch_managed(&ctx.root, &id, &branch, &caller) {
+              Ok(meta) => {
+                return json_response(200, &meta_to_json(&meta));
+              }
+              Err(err) => {
+                if err == "not_found" {
+                  return plain(404, &"not found");
+                }
+                if err == "forbidden" {
+                  return plain(403, &"forbidden");
+                }
+                if err == "conflict" {
+                  return plain(409, &"conflict");
+                }
+                return plain(400, &"invalid_request");
+              }
+            }
+          }
+        }
+      }
+      if action == "acl" && req.method() == "POST" {
+        match json.parse(&req.body()) {
+          Err(_) => {
+            return plain(400, &"invalid_json");
+          }
+          Ok(val) => {
+            let mut owners = List.new();
+            match json_string_list(&val, &"owners") {
+              Some(l) => {
+                owners = l;
+              }
+              None => {
+                return plain(400, &"invalid_request");
+              }
+            }
+            let writers = json_string_list(&val, &"writers").unwrap_or(List.new());
+            let readers = json_string_list(&val, &"readers").unwrap_or(List.new());
+            match update_acl_managed(&ctx.root, &id, &owners, &writers, &readers, &caller) {
+              Ok(meta) => {
+                return json_response(200, &meta_to_json(&meta));
+              }
+              Err(err) => {
+                if err == "not_found" {
+                  return plain(404, &"not found");
+                }
+                if err == "forbidden" {
+                  return plain(403, &"forbidden");
+                }
+                if err == "conflict" {
+                  return plain(409, &"conflict");
+                }
+                return plain(400, &"invalid_request");
+              }
+            }
+          }
+        }
+      }
+      if action == "rename" || action == "quota" {
+        return plain(400, &"unsupported_operation");
+      }
+      return plain(404, &"not found");
+    }
+  }
+  if seg_at(&segs, 1) == "auth" {
+    return plain(400, &"unsupported_operation");
+  }
+  return plain(404, &"not found");
+}
+
+fn serve_repo_managed(ctx: &Ctx, repo: &Repo, req: &HttpRequest, is_receive: Bool, receive_refs: Bool, refs_path: Bool, id: &String, subject: &String, meta_file: &String) -> HttpResponse
+  intent "マネージドリポジトリの要求を処理する（metadata ファイルを write_check に渡し、公開直前に再検証する）"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  if repo_is_quarantined(&repo) {
+    return plain(503, &"repository_unavailable");
+  }
+  if is_receive {
+    if receive_refs {
+      return to_receive_response(&receive_info_refs_reply(&repo, &req.query()));
+    }
+    let body = req.body();
+    if ctx.log {
+      log_sizes(&req, &body);
+    }
+    let wc = new_write_check(meta_file.clone(), id.clone(), subject.clone(), true);
+    return to_receive_response(&receive_pack_post(&repo, &encodings_of(&req), &req.header(&"content-type"), &body, &wc));
+  }
+  return respond(&ctx, &repo, &req, refs_path);
+}
+
 fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
   intent "1 つの要求を処理する"
   requires none
   ensures none
   effects clock, console, db, env, fs, random, task
 {
+  if req.path() == "/".as_bytes() || req.path() == "/ui".as_bytes() {
+    return ui_response();
+  }
   let segs = segments(&req.path());
+  if segs.len() >= 1 && seg_at(&segs, 0) == "api" {
+    return handle_api(&ctx, &req, &segs);
+  }
   if segs.len() < 3 || seg_at(&segs, 0) != "repos" {
     return no_store(ctx.router.dispatch(&req));
   }
@@ -211,6 +552,54 @@ fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
   if (upload_path || receive_path) && req.query().len() != 0 {
     return plain(400, &"invalid_query");
   }
+  let is_receive = receive_path || receive_refs;
+
+  let repo_dir = cat3(&cat3(&ctx.root, &"/", &id), &".git", &"");
+  let meta_file = join_path(&repo_dir, &"sigil-metadata");
+  if file_exists(&meta_file).unwrap_or(false) {
+    let mut meta = empty_meta();
+    match load_meta(&repo_dir, &id) {
+      Ok(m) => {
+        meta = m;
+      }
+      Err(_) => {
+        return plain(404, &"not found");
+      }
+    }
+    let has_auth = match req.header(&"authorization") {
+      Some(b) => b.len() > 0,
+      None => false,
+    };
+    let mut subject = None;
+    if has_auth {
+      let auth = ctx.router.dispatch(&req);
+      if auth.status() != 200 {
+        return no_store(auth);
+      }
+      subject = Some(auth.body().to_string_utf8().unwrap_or(""));
+    }
+    if is_receive {
+      if subject.is_none() {
+        return plain(401, &"unauthorized");
+      }
+      if !meta_can_read(&meta, &subject) {
+        return plain(404, &"not found");
+      }
+      if !meta_can_write(&meta, &subject) {
+        return plain(403, &"forbidden");
+      }
+    } else {
+      if !meta_can_read(&meta, &subject) {
+        return plain(404, &"not found");
+      }
+    }
+    let sub_str = subject.unwrap_or("");
+    return match open_repo(&repo_dir) {
+      Err(_) => plain(404, &"not found"),
+      Ok(repo) => serve_repo_managed(&ctx, &repo, &req, is_receive, receive_refs, refs_path, &id, &sub_str, &meta_file),
+    };
+  }
+
   let auth = ctx.router.dispatch(&req);
   if auth.status() != 200 {
     return no_store(auth);
@@ -220,7 +609,6 @@ fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
   if !repo_id_ok(&id) || !can_read(&acl, &subject, &id) {
     return plain(404, &"not found");
   }
-  let is_receive = receive_path || receive_refs;
   if is_receive && !can_write(&acl, &subject, &id) {
     return plain(403, &"forbidden");
   }
@@ -229,7 +617,6 @@ fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
     Err(_) => plain(404, &"not found"),
     Ok(repo) => serve_repo(&ctx, &repo, &req, is_receive, receive_refs, refs_path, &id, &subject),
   };
-  return plain(500, &"internal_error");
 }
 
 fn serve_repo(ctx: &Ctx, repo: &Repo, req: &HttpRequest, is_receive: Bool, receive_refs: Bool, refs_path: Bool, id: &String, subject: &String) -> HttpResponse
@@ -347,14 +734,14 @@ fn read_conns() -> Int
   }
 }
 
-fn serve(root: String, acl: FixedAcl, acl_file: String, router: Router) -> Int
+fn serve(root: String, acl: FixedAcl, acl_file: String, admin_subject: String, router: Router) -> Int
   intent "待ち受けを開始し、受け付けた接続を順に処理して終了する"
   requires none
   ensures none
   effects clock, console, db, env, fs, net.server, random, task
 {
   let log = env.get(&"SIGIL_GIT_LOG_REQUESTS").unwrap_or("") == "1";
-  let shared = SyncShared.new(Ctx { router: router, acl: acl, acl_file: acl_file, root: root, log: log });
+  let shared = SyncShared.new(Ctx { router: router, acl: acl, acl_file: acl_file, root: root, admin_subject: admin_subject, log: log });
   let n = read_conns();
   match net.listen(&"127.0.0.1", 0, 16) {
     Err(_) => {
@@ -393,6 +780,7 @@ pub fn main() -> Int
   let root = env.get(&"SIGIL_GIT_REPO_ROOT").unwrap_or("");
   let acl_text = env.get(&"SIGIL_GIT_ACL").unwrap_or("");
   let acl_file = env.get(&"SIGIL_GIT_ACL_FILE").unwrap_or("");
+  let admin = env.get(&"SIGIL_GIT_ADMIN").unwrap_or("");
   if root == "" {
     console.log(&"missing SIGIL_GIT_REPO_ROOT");
     return 1;
@@ -409,7 +797,7 @@ pub fn main() -> Int
           return 1;
         }
         Ok(router) => {
-          return serve(root, acl, acl_file, router);
+          return serve(root, acl, acl_file, admin, router);
         }
       }
     }
