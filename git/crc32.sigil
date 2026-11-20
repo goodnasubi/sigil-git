@@ -1,0 +1,69 @@
+module git.crc32
+  targets server
+  trust none
+
+// ADR 0052「フレームと検査値」: gzip の trailer が使う CRC-32（IEEE 802.3、多項式 0xEDB88320 の反転形）。
+// 秘密を扱わない公開の検査値なので、表引きで実装する。zlib の Adler-32 とは別物で、互いに代用しない。
+
+pub fn crc32_table() -> List<Int>
+  intent "CRC-32 の 256 要素の表を作る"
+  requires none
+  ensures result.len() == 256
+  effects none
+{
+  let mut t = List.new();
+  let mut n = 0;
+  while n < 256 {
+    let mut c = n;
+    let mut k = 0;
+    while k < 8 {
+      if (c & 1) == 1 {
+        c = 3988292384 ^ c >> 1;
+      } else {
+        c = c >> 1;
+      }
+      k = k + 1;
+    }
+    t.push(c);
+    n = n + 1;
+  }
+  return t;
+}
+
+fn table_at(t: &List<Int>, i: Int) -> Int
+  intent "表の i 番目を返す（範囲外は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  return match t.get(i) {
+    Some(v) => v,
+    None => 0,
+  };
+}
+
+pub fn crc32_update(table: &List<Int>, crc: Int, data: &Bytes, start: Int, end: Int) -> Int
+  intent "data[start, end) を畳み込んだ CRC-32 の途中値を返す（初期値は 4294967295、最後に 4294967295 と XOR して確定する）"
+  requires start >= 0 && end >= start && end <= data.len()
+  ensures none
+  effects none
+{
+  let mut c = crc;
+  let mut i = start;
+  while i < end {
+    let b = data.get(i).unwrap_or(0);
+    c = table_at(&table, (c ^ b) & 255) ^ c >> 8;
+    i = i + 1;
+  }
+  return c;
+}
+
+pub fn crc32(data: &Bytes) -> Int
+  intent "data の CRC-32（gzip の trailer の値）を返す"
+  requires none
+  ensures result >= 0 && result <= 4294967295
+  effects none
+{
+  let table = crc32_table();
+  return crc32_update(&table, 4294967295, &data, 0, data.len()) ^ 4294967295;
+}

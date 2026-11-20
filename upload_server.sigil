@@ -1,0 +1,335 @@
+module upload_server
+  targets server
+  trust none
+
+use git.acl.FixedAcl;
+use git.acl.can_read;
+use git.acl.parse_fixed_acl;
+use git.acl.repo_id_ok;
+use git.fsio.cat3;
+use git.gzip.gzip_decode;
+use git.hash.int_to_str;
+use git.repo.Repo;
+use git.repo.open_repo;
+use git.upload.UploadReply;
+use git.upload.info_refs_reply;
+use git.upload.upload_pack_post;
+
+// ADR 0048 第 2 段の接続試験用サーバー。本物の Git クライアントが clone／fetch できる最小の Smart HTTP v0 の upload-pack だけを持つ。
+//   GET  /repos/<id>/info/refs?service=git-upload-pack
+//   POST /repos/<id>/git-upload-pack
+// 認証は ADR 0037 の固定 HMAC Bearer 検証器（std.web）。認可は git.acl の固定の表だけ（本格的な ACL は第 4 段）。
+// 順序: 経路の形と query の形 → Bearer 認証（401）→ 認可（読めなければ存在を明かさず 404）→ Content-Encoding の検査 → 本文の処理。
+// 環境変数: SIGIL_GIT_REPO_ROOT（`<id>.git` の置き場）、SIGIL_GIT_ACL（`repo:subject,subject;...`）、SIGIL_AUTH_HMAC_KEY_HEX、SIGIL_AUTH_AUDIENCE、
+// SIGIL_GIT_SERVE_CONNS（受け付ける接続の数。既定 64）、SIGIL_GIT_LOG_REQUESTS=1（POST の符号化前後の本文サイズを標準出力へ出す。試験用）。
+
+struct Ctx {
+  router: Router,
+  acl: FixedAcl,
+  root: String,
+  log: Bool,
+}
+
+fn authorize(req: &AppRequest) -> HttpResponse
+  intent "認証を通った主体を本文にして返す（認証・経路の検査だけを std.web のルーターに任せる。ルーターの処理は fs を持てない）"
+  requires none
+  ensures none
+  effects none
+{
+  return match req.identity() {
+    Some(identity) => HttpResponse.new(200, identity.subject().as_bytes()),
+    None => HttpResponse.new(500, "missing identity".as_bytes()),
+  };
+}
+
+fn build_router() -> Result<Router, ConfigError>
+  intent "Bearer 検証器つきのルーターを作る。起動設定が揃わなければ待ち受けない"
+  requires none
+  ensures none
+  effects clock, env
+{
+  let config = web.load_bearer_config()?;
+  let verifier = config.into_verifier()?;
+  let mut router = Router.new().with_auth(verifier);
+  router = router.route("GET", "/repos/:id/info/refs", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("POST", "/repos/:id/git-upload-pack", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  return Ok(router);
+}
+
+fn no_store(r: HttpResponse) -> HttpResponse
+  intent "全応答に Cache-Control: no-store を付ける"
+  requires none
+  ensures none
+  effects none
+{
+  return r.with_header(&"cache-control", &"no-store".as_bytes());
+}
+
+fn to_response(r: &UploadReply) -> HttpResponse
+  intent "upload-pack の応答を HTTP 応答にする"
+  requires 200 <= r.status && r.status <= 599
+  ensures none
+  effects none
+{
+  return no_store(HttpResponse.new(r.status, r.body.clone()).with_header(&"content-type", &r.content_type.as_bytes()));
+}
+
+fn plain(status: Int, text: &String) -> HttpResponse
+  intent "固定理由だけの応答を作る"
+  requires 200 <= status && status <= 599
+  ensures none
+  effects none
+{
+  return no_store(HttpResponse.new(status, text.as_bytes()).with_header(&"content-type", &"text/plain".as_bytes()));
+}
+
+fn segments(path: &Bytes) -> List<String>
+  intent "/ で分けた経路の項目を返す（先頭の空項目は除く）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut cur = Bytes.new();
+  let mut i = 0;
+  while i < path.len() {
+    let c = path.get(i).unwrap_or(0);
+    if c == 47 {
+      if cur.len() > 0 {
+        out.push(cur.to_string_utf8().unwrap_or(""));
+      }
+      cur = Bytes.new();
+    } else {
+      cur.push(c);
+    }
+    i = i + 1;
+  }
+  if cur.len() > 0 {
+    out.push(cur.to_string_utf8().unwrap_or(""));
+  }
+  return out;
+}
+
+fn seg_at(l: &List<String>, i: Int) -> String
+  intent "i 番目の項目（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v.clone(),
+    None => "",
+  };
+}
+
+fn encodings_of(req: &HttpRequest) -> List<Bytes>
+  intent "Content-Encoding の全ヘッダ行の値を集める（ヘッダ名は小文字化済み）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let hs = req.headers();
+  let mut i = 0;
+  while i < hs.len() {
+    match hs.get(i) {
+      Some(h) => {
+        if h.name() == "content-encoding" {
+          out.push(h.value());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
+  intent "1 つの要求を処理する"
+  requires none
+  ensures none
+  effects clock, console, db, env, fs, random, task
+{
+  let segs = segments(&req.path());
+  if segs.len() < 3 || seg_at(&segs, 0) != "repos" {
+    return no_store(ctx.router.dispatch(&req));
+  }
+  let id = seg_at(&segs, 1);
+  let upload_path = req.path() == cat3(&"/repos/", &id, &"/git-upload-pack").as_bytes();
+  let refs_path = req.path() == cat3(&"/repos/", &id, &"/info/refs").as_bytes();
+  if !upload_path && !refs_path {
+    return no_store(ctx.router.dispatch(&req));
+  }
+  if refs_path && req.query() != "service=git-upload-pack".as_bytes() {
+    return plain(400, &"invalid_query");
+  }
+  if upload_path && req.query().len() != 0 {
+    return plain(400, &"invalid_query");
+  }
+  let auth = ctx.router.dispatch(&req);
+  if auth.status() != 200 {
+    return no_store(auth);
+  }
+  let subject = auth.body().to_string_utf8().unwrap_or("");
+  if !repo_id_ok(&id) || !can_read(&ctx.acl, &subject, &id) {
+    return plain(404, &"not found");
+  }
+  let path = cat3(&cat3(&ctx.root, &"/", &id), &".git", &"");
+  return match open_repo(&path) {
+    Err(_) => plain(404, &"not found"),
+    Ok(repo) => respond(&ctx, &repo, &req, refs_path),
+  };
+}
+
+fn respond(ctx: &Ctx, repo: &Repo, req: &HttpRequest, refs_path: Bool) -> HttpResponse
+  intent "認証・認可の後に、info/refs か upload-pack の POST を処理する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if refs_path {
+    return to_response(&info_refs_reply(&repo, &req.query()));
+  }
+  let body = req.body();
+  if ctx.log {
+    log_sizes(&req, &body);
+  }
+  return to_response(&upload_pack_post(&repo, &encodings_of(&req), &req.header(&"content-type"), &body));
+}
+
+fn log_sizes(req: &HttpRequest, body: &Bytes)
+  intent "試験用: POST の符号化前後の本文サイズを標準出力へ出す"
+  requires none
+  ensures none
+  effects console
+{
+  let encs = encodings_of(&req);
+  let mut gz = false;
+  if encs.len() == 1 {
+    match encs.get(0) {
+      Some(v) => {
+        if v.clone() == "gzip".as_bytes() {
+          gz = true;
+        }
+      }
+      None => {}
+    }
+  }
+  if gz {
+    let n = match gzip_decode(&body) {
+      Ok(plain_body) => plain_body.len(),
+      Err(_) => 0 - 1,
+    };
+    let enc = int_to_str(body.len());
+    let dec = match n >= 0 {
+      true => int_to_str(n),
+      false => "invalid",
+    };
+    console.log(&cat3(&cat3(&"POST content-encoding=gzip encoded=", &enc, &" decoded="), &dec, &""));
+  } else {
+    console.log(&cat3(&"POST content-encoding=identity encoded=", &int_to_str(body.len()), &""));
+  }
+}
+
+fn limits() -> HttpLimits
+  intent "ADR 0048 決定 2・ADR 0052 の HTTP 上限（要求本文は gzip の符号化 2 MiB まで受け取り、identity の 1 MiB 超は処理側で 413。応答 1 MiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return http.default_limits().with_body(2097152).with_encoded_body(2162688);
+}
+
+fn read_conns() -> Int
+  intent "受け付ける接続の数（SIGIL_GIT_SERVE_CONNS。既定 64、範囲 1〜4096）"
+  requires none
+  ensures none
+  effects env
+{
+  match env.get(&"SIGIL_GIT_SERVE_CONNS") {
+    Some(t) => {
+      match t.parse_int() {
+        Ok(v) => {
+          if 1 <= v && v <= 4096 {
+            return v;
+          }
+        }
+        Err(_) => {}
+      }
+      return 64;
+    }
+    None => {
+      return 64;
+    }
+  }
+}
+
+fn serve(root: String, acl: FixedAcl, router: Router) -> Int
+  intent "待ち受けを開始し、受け付けた接続を順に処理して終了する"
+  requires none
+  ensures none
+  effects clock, console, db, env, fs, net.server, random, task
+{
+  let log = env.get(&"SIGIL_GIT_LOG_REQUESTS").unwrap_or("") == "1";
+  let shared = SyncShared.new(Ctx { router: router, acl: acl, root: root, log: log });
+  let n = read_conns();
+  match net.listen(&"127.0.0.1", 0, 16) {
+    Err(_) => {
+      return 2;
+    }
+    Ok(listener) => {
+      console.log(&listener.local_port());
+      let mut served = 0;
+      while served < n {
+        match listener.accept() {
+          Err(_) => {
+            return 3;
+          }
+          Ok(stream) => {
+            let conn = http.conn(stream);
+            let mine = shared.clone();
+            http.serve_conn(&conn, &limits(), move |req| {
+              let ctx = mine.borrow();
+              return handle(&ctx, &req);
+            });
+          }
+        }
+        served = served + 1;
+      }
+    }
+  }
+  return 0;
+}
+
+pub fn main() -> Int
+  intent "起動設定がすべて揃ってから待ち受け、受け付けた接続を順に処理して終了する（成功は 0）"
+  requires none
+  ensures none
+  effects clock, console, db, env, fs, net.server, random, task
+{
+  let root = env.get(&"SIGIL_GIT_REPO_ROOT").unwrap_or("");
+  let acl_text = env.get(&"SIGIL_GIT_ACL").unwrap_or("");
+  if root == "" {
+    console.log(&"missing SIGIL_GIT_REPO_ROOT");
+    return 1;
+  }
+  match parse_fixed_acl(&acl_text) {
+    Err(reason) => {
+      console.log(&reason);
+      return 1;
+    }
+    Ok(acl) => {
+      match build_router() {
+        Err(e) => {
+          console.log(&e.name());
+          return 1;
+        }
+        Ok(router) => {
+          return serve(root, acl, router);
+        }
+      }
+    }
+  }
+  return 1;
+}

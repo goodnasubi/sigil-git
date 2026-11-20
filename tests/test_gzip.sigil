@@ -1,0 +1,577 @@
+module tests.test_gzip
+  targets server
+  trust none
+
+use git.crc32.crc32;
+use git.gzip.Rejection;
+use git.gzip.compression_reason;
+use git.gzip.compression_status;
+use git.gzip.gzip_decode;
+use git.gzip.gzip_decode_limited;
+use git.gzip.rejection_of;
+use git.gzip.select_encoding;
+use git.hash.hex_to_bytes;
+use git.inflate.inflate_zlib;
+use git.zlib.adler32;
+
+// ADR 0052: gzip フレーム検査・CRC-32・ISIZE・窓・固定理由・HTTP 状態・Content-Encoding の選択を、固定 fixture で試す。
+// 既知ベクトルは Python の zlib／struct（独立実装）で作った。実際の Git が送る gzip は interop_upload.sh で確かめる。
+
+fn bytes_of(hex: &String) -> Bytes
+  intent "テスト用の 16 進文字列をバイト列にする"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_to_bytes(&hex).unwrap_or(Bytes.new());
+}
+
+fn fail(label: &String) -> Bool
+  intent "失敗したラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&label);
+  return false;
+}
+
+fn check_ok(label: &String, gz_hex: &String, want_hex: &String) -> Bool
+  intent "gzip を復号して期待する出力と一致するかを返す"
+  requires none
+  ensures none
+  effects console
+{
+  let z = bytes_of(&gz_hex);
+  return match gzip_decode(&z) {
+    Ok(out) => out == bytes_of(&want_hex) || fail(&label),
+    Err(_) => fail(&label),
+  };
+}
+
+fn reason_of(z: &Bytes, out_limit: Int, enc_limit: Int) -> String
+  intent "復号の結果が失敗なら固定理由、成功なら ok を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match gzip_decode_limited(&z, out_limit, enc_limit) {
+    Ok(_) => "ok",
+    Err(e) => compression_reason(&e),
+  };
+}
+
+fn check_rej(label: &String, gz_hex: &String, want: &String) -> Bool
+  intent "不正な gzip が固定理由で拒否され、HTTP 状態が表どおりかを返す"
+  requires none
+  ensures none
+  effects console
+{
+  let z = bytes_of(&gz_hex);
+  match gzip_decode(&z) {
+    Ok(_) => {
+      return fail(&label);
+    }
+    Err(e) => {
+      let r = rejection_of(&e);
+      if r.reason != want || r.status != compression_status(&want) {
+        return fail(&label);
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+fn pattern(n: Int) -> Bytes
+  intent "決定的なテスト用の内容（n byte）を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < n {
+    out.push((i * 31 + i / 256) % 256);
+    i = i + 1;
+  }
+  return out;
+}
+
+fn le32(out: &mut Bytes, v: Int)
+  intent "32 bit を little endian で追記する"
+  requires v >= 0
+  ensures none
+  effects none
+{
+  out.push(v % 256);
+  out.push(v / 256 % 256);
+  out.push(v / 65536 % 256);
+  out.push(v / 16777216 % 256);
+}
+
+fn stored_block(data: &Bytes, final: Bool) -> Bytes
+  intent "stored ブロック 1 つの deflate 表現（65535 byte 以下）を作る"
+  requires data.len() <= 65535
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  if final {
+    out.push(1);
+  } else {
+    out.push(0);
+  }
+  let n = data.len();
+  out.push(n % 256);
+  out.push(n / 256);
+  out.push((65535 - n) % 256);
+  out.push((65535 - n) / 256);
+  out.extend(&data);
+  return out;
+}
+
+fn gzip_of(deflate: &Bytes, plain: &Bytes) -> Bytes
+  intent "ヘッダ（任意項目なし）と trailer を付けて gzip にする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = bytes_of(&"1f8b0800000000000003");
+  out.extend(&deflate);
+  le32(&mut out, crc32(&plain));
+  le32(&mut out, plain.len());
+  return out;
+}
+
+fn with_match(payload: &Bytes, match_hex: &String) -> Bytes
+  intent "payload の stored ブロック（最終でない）の後に、長さ 3 の後方参照の固定 Huffman ブロック（最終）を付けた deflate を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut d = stored_block(&payload, false);
+  d.extend(&bytes_of(&match_hex));
+  return d;
+}
+
+fn expected_with_match(payload: &Bytes, dist: Int) -> Bytes
+  intent "payload の後ろに、dist byte 戻った 3 byte の複製を足した期待値を作る"
+  requires dist >= 1
+  ensures none
+  effects none
+{
+  let mut e = Bytes.new();
+  e.extend(&payload);
+  let start = payload.len() - dist;
+  let mut i = 0;
+  while i < 3 {
+    let b = e.get(start + i).unwrap_or(0);
+    e.push(b);
+    i = i + 1;
+  }
+  return e;
+}
+
+fn run_window_tests() -> Bool
+  intent "後方距離の窓の境界（gzip の 32 KiB ちょうど、zlib の CINFO の宣言窓）を試す"
+  requires none
+  ensures none
+  effects console
+{
+  let big = pattern(32768);
+  let gz_ok = gzip_of(&with_match(&big, &"03deff0f00"), &expected_with_match(&big, 32768));
+  match gzip_decode(&gz_ok) {
+    Ok(out) => {
+      if out != expected_with_match(&big, 32768) {
+        return fail(&"gzip: distance 32768 output");
+      }
+    }
+    Err(_) => {
+      return fail(&"gzip: distance 32768 accepted");
+    }
+  }
+  // 宣言窓 256 byte の zlib（CINFO = 0）。距離 256 は受理、257 は履歴があっても invalid_compressed_data。
+  let small = pattern(300);
+  let mut z_ok = bytes_of(&"081d");
+  z_ok.extend(&with_match(&small, &"03fa1f00"));
+  let e_ok = expected_with_match(&small, 256);
+  let a_ok = adler32(&e_ok);
+  z_ok.push(a_ok / 16777216 % 256);
+  z_ok.push(a_ok / 65536 % 256);
+  z_ok.push(a_ok / 256 % 256);
+  z_ok.push(a_ok % 256);
+  match inflate_zlib(&z_ok, 0, 1000000) {
+    Ok(r) => {
+      if r.data != e_ok || r.consumed != z_ok.len() {
+        return fail(&"zlib window 256: distance 256 output");
+      }
+    }
+    Err(_) => {
+      return fail(&"zlib window 256: distance 256 accepted");
+    }
+  }
+  let mut z_bad = bytes_of(&"081d");
+  z_bad.extend(&with_match(&small, &"03060000"));
+  let e_bad = expected_with_match(&small, 257);
+  let a_bad = adler32(&e_bad);
+  z_bad.push(a_bad / 16777216 % 256);
+  z_bad.push(a_bad / 65536 % 256);
+  z_bad.push(a_bad / 256 % 256);
+  z_bad.push(a_bad % 256);
+  match inflate_zlib(&z_bad, 0, 1000000) {
+    Ok(_) => {
+      return fail(&"zlib window 256: distance 257 must be rejected");
+    }
+    Err(e) => {
+      if compression_reason(&e) != "invalid_compressed_data" {
+        return fail(&"zlib window 256: distance 257 reason");
+      }
+    }
+  }
+  // 同じ距離 257 でも CINFO = 7（32 KiB）なら受理される（窓の宣言に結び付いている）。
+  let mut z_wide = bytes_of(&"78da");
+  z_wide.extend(&with_match(&small, &"03060000"));
+  z_wide.push(a_bad / 16777216 % 256);
+  z_wide.push(a_bad / 65536 % 256);
+  z_wide.push(a_bad / 256 % 256);
+  z_wide.push(a_bad % 256);
+  match inflate_zlib(&z_wide, 0, 1000000) {
+    Ok(r) => {
+      if r.data != e_bad {
+        return fail(&"zlib window 32K: distance 257 output");
+      }
+    }
+    Err(_) => {
+      return fail(&"zlib window 32K: distance 257 accepted");
+    }
+  }
+  return true;
+}
+
+fn run_limit_tests() -> Bool
+  intent "符号化入力・展開量の上限の直下・一致・超過と、ADR 0052 の検査順序の重なりを試す"
+  requires none
+  ensures none
+  effects console
+{
+  let t1 = bytes_of(&"1f8b0800000000000003cb48cdc9c957c84027b9000088590b18000000");
+  if reason_of(&t1, 24, 1000) != "ok" {
+    return fail(&"limit: output exactly at the limit");
+  }
+  if reason_of(&t1, 23, 1000) != "compression_limit_exceeded" {
+    return fail(&"limit: output one byte over");
+  }
+  if reason_of(&t1, 1000, t1.len()) != "ok" {
+    return fail(&"limit: encoded exactly at the limit");
+  }
+  if reason_of(&t1, 1000, t1.len() - 1) != "compression_limit_exceeded" {
+    return fail(&"limit: encoded one byte over");
+  }
+  // 出力が上限ちょうどで次の符号が破損 → invalid、有効な単位が先に上限を超え後続が破損 → limit
+  let mut two = stored_block(&"ab".as_bytes(), false);
+  two.push(7);
+  let g2 = gzip_of(&two, &"ab".as_bytes());
+  if reason_of(&g2, 2, 1000) != "invalid_compressed_data" {
+    return fail(&"order: output at the limit then corrupt");
+  }
+  let mut three = stored_block(&"abc".as_bytes(), false);
+  three.push(7);
+  let g3 = gzip_of(&three, &"abc".as_bytes());
+  if reason_of(&g3, 2, 1000) != "compression_limit_exceeded" {
+    return fail(&"order: unit over the limit then corrupt");
+  }
+  // 有効な単位が上限を超え、後続の検査値も不一致 → limit
+  let mut bad_crc = bytes_of(&"1f8b0800000000000003cb48cdc9c957c84027b900");
+  le32(&mut bad_crc, 1);
+  le32(&mut bad_crc, 24);
+  if reason_of(&bad_crc, 3, 1000) != "compression_limit_exceeded" {
+    return fail(&"order: over the limit then CRC mismatch");
+  }
+  if reason_of(&bad_crc, 1000, 1000) != "invalid_compressed_data" {
+    return fail(&"order: CRC mismatch within the limit");
+  }
+  // gzip ヘッダ不正かつ符号化本文が上限ちょうど → invalid、1 byte 超過 → limit
+  let mut hdr_bad = Bytes.new();
+  let mut i = 0;
+  while i < 40 {
+    hdr_bad.push(0);
+    i = i + 1;
+  }
+  if reason_of(&hdr_bad, 1000, 40) != "invalid_compressed_data" {
+    return fail(&"order: bad header at the encoded limit");
+  }
+  if reason_of(&hdr_bad, 1000, 39) != "compression_limit_exceeded" {
+    return fail(&"order: bad header over the encoded limit");
+  }
+  // 打切りは、出力が予算内なら truncated。途中の入力でも上限超過が先に判定される。
+  let cut = t1.slice(0, 20).unwrap_or(Bytes.new());
+  if reason_of(&cut, 1000, 1000) != "truncated_compressed_data" {
+    return fail(&"order: truncated within the limit");
+  }
+  // 固定の上限（符号化 2 MiB・展開後 1 MiB）は定数どおり。
+  let mut over = Bytes.new();
+  let mut k = 0;
+  while k < 2097153 {
+    over.push(0);
+    k = k + 1;
+  }
+  if reason_of(&over, 1048576, 2097152) != "compression_limit_exceeded" {
+    return fail(&"limit: encoded 2 MiB + 1");
+  }
+  return true;
+}
+
+fn rejection_text(r: &Result<Bool, Rejection>) -> String
+  intent "Content-Encoding の選択結果を「gzip／identity／理由:状態」の文字列にする"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(g) => match g {
+      true => "gzip",
+      false => "identity",
+    },
+    Err(_) => "rejected",
+  };
+}
+
+fn run_encoding_tests() -> Bool
+  intent "Content-Encoding の選択（ADR 0052 検査順序 1）を試す"
+  requires none
+  ensures none
+  effects console
+{
+  let none_h = List.new();
+  match select_encoding(&none_h, true) {
+    Ok(g) => {
+      if g {
+        return fail(&"encoding: none must be identity");
+      }
+    }
+    Err(_) => {
+      return fail(&"encoding: none accepted");
+    }
+  }
+  match select_encoding(&none_h, false) {
+    Ok(g) => {
+      if g {
+        return fail(&"encoding: none (not upload-pack) must be identity");
+      }
+    }
+    Err(_) => {
+      return fail(&"encoding: none (not upload-pack) accepted");
+    }
+  }
+  let cases = words(&"identity|IDENTITY| Identity |gzip|GZIP|Gzip|x-gzip|X-Gzip|deflate|br|gzip, gzip|gzip,identity|identity, gzip|compress|chunked||gzip;q=1");
+  // 期待: 先頭 6 件の後 → identity, identity, identity, gzip, gzip, gzip, 以降は拒否
+  let want = words(&"identity|identity|identity|gzip|gzip|gzip|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected");
+  let mut i = 0;
+  while i < cases.len() {
+    let mut hs = List.new();
+    let c = match cases.get(i) {
+      Some(v) => v.clone(),
+      None => "",
+    };
+    if c == "" {
+      hs.push(Bytes.new());
+    } else {
+      hs.push(c.as_bytes());
+    }
+    let r = select_encoding(&hs, true);
+    let w = match want.get(i) {
+      Some(v) => v.clone(),
+      None => "?",
+    };
+    if rejection_text(&r) != w {
+      console.log(&c);
+      return fail(&"encoding: case mismatch");
+    }
+    if w == "rejected" {
+      match r {
+        Err(e) => {
+          if e.status != 415 || e.reason != "unsupported_content_encoding" {
+            return fail(&"encoding: rejection must be 415 unsupported_content_encoding");
+          }
+        }
+        Ok(_) => {
+          return fail(&"encoding: unexpected ok");
+        }
+      }
+    }
+    i = i + 1;
+  }
+  // upload-pack POST 以外の gzip は拒否、identity は受理。
+  let mut gz_h = List.new();
+  gz_h.push("gzip".as_bytes());
+  match select_encoding(&gz_h, false) {
+    Ok(_) => {
+      return fail(&"encoding: gzip outside upload-pack POST must be rejected");
+    }
+    Err(e) => {
+      if e.status != 415 {
+        return fail(&"encoding: gzip outside upload-pack POST status");
+      }
+    }
+  }
+  // 複数のヘッダ行は、同じ値でも多重符号化として拒否する。
+  let mut two_h = List.new();
+  two_h.push("gzip".as_bytes());
+  two_h.push("gzip".as_bytes());
+  match select_encoding(&two_h, true) {
+    Ok(_) => {
+      return fail(&"encoding: repeated header lines must be rejected");
+    }
+    Err(_) => {}
+  }
+  return true;
+}
+
+fn words(s: &String) -> List<String>
+  intent "| 区切りの文字列を分割する（空の項目も 1 件として扱う）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut out = List.new();
+  let mut cur = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 124 {
+      out.push(cur.to_string_utf8().unwrap_or(""));
+      cur = Bytes.new();
+    } else {
+      cur.push(c);
+    }
+    i = i + 1;
+  }
+  out.push(cur.to_string_utf8().unwrap_or(""));
+  return out;
+}
+
+fn run_prefix_tests() -> Bool
+  intent "完結した gzip の真の接頭辞がすべて truncated_compressed_data で拒否されることを試す"
+  requires none
+  ensures none
+  effects console
+{
+  let g = bytes_of(&"1f8b0800000000000003cb48cdc9c957c84027b9000088590b18000000");
+  let mut n = 0;
+  while n < g.len() {
+    let p = g.slice(0, n).unwrap_or(Bytes.new());
+    if reason_of(&p, 1000, 1000) != "truncated_compressed_data" {
+      console.log(&"prefix length");
+      return fail(&"prefix: not truncated");
+    }
+    n = n + 1;
+  }
+  let h = bytes_of(&"1f8b081e000000000003060058590200616266696c652e7478740063003cedcb48cdc9c957c84027b9000088590b18000000");
+  let mut m = 0;
+  while m < h.len() {
+    let p = h.slice(0, m).unwrap_or(Bytes.new());
+    if reason_of(&p, 1000, 1000) != "truncated_compressed_data" {
+      return fail(&"prefix (optional fields): not truncated");
+    }
+    m = m + 1;
+  }
+  return true;
+}
+
+pub fn run_gzip_tests() -> Bool
+  intent "git.crc32／git.gzip の全テストを実行し全合格なら true を返す"
+  requires none
+  ensures none
+  effects console
+{
+  if crc32(&"123456789".as_bytes()) != 3421780262 || crc32(&Bytes.new()) != 0 {
+    return fail(&"crc32 known values");
+  }
+  if compression_status(&"invalid_compressed_data") != 400 || compression_status(&"truncated_compressed_data") != 400 || compression_status(&"unsupported_preset_dictionary") != 400 || compression_status(&"trailing_compressed_data") != 400 || compression_status(&"compression_limit_exceeded") != 413 || compression_status(&"unsupported_content_encoding") != 415 {
+    return fail(&"status table");
+  }
+  match gzip_decode(&bytes_of(&"1f8b0800000000000003cb48cdc9c957c84027b9000088590b18000000")) {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"decode: plain gzip");
+    }
+  }
+  if !check_ok(&"empty", &"1f8b080000000000000303000000000000000000", &"") {
+    return false;
+  }
+  if !check_ok(&"fixed", &"1f8b0800000000000003cb48cdc9c957c84027b9000088590b18000000", &"68656c6c6f2068656c6c6f2068656c6c6f2068656c6c6f0a") {
+    return false;
+  }
+  if !check_ok(&"dynamic", &"1f8b08000000000000037d945d0e02210c84afb2578368d464fd49f4a9a7d7dda2fda6253ec042a1d3693b8b1d5f6d39b5ebb52ddbaaad8f735bfab6dc270be3e1b8ea85efd8377efab3e31afde66823fce37959efb7250839da30c3e4bef68bdd33ecebfce5b15ff2adcf464cbfedc84c601cc363208e83881a642d96111e65309dc80970121979e9014b850e812faae55696474b3a6c6320724e46dda63ca23b20e04b0663f31d3f49607c451e523eb711210fe49ef38788183d0b1ee5ff7321caa739e456f744aacea2ae1c5105c0f4f137d02c68420a7a852f3b1339710f7979887fd20432fc6cf65e10bd10a27a01a47f60eda55e54291451b26c143dd7969d5882ae81abc8b52a931ad5c7cf1d4da95702550f35b3f29a645952484a11f9b1133df5559d28ea59c6b951a94759249fd51b1e471d75a6060000", &"7a6574612067616d6d612065746120616c70686120626574612062657461207a65746120616c7068612064656c746120616c7068612062657461206574612065746120626574612064656c746120626574612065746120616c70686120626574612064656c746120616c7068612065746120616c7068612064656c746120616c7068612067616d6d6120657073696c6f6e206574612067616d6d61206265746120657073696c6f6e2067616d6d6120626574612064656c7461207a6574612062657461206265746120616c7068612064656c746120746865746120657461207a657461207468657461207468657461207a65746120657073696c6f6e2064656c74612067616d6d612064656c7461206265746120657073696c6f6e207468657461207a65746120746865746120657073696c6f6e20626574612062657461206574612067616d6d61207a6574612067616d6d612074686574612065746120616c7068612062657461207a657461207a657461207a6574612074686574612074686574612062657461206265746120657073696c6f6e207468657461206265746120616c70686120657073696c6f6e20746865746120657073696c6f6e20657461207a65746120616c706861207468657461207a6574612067616d6d61206265746120746865746120616c7068612064656c746120657073696c6f6e2067616d6d612064656c7461206574612065746120746865746120626574612067616d6d612074686574612065746120657073696c6f6e2067616d6d612065746120657073696c6f6e20657461207a657461206574612064656c74612067616d6d6120626574612067616d6d612067616d6d612064656c74612064656c746120616c7068612074686574612067616d6d6120657073696c6f6e20657073696c6f6e20616c7068612067616d6d6120657461207a657461207a6574612067616d6d6120616c7068612074686574612065746120657461206574612065746120626574612074686574612065746120616c7068612064656c746120626574612064656c74612074686574612067616d6d612062657461207a65746120616c706861206265746120616c7068612067616d6d612062657461207a65746120616c70686120626574612064656c7461206574612067616d6d6120657073696c6f6e207a657461207a6574612074686574612062657461206265746120746865746120746865746120746865746120746865746120657073696c6f6e20626574612067616d6d612062657461207a65746120657073696c6f6e2074686574612067616d6d6120616c7068612064656c7461207a6574612067616d6d6120616c70686120657073696c6f6e206265746120657073696c6f6e207a6574612067616d6d61207a6574612064656c7461207a6574612064656c74612064656c74612064656c7461206574612064656c74612064656c7461207468657461207a65746120616c70686120616c70686120657073696c6f6e20746865746120657073696c6f6e2064656c7461207a657461207468657461207a657461207a65746120626574612064656c746120626574612064656c74612074686574612064656c7461207a6574612064656c746120746865746120616c706861207468657461207a65746120626574612062657461206574612064656c74612074686574612067616d6d6120657461207a6574612062657461206574612074686574612065746120626574612067616d6d612067616d6d612067616d6d6120616c7068612067616d6d612074686574612067616d6d61207468657461207a6574612067616d6d612067616d6d6120616c70686120616c70686120626574612067616d6d61206574612064656c74612064656c746120616c70686120657073696c6f6e2064656c746120657073696c6f6e2064656c7461207a65746120657073696c6f6e206574612067616d6d6120616c706861207a657461207468657461206574612067616d6d612067616d6d6120616c7068612074686574612067616d6d6120616c7068612067616d6d612067616d6d612067616d6d61207468657461206265746120616c706861207a657461207468657461206265746120616c7068612064656c74612064656c746120657073696c6f6e20616c706861206265746120746865746120616c7068612062657461207468657461207a6574612064656c746120657073696c6f6e2074686574612074686574612064656c746120657073696c6f6e2064656c74612074686574612067616d6d6120657461206265746120657461207468657461207a65746120626574612064656c746120657461") {
+    return false;
+  }
+  if !check_ok(&"stored_multi", &"1f8b0800000000000003000000ffff000200fdff6162010200fdff636411cd82ed04000000", &"61626364") {
+    return false;
+  }
+  if !check_ok(&"optional", &"1f8b081e000000000003060058590200616266696c652e7478740063003cedcb48cdc9c957c84027b9000088590b18000000", &"68656c6c6f2068656c6c6f2068656c6c6f2068656c6c6f0a") {
+    return false;
+  }
+  if !check_ok(&"fname_only", &"1f8b08080000000000036e00cb48cdc9c957c84027b9000088590b18000000", &"68656c6c6f2068656c6c6f2068656c6c6f2068656c6c6f0a") {
+    return false;
+  }
+  if !check_ok(&"fhcrc_only", &"1f8b0802000000000003a777cb48cdc9c957c84027b9000088590b18000000", &"68656c6c6f2068656c6c6f2068656c6c6f2068656c6c6f0a") {
+    return false;
+  }
+  if !check_rej(&"bad_id1", &"1e8b0800000000000003cb48cdc9c957c84027b9000088590b18000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"bad_id2", &"1f8c0800000000000003cb48cdc9c957c84027b9000088590b18000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"bad_method", &"1f8b0700000000000003cb48cdc9c957c84027b9000088590b18000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"reserved_flag", &"1f8b0820000000000003cb48cdc9c957c84027b9000088590b18000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"bad_fhcrc", &"1f8b0802000000000003d204cb48cdc9c957c84027b9000088590b18000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"bad_crc", &"1f8b0800000000000003cb48cdc9c957c84027b9000188590b18000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"bad_isize", &"1f8b0800000000000003cb48cdc9c957c84027b9000088590b19000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"bad_block_type", &"1f8b0800000000000003070000000000000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"far_distance", &"1f8b08000000000000030302002d7307f003000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"reserved_dist_sym", &"1f8b0800000000000003033e000000000000000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"stored_nlen", &"1f8b08000000000000030105000000616263646565d8878505000000", &"invalid_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"trailing_byte", &"1f8b0800000000000003cb48cdc9c957c84027b9000088590b1800000000", &"trailing_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"concat", &"1f8b0800000000000003cb48cdc9c957c84027b9000088590b180000001f8b0800000000000003cb48cdc9c957c84027b9000088590b18000000", &"trailing_compressed_data") {
+    return false;
+  }
+  if !check_rej(&"empty_input", &"", &"truncated_compressed_data") {
+    return false;
+  }
+  if !run_prefix_tests() {
+    return false;
+  }
+  if !run_window_tests() {
+    return false;
+  }
+  if !run_limit_tests() {
+    return false;
+  }
+  if !run_encoding_tests() {
+    return false;
+  }
+  return true;
+}

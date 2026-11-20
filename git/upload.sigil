@@ -1,0 +1,682 @@
+module git.upload
+  targets server
+  trust none
+
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.error.GitError;
+use git.fsio.cat3;
+use git.gzip.gzip_decode;
+use git.gzip.rejection_of;
+use git.gzip.select_encoding;
+use git.gzip.trimmed_lower;
+use git.hash.bytes_to_hex;
+use git.hash.is_valid_hex_id;
+use git.limits.max_graph_walk_items;
+use git.limits.max_transfer_objects;
+use git.limits.max_transfer_response_size;
+use git.object.ObjectType;
+use git.odb.odb_read_in;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.pktline.PktLine;
+use git.pktline.pkt_encode;
+use git.pktline.pkt_encode_str;
+use git.pktline.pkt_flush;
+use git.pktline.pkt_read;
+use git.repo.Repo;
+use git.tag.decode_tag;
+use git.tag.tag_object_id;
+use git.transfer.AdvSet;
+use git.transfer.advertise_upload_pack;
+use git.transfer.check_requested_capabilities;
+use git.transfer.collect_adv_set;
+use git.tree.decode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.walk.index_of;
+use git.wirepack.wire_pack_build_limited;
+
+// ADR 0048 決定 1「clone・fetch」/ ADR 0052: upload-pack の要求処理（Smart HTTP v0）。
+// - 参照広告: 第 1 段の能力広告に `# service=git-upload-pack` の前置きと flush を付け、全体を 1 MiB に収める。
+// - POST: Content-Encoding（identity／単一 gzip）→ 展開（上限付き・全検証後）→ pkt-line の want／have／done。
+//   want は公開した実参照の先端だけ（peeled 行だけを根拠にした OID は許さない）。have は公開した履歴にあるものだけを
+//   共通とみなし、無い・未公開・存在しないは見分けのつかない同じ応答にする（情報を漏らさない）。
+//   基本の ACK／NAK（multi_ack なし）。pack は want からの完全な到達集合を、第 1 段の wire 専用 pack v2 で送る。
+//   side-band-64k が要求されたら channel 1 に pack、pack 構築の失敗は channel 3、最後に flush。応答全体（ACK・side-band・trailer を含む）が
+//   1 MiB に収まることを送信前に確かめ、超えれば pack を送らず明示的に失敗する。
+// - 未対応（shallow／deepen／filter など）は黙って成功させず拒否する。
+
+pub struct UploadReply {
+  status: Int,
+  content_type: String,
+  body: Bytes,
+}
+
+pub struct UploadRequest {
+  wants: List<String>,
+  haves: List<String>,
+  caps: List<String>,
+  done: Bool,
+}
+
+fn text_reply(status: Int, reason: &String) -> UploadReply
+  intent "固定理由だけを本文にした text/plain の応答を作る（入力の内容・内部の文言・秘密を含めない）"
+  requires 200 <= status && status <= 599
+  ensures none
+  effects none
+{
+  return UploadReply { status: status, content_type: "text/plain", body: reason.as_bytes() };
+}
+
+fn result_reply(body: Bytes) -> UploadReply
+  intent "upload-pack の結果（200）の応答を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return UploadReply { status: 200, content_type: "application/x-git-upload-pack-result", body: body };
+}
+
+fn err_pkt(text: &String) -> Bytes
+  intent "pkt-line の ERR 行を作る（Git 応答の開始前の拒否）"
+  requires none
+  ensures none
+  effects none
+{
+  return pkt_encode_str(&cat3(&"ERR ", &text, &"")).unwrap_or(Bytes.new());
+}
+
+fn reply_for_error(err: &GitError) -> UploadReply
+  intent "要求・リポジトリの失敗を、固定理由の HTTP 応答か Git の ERR 行にする"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.LimitExceeded(_) => text_reply(413, &"limit_exceeded"),
+    GitError.Corrupt(_) => text_reply(400, &"invalid_request"),
+    GitError.UnsupportedFormat(_) => result_reply(err_pkt(&"upload-pack: unsupported request")),
+    GitError.NotFound(_) => text_reply(500, &"repository_error"),
+    _ => text_reply(500, &"repository_error"),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 参照広告
+// ---------------------------------------------------------------------------
+
+pub fn frame_advertisement(adv: &Bytes, limit: Int) -> Result<Bytes, GitError>
+  intent "参照広告の本体に `# service=git-upload-pack` の pkt-line と flush を前置きする。前置きを含めた全体が limit を超えるなら LimitExceeded"
+  requires limit >= 0
+  ensures none
+  effects none
+{
+  let mut out = pkt_encode_str(&"# service=git-upload-pack\n")?;
+  out.extend(&pkt_flush());
+  out.extend(&adv);
+  if out.len() > limit {
+    return Err(GitError.LimitExceeded("advertisement exceeds the response limit"));
+  }
+  return Ok(out);
+}
+
+pub fn upload_advertisement(repo: &Repo) -> Result<Bytes, GitError>
+  intent "GET info/refs?service=git-upload-pack の応答本体を作る。参照数 1024・応答 1 MiB（前置きと peeled 行を含む全体）を超えれば LimitExceeded"
+  requires none
+  ensures none
+  effects fs
+{
+  let set = collect_adv_set(&repo)?;
+  let adv = advertise_upload_pack(&set.refs, &set.head_id, &set.head_symref)?;
+  return frame_advertisement(&adv, max_transfer_response_size());
+}
+
+pub fn info_refs_reply(repo: &Repo, query: &Bytes) -> UploadReply
+  intent "GET info/refs の応答を作る（認証・認可の後）。query は `service=git-upload-pack` ちょうど 1 つだけを受理し、重複・余分・別 service は 400。広告できなければ明示的に失敗し、成功表示を出さない"
+  requires none
+  ensures none
+  effects fs
+{
+  if query != "service=git-upload-pack".as_bytes() {
+    return text_reply(400, &"invalid_query");
+  }
+  return match upload_advertisement(&repo) {
+    Ok(body) => UploadReply { status: 200, content_type: "application/x-git-upload-pack-advertisement", body: body },
+    Err(e) => reply_for_error(&e),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 要求の解読
+// ---------------------------------------------------------------------------
+
+fn strip_lf(b: &Bytes) -> Bytes
+  intent "末尾の LF を 1 つだけ除く"
+  requires none
+  ensures none
+  effects none
+{
+  if b.len() > 0 && b.get(b.len() - 1).unwrap_or(0) == 10 {
+    return b.slice(0, b.len() - 1).unwrap_or(Bytes.new());
+  }
+  return b.clone();
+}
+
+fn split_spaces(b: &Bytes) -> Result<List<String>, GitError>
+  intent "空白 1 つ区切りの項目に分ける。空の項目（連続した空白）は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut cur = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 32 {
+      if cur.len() == 0 {
+        return Err(GitError.Corrupt("empty token in a request line"));
+      }
+      out.push(cur.to_string_utf8().map_err(|e| GitError.Corrupt("request line is not UTF-8"))?);
+      cur = Bytes.new();
+    } else {
+      cur.push(c);
+    }
+    i = i + 1;
+  }
+  if cur.len() == 0 {
+    if b.len() > 0 {
+      return Err(GitError.Corrupt("empty token in a request line"));
+    }
+    return Ok(out);
+  }
+  out.push(cur.to_string_utf8().map_err(|e| GitError.Corrupt("request line is not UTF-8"))?);
+  return Ok(out);
+}
+
+fn tok_at(toks: &List<String>, i: Int) -> String
+  intent "i 番目の項目を返す（範囲外は空文字列）"
+  requires none
+  ensures none
+  effects none
+{
+  return match toks.get(i) {
+    Some(t) => t.clone(),
+    None => "",
+  };
+}
+
+fn is_unsupported_line(name: &String) -> Bool
+  intent "未対応と明記した要求行（shallow／deepen／filter）か"
+  requires none
+  ensures none
+  effects none
+{
+  return name == "shallow" || name == "deepen" || name == "deepen-since" || name == "deepen-not" || name == "deepen-relative" || name == "filter";
+}
+
+fn push_unique(list: &mut List<String>, id: &String)
+  intent "重複しないときだけ追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if index_of(&list, &id) < 0 {
+    list.push(id.clone());
+  }
+}
+
+pub fn parse_upload_request(body: &Bytes) -> Result<UploadRequest, GitError>
+  intent "want／flush、have／done または flush の v0 要求を読む。want の識別子は 64 桁の小文字 hex、能力は最初の want 行だけ。未対応の行（shallow／deepen／filter）は UnsupportedFormat、それ以外の不正・余剰・終端なしは Corrupt、1 pkt-line 65520 byte 超は LimitExceeded"
+  requires none
+  ensures none
+  effects none
+{
+  let mut wants = List.new();
+  let mut haves = List.new();
+  let mut caps = List.new();
+  let mut done = false;
+  let mut pos = 0;
+  let mut phase = 0;
+  let mut finished = false;
+  while !finished {
+    if pos >= body.len() {
+      return Err(GitError.Corrupt("request ended before its terminator"));
+    }
+    let r = pkt_read(&body, pos)?;
+    pos = r.next;
+    match r.line {
+      PktLine.Flush => {
+        if phase == 0 {
+          if wants.len() == 0 {
+            if pos != body.len() {
+              return Err(GitError.Corrupt("trailing data after an empty request"));
+            }
+            finished = true;
+          } else {
+            phase = 1;
+          }
+        } else {
+          finished = true;
+        }
+      }
+      PktLine.Data(payload) => {
+        let line = strip_lf(&payload);
+        if phase == 0 {
+          let toks = split_spaces(&line)?;
+          let name = tok_at(&toks, 0);
+          if name == "want" {
+            if toks.len() < 2 {
+              return Err(GitError.Corrupt("want without an object id"));
+            }
+            let id = tok_at(&toks, 1);
+            if !is_valid_hex_id(&id) {
+              return Err(GitError.Corrupt("want object id is not a SHA-256 object id"));
+            }
+            if wants.len() == 0 {
+              let mut k = 2;
+              while k < toks.len() {
+                caps.push(tok_at(&toks, k));
+                k = k + 1;
+              }
+            } else if toks.len() != 2 {
+              return Err(GitError.Corrupt("capabilities are allowed on the first want only"));
+            }
+            push_unique(&mut wants, &id);
+          } else if is_unsupported_line(&name) {
+            return Err(GitError.UnsupportedFormat("unsupported request line"));
+          } else {
+            return Err(GitError.Corrupt("unexpected line in the want section"));
+          }
+        } else {
+          if line == "done".as_bytes() {
+            done = true;
+            finished = true;
+          } else {
+            let toks = split_spaces(&line)?;
+            let name = tok_at(&toks, 0);
+            if name != "have" || toks.len() != 2 {
+              return Err(GitError.Corrupt("unexpected line in the have section"));
+            }
+            let id = tok_at(&toks, 1);
+            if !is_valid_hex_id(&id) {
+              return Err(GitError.Corrupt("have object id is not a SHA-256 object id"));
+            }
+            push_unique(&mut haves, &id);
+          }
+        }
+      }
+    }
+  }
+  if pos != body.len() {
+    return Err(GitError.Corrupt("trailing data after the request terminator"));
+  }
+  return Ok(UploadRequest { wants: wants, haves: haves, caps: caps, done: done });
+}
+
+// ---------------------------------------------------------------------------
+// 到達集合と公開した履歴
+// ---------------------------------------------------------------------------
+
+fn count_item(left: Int) -> Result<Int, GitError>
+  intent "走査件数を 1 つ使う。使い切っていれば LimitExceeded"
+  requires none
+  ensures none
+  effects none
+{
+  if left <= 0 {
+    return Err(GitError.LimitExceeded("graph walk exceeds the limit"));
+  }
+  return Ok(left - 1);
+}
+
+pub fn reachable_objects(repo: &Repo, packs: &List<PackStore>, tips: &List<String>, object_limit: Int, walk_budget: Int) -> Result<List<String>, GitError>
+  intent "tips から到達できるすべてのオブジェクト（commit の tree と親、tree のエントリ（gitlink を除く）、tag の対象）の識別子を、重複なく決定的な順（幅優先。先頭から取り出し、末尾に足す）で集める。オブジェクト数が object_limit、走査件数が walk_budget を超えれば LimitExceeded。各オブジェクトは 0047 の核で読み、識別子を再計算して検証する"
+  requires object_limit >= 0 && walk_budget >= 0
+  ensures none
+  effects fs
+{
+  let mut seen = List.new();
+  let mut queue = List.new();
+  let mut t = 0;
+  while t < tips.len() {
+    queue.push(tok_at(&tips, t));
+    t = t + 1;
+  }
+  let mut head = 0;
+  let mut left = walk_budget;
+  while head < queue.len() {
+    let id = tok_at(&queue, head);
+    head = head + 1;
+    left = count_item(left)?;
+    if index_of(&seen, &id) < 0 {
+      if seen.len() >= object_limit {
+        return Err(GitError.LimitExceeded("too many objects in one transfer"));
+      }
+      let o = odb_read_in(&repo, &packs, &id)?;
+      seen.push(id.clone());
+      match o.obj_type {
+        ObjectType.Blob => {}
+        ObjectType.Commit => {
+          let c = decode_commit(&o.content)?;
+          queue.push(commit_tree_id(&c));
+          let parents = commit_parents(&c);
+          let mut i = 0;
+          while i < parents.len() {
+            queue.push(tok_at(&parents, i));
+            i = i + 1;
+          }
+        }
+        ObjectType.Tree => {
+          let entries = decode_tree(&o.content)?;
+          let mut i = 0;
+          while i < entries.len() {
+            match entries.get(i) {
+              None => {}
+              Some(e) => {
+                if entry_mode(&e) != 160000 {
+                  queue.push(bytes_to_hex(&entry_id(&e)));
+                }
+              }
+            }
+            i = i + 1;
+          }
+        }
+        ObjectType.Tag => {
+          let tg = decode_tag(&o.content)?;
+          queue.push(tag_object_id(&tg));
+        }
+      }
+    }
+  }
+  return Ok(seen);
+}
+
+pub fn published_history(repo: &Repo, packs: &List<PackStore>, tips: &List<String>, walk_budget: Int) -> Result<List<String>, GitError>
+  intent "公開した参照の先端から、commit の親と tag の対象をたどって到達できる識別子（先端を含む）を集める。tree と blob には入らない。have が共通かどうかの判定にだけ使う。走査件数が walk_budget を超えれば LimitExceeded"
+  requires walk_budget >= 0
+  ensures none
+  effects fs
+{
+  let mut seen = List.new();
+  let mut queue = List.new();
+  let mut t = 0;
+  while t < tips.len() {
+    queue.push(tok_at(&tips, t));
+    t = t + 1;
+  }
+  let mut head = 0;
+  let mut left = walk_budget;
+  while head < queue.len() {
+    let id = tok_at(&queue, head);
+    head = head + 1;
+    left = count_item(left)?;
+    if index_of(&seen, &id) < 0 {
+      let o = odb_read_in(&repo, &packs, &id)?;
+      seen.push(id.clone());
+      match o.obj_type {
+        ObjectType.Commit => {
+          let c = decode_commit(&o.content)?;
+          let parents = commit_parents(&c);
+          let mut i = 0;
+          while i < parents.len() {
+            queue.push(tok_at(&parents, i));
+            i = i + 1;
+          }
+        }
+        ObjectType.Tag => {
+          let tg = decode_tag(&o.content)?;
+          queue.push(tag_object_id(&tg));
+        }
+        _ => {}
+      }
+    }
+  }
+  return Ok(seen);
+}
+
+// ---------------------------------------------------------------------------
+// 交渉と pack 応答
+// ---------------------------------------------------------------------------
+
+fn tips_of(set: &AdvSet) -> List<String>
+  intent "広告した実参照の先端（HEAD を含む）の識別子を、重複なく集める。peeled 行の識別子は含めない"
+  requires none
+  ensures none
+  effects none
+{
+  let mut tips = List.new();
+  let mut i = 0;
+  while i < set.refs.len() {
+    match set.refs.get(i) {
+      None => {}
+      Some(r) => {
+        push_unique(&mut tips, &r.id);
+      }
+    }
+    i = i + 1;
+  }
+  match set.head_id {
+    Some(h) => {
+      push_unique(&mut tips, &h);
+    }
+    None => {}
+  }
+  return tips;
+}
+
+fn sideband_error(text: &String) -> Bytes
+  intent "side-band の channel 3 に載せた失敗の pkt-line を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(3);
+  payload.extend(&cat3(&text, &"\n", &"").as_bytes());
+  return pkt_encode(&payload).unwrap_or(Bytes.new());
+}
+
+fn failure_text(err: &GitError) -> String
+  intent "pack 構築の失敗を固定の文言にする（内容・内部パスを含めない）"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    GitError.LimitExceeded(_) => "upload-pack: limit exceeded",
+    _ => "upload-pack: repository error",
+  };
+}
+
+pub fn sideband_frames(pack: &Bytes) -> Result<Bytes, GitError>
+  intent "pack を side-band-64k の channel 1 に載せ、最後に flush を付ける（1 pkt-line は 65520 byte 以下なので 1 つの内容は 65515 byte まで）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut pos = 0;
+  while pos < pack.len() {
+    let mut end = pos + 65515;
+    if end > pack.len() {
+      end = pack.len();
+    }
+    let mut payload = Bytes.new();
+    payload.push(1);
+    payload.extend(&pack.slice(pos, end).unwrap_or(Bytes.new()));
+    out.extend(&pkt_encode(&payload)?);
+    pos = end;
+  }
+  out.extend(&pkt_flush());
+  return Ok(out);
+}
+
+fn has_cap(caps: &List<String>, name: &String) -> Bool
+  intent "要求された能力に name があるか"
+  requires none
+  ensures none
+  effects none
+{
+  return index_of(&caps, &name) >= 0;
+}
+
+fn pack_part(repo: &Repo, packs: &List<PackStore>, wants: &List<String>, sideband: Bool, acks_len: Int, object_limit: Int, walk_budget: Int, response_limit: Int) -> Result<Bytes, GitError>
+  intent "want からの完全な到達集合を wire 専用 pack にして、応答の枠づけをする。ACK／NAK を含む応答全体が response_limit を超えるなら LimitExceeded（pack は返さない）"
+  requires none
+  ensures none
+  effects fs
+{
+  let ids = reachable_objects(&repo, &packs, &wants, object_limit, walk_budget)?;
+  let pack = wire_pack_build_limited(&repo, &ids, walk_budget)?;
+  let mut framed = Bytes.new();
+  if sideband {
+    framed = sideband_frames(&pack)?;
+  } else {
+    framed = pack;
+  }
+  if acks_len + framed.len() > response_limit {
+    return Err(GitError.LimitExceeded("response exceeds the response limit"));
+  }
+  return Ok(framed);
+}
+
+fn negotiate(repo: &Repo, request: &Bytes, object_limit: Int, walk_budget: Int, response_limit: Int) -> Result<UploadReply, GitError>
+  intent "upload_pack_respond_limited の本体。要求・リポジトリの失敗は Err で返す"
+  requires object_limit >= 0 && walk_budget >= 0 && response_limit >= 0
+  ensures none
+  effects fs
+{
+  let req = parse_upload_request(&request)?;
+  if req.wants.len() == 0 {
+    return Ok(result_reply(Bytes.new()));
+  }
+  check_requested_capabilities(true, &req.caps)?;
+  let sideband = has_cap(&req.caps, &"side-band-64k");
+  let set = collect_adv_set(&repo)?;
+  let tips = tips_of(&set);
+  let mut w = 0;
+  while w < req.wants.len() {
+    if index_of(&tips, &tok_at(&req.wants, w)) < 0 {
+      return Ok(result_reply(err_pkt(&"upload-pack: not our ref")));
+    }
+    w = w + 1;
+  }
+  let packs = open_packs(&repo)?;
+  let published = published_history(&repo, &packs, &tips, walk_budget)?;
+  let mut acks = Bytes.new();
+  let mut common = false;
+  let mut h = 0;
+  while h < req.haves.len() {
+    let id = tok_at(&req.haves, h);
+    if !common && index_of(&published, &id) >= 0 {
+      common = true;
+      acks.extend(&pkt_encode_str(&cat3(&"ACK ", &id, &"\n"))?);
+    }
+    h = h + 1;
+  }
+  if !common {
+    acks.extend(&pkt_encode_str(&"NAK\n")?);
+  }
+  if !req.done {
+    // done の無い要求（have の束＋flush）には、共通があっても NAK だけを返す。基本の ACK（multi_ack 無し）の stateless な HTTP では、
+    // 実 Git の利用側は ACK を受けると「共通が見つかった」と見て、次の done の要求（have を再送しない）の応答の先頭に ACK／NAK 行が
+    // 来ないものと読むため、ここで ACK を返すと次の応答の NAK が side-band の band 番号として読まれて壊れる（interop_upload.sh で確認）。
+    // 共通の通知は done の要求だけで行い、利用側は have を尽くしてから done を送る。
+    return Ok(result_reply(pkt_encode_str(&"NAK\n")?));
+  }
+  match pack_part(&repo, &packs, &req.wants, sideband, acks.len(), object_limit, walk_budget, response_limit) {
+    Ok(framed) => {
+      let mut body = acks.clone();
+      body.extend(&framed);
+      return Ok(result_reply(body));
+    }
+    Err(e) => {
+      let text = failure_text(&e);
+      if sideband {
+        // side-band では ACK／NAK の後に channel 3 で失敗を伝える。
+        let mut body = acks.clone();
+        body.extend(&sideband_error(&text));
+        body.extend(&pkt_flush());
+        return Ok(result_reply(body));
+      }
+      // side-band 無しでは、ACK／NAK の直後を利用側が生の pack として読むため、ACK／NAK を付けず ERR だけを返す。
+      return Ok(result_reply(err_pkt(&text)));
+    }
+  }
+}
+
+pub fn upload_pack_respond_limited(repo: &Repo, request: &Bytes, object_limit: Int, walk_budget: Int, response_limit: Int) -> UploadReply
+  intent "検証済みの要求本文（展開後）に対する upload-pack の応答を作る。want は公開した先端だけ、have は公開した履歴にあるものだけが共通。基本の ACK／NAK、pack は完全な到達集合。上限は引数で受ける（固定値は upload_pack_respond）"
+  requires object_limit >= 0 && walk_budget >= 0 && response_limit >= 0
+  ensures none
+  effects fs
+{
+  return match negotiate(&repo, &request, object_limit, walk_budget, response_limit) {
+    Ok(r) => r,
+    Err(e) => reply_for_error(&e),
+  };
+}
+
+pub fn upload_pack_respond(repo: &Repo, request: &Bytes) -> UploadReply
+  intent "固定上限（オブジェクト 4096、走査 100000、応答 1 MiB）で upload-pack の応答を作る"
+  requires none
+  ensures none
+  effects fs
+{
+  return upload_pack_respond_limited(&repo, &request, max_transfer_objects(), max_graph_walk_items(), max_transfer_response_size());
+}
+
+// ---------------------------------------------------------------------------
+// POST /repos/<id>/git-upload-pack（認証・認可の後）
+// ---------------------------------------------------------------------------
+
+pub fn upload_pack_post_limited(repo: &Repo, encodings: &List<Bytes>, content_type: &Option<Bytes>, body: &Bytes, object_limit: Int, walk_budget: Int, response_limit: Int) -> UploadReply
+  intent "認証・認可の後の POST を処理する。順序: Content-Encoding（415）→ Content-Type（415）→ identity なら本文 1 MiB（413）／gzip なら全検証つき展開（400／413）→ pkt-line の要求処理。gzip は全検証が済むまで要求処理を始めない"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut gzip = false;
+  match select_encoding(&encodings, true) {
+    Ok(g) => {
+      gzip = g;
+    }
+    Err(r) => {
+      return text_reply(r.status, &r.reason);
+    }
+  }
+  let ct_ok = match content_type {
+    Some(ct) => trimmed_lower(&ct) == "application/x-git-upload-pack-request".as_bytes(),
+    None => false,
+  };
+  if !ct_ok {
+    return text_reply(415, &"unsupported_media_type");
+  }
+  if gzip {
+    match gzip_decode(&body) {
+      Ok(plain) => {
+        return upload_pack_respond_limited(&repo, &plain, object_limit, walk_budget, response_limit);
+      }
+      Err(e) => {
+        let r = rejection_of(&e);
+        return text_reply(r.status, &r.reason);
+      }
+    }
+  }
+  if body.len() > 1048576 {
+    return text_reply(413, &"request_too_large");
+  }
+  return upload_pack_respond_limited(&repo, &body, object_limit, walk_budget, response_limit);
+}
+
+pub fn upload_pack_post(repo: &Repo, encodings: &List<Bytes>, content_type: &Option<Bytes>, body: &Bytes) -> UploadReply
+  intent "固定上限で POST を処理する"
+  requires none
+  ensures none
+  effects fs
+{
+  return upload_pack_post_limited(&repo, &encodings, &content_type, &body, max_transfer_objects(), max_graph_walk_items(), max_transfer_response_size());
+}
