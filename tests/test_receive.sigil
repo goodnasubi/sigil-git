@@ -277,6 +277,8 @@ fn run_parse(f: &Fixture) -> Bool
 {
   let mut ok = true;
   let c2 = f.commit2.clone();
+  let spaced = push_body(&zero(), &c2, &"refs/heads/main", &cat3(&" ", &caps_ok(), &""), &empty_pack());
+  ok = expect(parse_receive_request(&spaced).is_ok(), &"parse: a single leading space before the capabilities (as real Git sends) is accepted") && ok;
   let good = push_body(&zero(), &c2, &"refs/heads/main", &caps_ok(), &empty_pack());
   match parse_receive_request(&good) {
     Ok(r) => {

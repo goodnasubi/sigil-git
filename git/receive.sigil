@@ -276,7 +276,12 @@ pub fn parse_receive_request(body: &Bytes) -> Result<ReceiveRequest, GitError>
   let ref_name = tok_at(&toks, 2);
   check_id(&old_id)?;
   check_id(&new_id)?;
-  let caps_bytes = payload.slice(nul + 1, payload.len()).unwrap_or(Bytes.new());
+  // 実 Git は能力の列の先頭に空白を 1 つ置く（`\0 report-status ...`）。その 1 つだけは許す
+  let mut caps_from = nul + 1;
+  if caps_from < payload.len() && payload.get(caps_from).unwrap_or(0) == 32 {
+    caps_from = caps_from + 1;
+  }
+  let caps_bytes = payload.slice(caps_from, payload.len()).unwrap_or(Bytes.new());
   let caps = split_ws(&caps_bytes)?;
   check_requested_capabilities(false, &caps)?;
   if index_of(&caps, &"report-status") < 0 {
