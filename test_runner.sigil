@@ -3,7 +3,10 @@ module test_runner
   trust none
 
 use tests.test_commit.run_commit_tests;
+use tests.test_compat.run_compat_tests;
+use tests.test_fault.run_fault_tests;
 use tests.test_fixture.run_fixture_tests;
+use tests.test_fuzz.run_fuzz_tests;
 use tests.test_inflate.run_inflate_tests;
 use tests.test_limits.run_limits_tests;
 use tests.test_object.run_object_tests;
@@ -13,6 +16,7 @@ use tests.test_repo.run_repo_tests;
 use tests.test_tag.run_tag_tests;
 use tests.test_tree.run_tree_tests;
 use tests.test_validate.run_validate_tests;
+use tests.test_xcheck.run_xcheck_tests;
 
 pub fn main() -> Int
   intent "すべてのテストを実行し、全合格なら 0、不合格なら 1 以上のコードを返す"
@@ -84,6 +88,30 @@ pub fn main() -> Int
   if !run_ops_tests() {
     console.log(&"FAIL: ops tests");
     return 11;
+  }
+
+  console.log(&"Running tests: backward compatibility fixtures (v1)");
+  if !run_compat_tests() {
+    console.log(&"FAIL: compat tests");
+    return 12;
+  }
+
+  console.log(&"Running tests: fuzzing & boundary regression");
+  if !run_fuzz_tests() {
+    console.log(&"FAIL: fuzz tests");
+    return 13;
+  }
+
+  console.log(&"Running tests: fault injection & durable model");
+  if !run_fault_tests() {
+    console.log(&"FAIL: fault tests");
+    return 14;
+  }
+
+  console.log(&"Running tests: cross-check trace digest");
+  if !run_xcheck_tests() {
+    console.log(&"FAIL: xcheck tests");
+    return 15;
   }
 
   console.log(&"ALL TESTS PASSED SUCCESSFULLY");

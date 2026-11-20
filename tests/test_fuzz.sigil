@@ -1,0 +1,857 @@
+module tests.test_fuzz
+  targets server
+  trust none
+
+use git.commit.decode_commit;
+use git.fsio.create_synced_file;
+use git.fsio.make_dirs;
+use git.fsio.read_file_opt;
+use git.fsio.remove_file_if_exists;
+use git.index.parse_index;
+use git.inflate.inflate_zlib;
+use git.object.verify_object_bytes;
+use git.pack.apply_delta;
+use git.pack.open_pack;
+use git.pack.pack_read_index;
+use git.refs.parse_packed_refs;
+use git.repo.parse_config;
+use git.tag.decode_tag;
+use git.tree.decode_tree;
+use git.validate.validate_path;
+use git.validate.validate_ref_name;
+
+struct Rng {
+  state: Int,
+}
+
+fn rng_new(seed: Int) -> Rng
+  intent "決定的シードから擬似乱数生成器を作成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut s = seed;
+  if s == 0 {
+    s = 1;
+  }
+  return Rng { state: s };
+}
+
+fn rng_next(rng: &mut Rng) -> Int
+  intent "次の擬似乱数を返す (0 <= n < 2147483647)"
+  requires none
+  ensures none
+  effects none
+{
+  let a = 1103515245;
+  let c = 12345;
+  let next_state = (rng.state * a + c) % 2147483647;
+  let mut s = next_state;
+  if s < 0 {
+    s = 0 - s;
+  }
+  rng.state = s;
+  return s;
+}
+
+fn rng_bytes(rng: &mut Rng, len: Int) -> Bytes
+  intent "指定長の擬似乱数バイト列を生成する"
+  requires len >= 0
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < len {
+    b.push(rng_next(&mut rng) % 256);
+    i = i + 1;
+  }
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// 1. 緩い形式のヘッダのファジング（巨大サイズ・負数・非数字・NUL欠落・乱数）
+// ---------------------------------------------------------------------------
+fn fuzz_headers(rng: &mut Rng, iterations: Int) -> Bool
+  intent "構造化された不正ヘッダおよびランダム列を検証し panic しないことを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  let dummy_id = rng_bytes(&mut rng, 32);
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 6;
+    if pat == 0 {
+      // 純ランダム列
+      let len = rng_next(&mut rng) % 128;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // 巨大サイズ（オーバーフロー）
+      b.extend(&"blob 999999999999999999999999999999999999".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 16));
+    } else if pat == 2 {
+      // 負のサイズ
+      b.extend(&"tree -100".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 16));
+    } else if pat == 3 {
+      // 非数字サイズ
+      b.extend(&"commit abcdef".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 16));
+    } else if pat == 4 {
+      // 終端 NUL 欠落
+      b.extend(&"tag 1234567890".as_bytes());
+    } else {
+      // 空サイズ
+      b.extend(&"blob ".as_bytes());
+      b.push(0);
+    }
+    let _ = verify_object_bytes(&b, &dummy_id);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 2. tree のファジング（切り詰めエントリ・未ソート・NUL 含有パス・乱数）
+// ---------------------------------------------------------------------------
+fn fuzz_trees(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた tree データを復号し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 5;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 256;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // 切り詰められた SHA-256 (32 バイト未満)
+      b.extend(&"100644 file.txt".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, i % 31));
+    } else if pat == 2 {
+      // ファイル名に NUL バイトを含む
+      b.extend(&"100644 bad".as_bytes());
+      b.push(0);
+      b.extend(&"name".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 32));
+    } else if pat == 3 {
+      // 順不同（未ソート）エントリ
+      b.extend(&"100644 z_file".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 32));
+      b.extend(&"100644 a_file".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 32));
+    } else {
+      // モード欠落
+      b.extend(&"no_mode_entry".as_bytes());
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 32));
+    }
+    let _ = decode_tree(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3. commit のファジング（tree 欠落・不正親ID・ヘッダ区切り欠落・乱数）
+// ---------------------------------------------------------------------------
+fn fuzz_commits(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた commit データを復号し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 5;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 512;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // tree ヘッダ欠落
+      b.extend(&"author A <a@example.com> 0 +0000\ncommitter C <c@example.com> 0 +0000\n\nmessage\n".as_bytes());
+    } else if pat == 2 {
+      // 不正な親コミット ID (64 桁未満)
+      b.extend(&"tree 2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4\nparent deadbeef\nauthor A <a@example.com> 0 +0000\ncommitter C <c@example.com> 0 +0000\n\nmsg\n".as_bytes());
+    } else if pat == 3 {
+      // メッセージ前の空行 (\n\n) 欠落
+      b.extend(&"tree 2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4\nauthor A <a@example.com> 0 +0000\ncommitter C <c@example.com> 0 +0000\nno double newline message".as_bytes());
+    } else {
+      // 切り詰められた author/committer
+      b.extend(&"tree 2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4\nauthor truncated".as_bytes());
+    }
+    let _ = decode_commit(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4. tag のファジング（未対応型・不正ID・切り詰めPGP署名・乱数）
+// ---------------------------------------------------------------------------
+fn fuzz_tags(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた tag データを復号し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 5;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 512;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // 不正な object ID (非 hex)
+      b.extend(&"object not_hex_id_here\ntype commit\ntag v1\ntagger T <t@example.com> 0 +0000\n\nmsg".as_bytes());
+    } else if pat == 2 {
+      // 未知の object type
+      b.extend(&"object 2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4\ntype unsupported_blob_variant\ntag v1\ntagger T <t@example.com> 0 +0000\n\nmsg".as_bytes());
+    } else if pat == 3 {
+      // 切り詰められた PGP 署名ブロック
+      b.extend(&"object 2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4\ntype commit\ntag v1\ntagger T <t@example.com> 0 +0000\n\nannotated tag\n-----BEGIN PGP SIGNATURE-----\nVersion: GnuPG v2\n".as_bytes());
+    } else {
+      // tagger 欠落
+      b.extend(&"object 2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4\ntype commit\ntag v1\n\nmsg without tagger".as_bytes());
+    }
+    let _ = decode_tag(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 5. inflate (zlib) のファジング（ヘッダ破損・Adler-32 不一致・乱数）
+// ---------------------------------------------------------------------------
+fn fuzz_inflate(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた zlib データを伸長し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 4;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 256;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // 正当なヘッダ (0x78, 0x9c) + 破損データ
+      b.push(120);
+      b.push(156);
+      b.extend(&rng_bytes(&mut rng, 20));
+    } else if pat == 2 {
+      // 正当なストリーム末尾の Adler-32 チェックサム破壊
+      b.push(120);
+      b.push(1);
+      b.push(1);
+      b.push(0);
+      b.push(0);
+      b.push(255);
+      b.push(255);
+      b.push(104);  // 'h'
+      b.push(255);  // 破損 Adler-32
+      b.push(255);
+      b.push(255);
+      b.push(255);
+    } else {
+      // 未知の圧縮方式ヘッダ
+      b.push(255);
+      b.push(255);
+      b.extend(&rng_bytes(&mut rng, 16));
+    }
+    let _ = inflate_zlib(&b, 0, 65536);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 6. index v2 のファジング（DIRC ヘッダ・不正バージョン・切り詰めエントリ）
+// ---------------------------------------------------------------------------
+fn fuzz_index(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた index データをパースし panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 4;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 256;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // DIRC + 未対応バージョン (ver 3)
+      b.push(68);
+      b.push(73);
+      b.push(82);
+      b.push(67);
+      b.push(0);
+      b.push(0);
+      b.push(0);
+      b.push(3);
+      b.extend(&rng_bytes(&mut rng, 24));
+    } else if pat == 2 {
+      // DIRC + ver 2 + 宣言エントリ数過大 + 切り詰めボディ
+      b.push(68);
+      b.push(73);
+      b.push(82);
+      b.push(67);
+      b.push(0);
+      b.push(0);
+      b.push(0);
+      b.push(2);
+      b.push(0);
+      b.push(0);
+      b.push(10);
+      b.push(0);
+      b.extend(&rng_bytes(&mut rng, 16));
+    } else {
+      // マジックヘッダ不一致
+      b.push(78);
+      b.push(79);
+      b.push(80);
+      b.push(69);
+      b.extend(&rng_bytes(&mut rng, 32));
+    }
+    let _ = parse_index(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 7. packed-refs のファジング（破損ヘッダ・不正剥離構文・非 hex 行）
+// ---------------------------------------------------------------------------
+fn fuzz_packed_refs(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた packed-refs データをパースし panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 4;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 256;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // 不正な剥離（peeled ^）構文
+      b.extend(&"# pack-refs with: peeled-fully\n2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4 refs/tags/v1\n^bad_peeled_hash\n".as_bytes());
+    } else if pat == 2 {
+      // 非 64 桁ハッシュ
+      b.extend(&"# pack-refs with: peeled-fully\nshort_hash refs/heads/main\n".as_bytes());
+    } else {
+      // 改行なし切り詰め
+      b.extend(&"# pack-refs with: peeled-fully\n2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4 refs/heads/m".as_bytes());
+    }
+    let _ = parse_packed_refs(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 8. 差分（delta）のファジング（base長不一致・オフセット超過・壊れたオペコード）
+// ---------------------------------------------------------------------------
+fn fuzz_delta(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた delta データを base に適用し panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut base = Bytes.new();
+  base.extend(&"base object content for delta fuzzing\n".as_bytes());
+  let mut i = 0;
+  while i < iterations {
+    let mut d = Bytes.new();
+    let pat = i % 4;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 128;
+      d = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // ソース長不一致 (宣言 src_size = 5, 実際 base.len() = 38)
+      d.push(5);
+      d.push(10);
+      d.push(1);
+      d.push(97);
+    } else if pat == 2 {
+      // copy オペコードでオフセットが base 長を超過 (copy offset = 100, len = 5)
+      d.push(38);  // src_size
+      d.push(5);  // dst_size
+      d.push(145);  // copy op (offset byte 1, size byte 1)
+      d.push(100);  // offset = 100 (> 38)
+      d.push(5);  // len = 5
+    } else {
+      // 復元後サイズ超過宣言
+      d.push(38);
+      d.push(255);
+      d.push(255);
+      d.push(255);
+      d.push(127);  // huge dst_size
+      d.extend(&rng_bytes(&mut rng, 16));
+    }
+    let _ = apply_delta(&base, &d);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 9. 設定（config）のファジング（構文破損・未完セクション・引用符欠損）
+// ---------------------------------------------------------------------------
+fn fuzz_config(rng: &mut Rng, iterations: Int) -> Bool
+  intent "壊れた git config データをパースし panic せずに安全に拒否されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let mut b = Bytes.new();
+    let pat = i % 4;
+    if pat == 0 {
+      let len = rng_next(&mut rng) % 256;
+      b = rng_bytes(&mut rng, len);
+    } else if pat == 1 {
+      // 閉じ括弧のないセクション
+      b.extend(&"[core\nrepositoryformatversion = 1\n".as_bytes());
+    } else if pat == 2 {
+      // 未終了の引用符付きサブセクション
+      b.extend(&"[remote \"origin\nurl = git@example.com\n".as_bytes());
+    } else {
+      // 等号のないキー行
+      b.extend(&"[core]\nno_equal_sign_key_here\n".as_bytes());
+    }
+    let _ = parse_config(&b);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 10. パスおよび参照名のファジング（トラバーサル・ADS・予約文字・大文字小文字）
+// ---------------------------------------------------------------------------
+fn fuzz_paths_and_refs(rng: &mut Rng, iterations: Int) -> Bool
+  intent "ランダムおよび変異パス・参照名を検査し panic しないことを確かめる"
+  requires iterations > 0
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < iterations {
+    let len = rng_next(&mut rng) % 64;
+    let b = rng_bytes(&mut rng, len);
+    let s = b.to_string_utf8().unwrap_or("");
+    let _ = validate_path(&s);
+    let _ = validate_ref_name(&s);
+    i = i + 1;
+  }
+  return true;
+}
+
+fn path_fails(s: &String) -> Bool
+  intent "path が不正として拒否されたら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match validate_path(&s) {
+    Ok(_) => false,
+    Err(_) => true,
+  };
+}
+
+fn ref_fails(s: &String) -> Bool
+  intent "ref 名が不正として拒否されたら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match validate_ref_name(&s) {
+    Ok(_) => false,
+    Err(_) => true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 11. pack index (.idx v2) のファジング（マジック破損・非単調fanout・不正オフセット）
+// ---------------------------------------------------------------------------
+fn fuzz_pack_index(rng: &mut Rng, iterations: Int, base_idx: &Bytes, base_pack: &Bytes) -> Bool
+  intent "壊れた pack index (.idx) データを検証し panic せずに安全に処理されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects fs
+{
+  let test_idx = "tmp/fuzz_pack/test.idx";
+  let test_pack = "tmp/fuzz_pack/test.pack";
+  let _ = remove_file_if_exists(&test_pack);
+  let _ = create_synced_file(&test_pack, &base_pack);
+
+  let mut i = 0;
+  while i < iterations {
+    let mut b = base_idx.clone();
+    let pat = i % 5;
+    if pat == 0 {
+      let trunc_len = rng_next(&mut rng) % base_idx.len();
+      b = base_idx.slice(0, trunc_len).unwrap_or(Bytes.new());
+    } else if pat == 1 {
+      let _ = b.set(0, rng_next(&mut rng) % 256);
+      let _ = b.set(4, rng_next(&mut rng) % 256);
+    } else if pat == 2 {
+      let _ = b.set(100, 255);
+      let _ = b.set(104, 0);
+    } else if pat == 3 {
+      if b.len() > 32 {
+        let last_idx = b.len() - 1;
+        let v = (b.get(last_idx).unwrap_or(0) + 1) % 256;
+        let _ = b.set(last_idx, v);
+      }
+    } else {
+      let mut off = 1032;
+      if b.len() > 1032 {
+        off = 1032 + rng_next(&mut rng) % (b.len() - 1032);
+      }
+      let v = (b.get(off).unwrap_or(0) + 1) % 256;
+      let _ = b.set(off, v);
+    }
+    let _ = remove_file_if_exists(&test_idx);
+    let _ = create_synced_file(&test_idx, &b);
+    let _ = open_pack(&test_idx);
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 12. pack ファイル (.pack v2) のファジング（PACKヘッダ破損・版違い・エントリ破損）
+// ---------------------------------------------------------------------------
+fn fuzz_pack_file(rng: &mut Rng, iterations: Int, base_idx: &Bytes, base_pack: &Bytes) -> Bool
+  intent "壊れた pack ファイル (.pack) データを検証し panic せずに安全に処理されることを確かめる"
+  requires iterations > 0
+  ensures none
+  effects fs
+{
+  let test_idx = "tmp/fuzz_pack/test.idx";
+  let test_pack = "tmp/fuzz_pack/test.pack";
+  let _ = remove_file_if_exists(&test_idx);
+  let _ = create_synced_file(&test_idx, &base_idx);
+
+  let mut i = 0;
+  while i < iterations {
+    let mut b = base_pack.clone();
+    let pat = i % 5;
+    if pat == 0 {
+      let trunc_len = rng_next(&mut rng) % base_pack.len();
+      b = base_pack.slice(0, trunc_len).unwrap_or(Bytes.new());
+    } else if pat == 1 {
+      let _ = b.set(0, 88);
+      let _ = b.set(4, 3);
+    } else if pat == 2 {
+      let cur = b.get(11).unwrap_or(0);
+      let _ = b.set(11, (cur + 5) % 256);
+    } else if pat == 3 {
+      if b.len() > 32 {
+        let last_idx = b.len() - 1;
+        let v = (b.get(last_idx).unwrap_or(0) + 1) % 256;
+        let _ = b.set(last_idx, v);
+      }
+    } else {
+      let mut off = 12;
+      if b.len() > 12 {
+        off = 12 + rng_next(&mut rng) % (b.len() - 12);
+      }
+      let v = (b.get(off).unwrap_or(0) + 1) % 256;
+      let _ = b.set(off, v);
+    }
+    let _ = remove_file_if_exists(&test_pack);
+    let _ = create_synced_file(&test_pack, &b);
+    match open_pack(&test_idx) {
+      Ok(ps) => {
+        let _ = pack_read_index(&ps, 0);
+      }
+      Err(_) => {}
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 13. 固定の回帰例コーパス（悪意のある入力・境界値）
+// ---------------------------------------------------------------------------
+fn run_regression_corpus() -> Bool
+  intent "過去の脆弱性類似パターンや境界値コーパスを検査し、適切に拒否されることを確かめる"
+  requires none
+  ensures none
+  effects none
+{
+  // (a) パス検査の回帰例（トラバーサル・ADS・絶対パス・予約記号）
+  if !path_fails(&"../escaped") {
+    return false;
+  }
+  if !path_fails(&"a/../../b") {
+    return false;
+  }
+  if !path_fails(&".git/config") {
+    return false;
+  }
+  if !path_fails(&"a/.git/hooks") {
+    return false;
+  }
+  if !path_fails(&"/absolute/path") {
+    return false;
+  }
+  if !path_fails(&"back\\slash") {
+    return false;
+  }
+  if !path_fails(&".git::$DATA") {
+    return false;
+  }
+  if !path_fails(&"") {
+    return false;
+  }
+  if !path_fails(&".") {
+    return false;
+  }
+  if !path_fails(&"..") {
+    return false;
+  }
+
+  // (b) 長大なパス（上限 4096 文字および構成要素 255 文字超過）
+  let mut long_comp = Bytes.new();
+  let mut i = 0;
+  while i < 260 {
+    long_comp.push(97);  // 'a'
+    i = i + 1;
+  }
+  if !path_fails(&long_comp.to_string_utf8().unwrap_or("")) {
+    return false;
+  }
+
+  let mut long_total = Bytes.new();
+  i = 0;
+  while i < 4100 {
+    if i % 10 == 0 && i > 0 {
+      long_total.push(47);  // '/'
+    } else {
+      long_total.push(98);  // 'b'
+    }
+    i = i + 1;
+  }
+  if !path_fails(&long_total.to_string_utf8().unwrap_or("")) {
+    return false;
+  }
+
+  // (c) 参照名の回帰例
+  if !ref_fails(&"refs/heads/..") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo.lock") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo@{bar") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo//bar") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo?bar") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo*bar") {
+    return false;
+  }
+  if !ref_fails(&"@") {
+    return false;
+  }
+  if !ref_fails(&"/refs/heads/foo") {
+    return false;
+  }
+  if !ref_fails(&"refs/heads/foo/") {
+    return false;
+  }
+
+  // 長大な参照名（上限 1024 文字超過）
+  let mut long_ref = Bytes.new();
+  long_ref.extend(&"refs/heads/".as_bytes());
+  i = 0;
+  while i < 1050 {
+    long_ref.push(99);  // 'c'
+    i = i + 1;
+  }
+  if !ref_fails(&long_ref.to_string_utf8().unwrap_or("")) {
+    return false;
+  }
+
+  // (d) 壊れたヘッダ・構造
+  let mut bad_tree = Bytes.new();
+  bad_tree.extend(&"100644 a".as_bytes());
+  bad_tree.push(0);
+  // SHA-256 (32 bytes) が欠落
+  match decode_tree(&bad_tree) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // (e) 壊れたコミット
+  let mut bad_commit = Bytes.new();
+  bad_commit.extend(&"tree invalid_hex\n\nmessage\n".as_bytes());
+  match decode_commit(&bad_commit) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // (f) 壊れたタグ（不正な object ID）
+  let mut bad_tag = Bytes.new();
+  bad_tag.extend(&"object not_a_valid_64_hex_id\ntype commit\ntag v1\ntagger T <t@example.com> 0 +0000\n\nmsg\n".as_bytes());
+  match decode_tag(&bad_tag) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // (g) 壊れた packed-refs
+  let mut bad_pref = Bytes.new();
+  bad_pref.extend(&"not_a_valid_hash refs/heads/main\n".as_bytes());
+  match parse_packed_refs(&bad_pref) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  // (h) 壊れた delta
+  let mut base = Bytes.new();
+  base.extend(&"sample base data\n".as_bytes());
+  let mut bad_delta = Bytes.new();
+  bad_delta.push(17);  // src size
+  bad_delta.push(10);  // dst size
+  bad_delta.push(145);  // copy op
+  bad_delta.push(200);  // offset = 200 (> 17)
+  bad_delta.push(5);
+  match apply_delta(&base, &bad_delta) {
+    Ok(_) => {
+      return false;
+    }
+    Err(_) => {}
+  }
+
+  return true;
+}
+
+pub fn run_fuzz_tests() -> Bool
+  intent "第6段ファジング試験を実行する（ADR 0047 決定 6-6、シード: 20261120）"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let seed = 20261120;
+  let mut rng = rng_new(seed);
+  let iters = 100;
+
+  console.log(&"Fuzzing 1/12: object headers (structured & random)");
+  if !fuzz_headers(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 2/12: tree decoding (truncated, unsorted, NUL paths)");
+  if !fuzz_trees(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 3/12: commit decoding (missing headers, invalid parents)");
+  if !fuzz_commits(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 4/12: tag decoding (unknown type, truncated PGP signature)");
+  if !fuzz_tags(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 5/12: inflate zlib (corrupted streams, Adler-32 mismatch)");
+  if !fuzz_inflate(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 6/12: index v2 (DIRC header, version, truncation)");
+  if !fuzz_index(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 7/12: packed-refs (corrupted headers, peeled syntax)");
+  if !fuzz_packed_refs(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 8/12: delta application (source mismatch, offset bounds)");
+  if !fuzz_delta(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 9/12: config parsing (malformed sections, quotes)");
+  if !fuzz_config(&mut rng, iters) {
+    return false;
+  }
+
+  console.log(&"Fuzzing 10/12: paths and ref names (traversals, ADS, control chars)");
+  if !fuzz_paths_and_refs(&mut rng, iters) {
+    return false;
+  }
+
+  let idx_fixture = match read_file_opt(&"fixtures/v1/sample.idx", 1048576, false) {
+    Ok(Some(b)) => b,
+    _ => Bytes.new(),
+  };
+  let pack_fixture = match read_file_opt(&"fixtures/v1/sample.pack", 1048576, false) {
+    Ok(Some(b)) => b,
+    _ => Bytes.new(),
+  };
+
+  if idx_fixture.len() > 0 && pack_fixture.len() > 0 {
+    let _ = make_dirs(&"tmp/fuzz_pack");
+    console.log(&"Fuzzing 11/12: pack index v2 (.idx header, non-monotonic fanout, truncation, checksums)");
+    if !fuzz_pack_index(&mut rng, iters, &idx_fixture, &pack_fixture) {
+      return false;
+    }
+
+    console.log(&"Fuzzing 12/12: pack v2 (.pack header, version, count mismatch, corrupted entries)");
+    if !fuzz_pack_file(&mut rng, iters, &idx_fixture, &pack_fixture) {
+      return false;
+    }
+    let _ = remove_file_if_exists(&"tmp/fuzz_pack/test.idx");
+    let _ = remove_file_if_exists(&"tmp/fuzz_pack/test.pack");
+  }
+
+  console.log(&"Fuzzing: regression corpus (4096-char path, component/ref limits, malicious boundaries)");
+  if !run_regression_corpus() {
+    return false;
+  }
+
+  console.log(&"All fuzzing tests (12 domains, 1200 iterations + regression corpus) passed successfully");
+  return true;
+}

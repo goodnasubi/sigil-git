@@ -9,13 +9,15 @@
 #  H. 日本語など UTF-8 のパスが add・commit・checkout で往復する。
 set -euo pipefail
 
-if [ -z "${SIGIL:-}" ]; then
-  if command -v sigil >/dev/null 2>&1; then SIGIL="sigil"; else echo "SIGIL is not set" >&2; exit 1; fi
-fi
+: "${SIGIL:=sigil}"
+: "${STAGE5_GIT:=git}"
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Git version: $(git --version)"
-git init --object-format=sha256 --bare -q "$(mktemp -d)" || { echo "this git does not support SHA-256" >&2; exit 1; }
+echo "Git version: $("$STAGE5_GIT" --version)"
+if [[ -n "${STAGE5_GIT_VERSION:-}" ]]; then
+  test "$("$STAGE5_GIT" --version)" = "git version $STAGE5_GIT_VERSION"
+fi
+"$STAGE5_GIT" init --object-format=sha256 --bare -q "$(mktemp -d)" || { echo "this git does not support SHA-256" >&2; exit 1; }
 
 W=tmp/interop_ops
 rm -rf "$W"
@@ -32,7 +34,7 @@ run() {
   "$W/ops_bin" | sed '$d' >"$W/out.txt"
 }
 expect_out() { test "$(cat "$W/out.txt" | tr '\n' ' ')" = "$1 " || { echo "unexpected output: $(cat "$W/out.txt" | tr '\n' ' ') (wanted: $1)" >&2; exit 1; }; }
-g() { git -C "$R" "$@"; }
+g() { "$STAGE5_GIT" -C "$R" "$@"; }
 
 echo "=== A. our init / add / commit / branch verified by real Git ==="
 run <<'CMDS'
@@ -81,13 +83,13 @@ test ! -e "$R/.git/index.lock"
 echo "our repository passes fsck --strict --full, log, ls-tree, diff and cat-file; git status is clean"
 
 echo "=== B. real git clone / checkout of our commits ==="
-git clone -q "$R" "$W/clone"
-test "$(git -C "$W/clone" rev-parse --show-object-format)" = "sha256"
-test -z "$(git -C "$W/clone" status --porcelain)"
+"$STAGE5_GIT" clone -q "$R" "$W/clone"
+test "$("$STAGE5_GIT" -C "$W/clone" rev-parse --show-object-format)" = "sha256"
+test -z "$("$STAGE5_GIT" -C "$W/clone" status --porcelain)"
 test -x "$W/clone/dir/sub/run.sh"
 test "$(cat "$W/clone/dir/b.txt")" = "bravo2"
-git -C "$W/clone" checkout -q "$C1"
-test -z "$(git -C "$W/clone" status --porcelain)"
+"$STAGE5_GIT" -C "$W/clone" checkout -q "$C1"
+test -z "$("$STAGE5_GIT" -C "$W/clone" status --porcelain)"
 test "$(cat "$W/clone/dir/b.txt")" = "bravo"
 test ! -e "$W/clone/c.txt"
 echo "real git checks out our commits with a clean status and the exec bit"
@@ -102,7 +104,7 @@ test -z "$(g status --porcelain)"
 test "$(cat "$R/dir/b.txt")" = "bravo"
 test ! -e "$R/c.txt"
 test -x "$R/dir/sub/run.sh"
-test "$(g ls-files -s | cut -d' ' -f1,2 | tr '\n' ' ')" = "$(git -C "$W/clone" ls-files -s | cut -d' ' -f1,2 | tr '\n' ' ')"
+test "$(g ls-files -s | cut -d' ' -f1,2 | tr '\n' ' ')" = "$("$STAGE5_GIT" -C "$W/clone" ls-files -s | cut -d' ' -f1,2 | tr '\n' ' ')"
 run <<'CMDS'
 checkout:main
 CMDS
@@ -111,8 +113,8 @@ test -z "$(g status --porcelain)"
 test "$(cat "$R/dir/b.txt")" = "bravo2"
 test "$(cat "$R/c.txt")" = "new"
 test -x "$R/dir/sub/run.sh"
-git -C "$W/clone" checkout -q "$C2"
-test "$(g ls-files -s | tr '\n' ' ')" = "$(git -C "$W/clone" ls-files -s | tr '\n' ' ')" || test "$(g ls-files -s | cut -d' ' -f1,2,4 | tr '\n' ' ')" = "$(git -C "$W/clone" ls-files -s | cut -d' ' -f1,2,4 | tr '\n' ' ')"
+"$STAGE5_GIT" -C "$W/clone" checkout -q "$C2"
+test "$(g ls-files -s | tr '\n' ' ')" = "$("$STAGE5_GIT" -C "$W/clone" ls-files -s | tr '\n' ' ')" || test "$(g ls-files -s | cut -d' ' -f1,2,4 | tr '\n' ' ')" = "$("$STAGE5_GIT" -C "$W/clone" ls-files -s | cut -d' ' -f1,2,4 | tr '\n' ' ')"
 # 実行ビットが往復する（私たちの checkout が書いたファイルを実 Git が clean と判断する）
 test -z "$(g status --porcelain)"
 run <<'CMDS'

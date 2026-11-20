@@ -457,7 +457,7 @@ fn read_varint(d: &Bytes, cur: &mut Cur) -> Result<Int, GitError>
   return Ok(v);
 }
 
-fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
+pub fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
   intent "差分 delta を base に適用して復元後の内容を返す。base の大きさの不一致、範囲外の copy、復元後の大きさ（上限 64 MiB と宣言値）の超過・不足は Corrupt／LimitExceeded"
   requires none
   ensures none
