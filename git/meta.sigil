@@ -624,8 +624,58 @@ fn remove_dir_rec(dir: &String) -> Result<Bool, GitError>
   };
 }
 
+fn dir_has_any_file(dir: &String) -> Result<Bool, GitError>
+  intent "ディレクトリ配下に通常ファイルが存在するか再帰的に調べる（空ディレクトリのみなら false）"
+  requires none
+  ensures none
+  effects fs
+{
+  if !dir_exists(&dir)? {
+    return Ok(false);
+  }
+  let names = list_names(&dir, 1000)?;
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      Some(name) => {
+        let p = join_path(&dir, &name);
+        if dir_exists(&p)? {
+          if dir_has_any_file(&p)? {
+            return Ok(true);
+          }
+        } else if file_exists(&p)? {
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(false);
+}
+
+fn repo_has_real_data(git_dir: &String) -> Result<Bool, GitError>
+  intent "リポジトリ内に実体データ（packed-refs、objects 配下のファイル、refs 配下のファイル）が存在するか判定する"
+  requires none
+  ensures none
+  effects fs
+{
+  if file_exists(&join_path(&git_dir, &"packed-refs"))? {
+    return Ok(true);
+  }
+  let obj_dir = join_path(&git_dir, &"objects");
+  if dir_has_any_file(&obj_dir)? {
+    return Ok(true);
+  }
+  let refs_dir = join_path(&git_dir, &"refs");
+  if dir_has_any_file(&refs_dir)? {
+    return Ok(true);
+  }
+  return Ok(false);
+}
+
 pub fn create_repo_managed(root: &String, id: &String, owner: &String, default_branch: &String, admin_subject: &String, caller: &String) -> Result<RepoMeta, String>
-  intent "起動設定の管理者のみがリポジトリを新規作成できる。作成時は private、owner は 1 人以上。同期が完了するまで一覧に出ない"
+  intent "起動設定の管理者のみがリポジトリを新規作成できる。作成時は private、owner は 1 人以上。同期が完了するまで一覧に出ない。排他ロック下で作成し実データは破壊しない"
   requires none
   ensures none
   effects fs, random
@@ -647,12 +697,27 @@ pub fn create_repo_managed(root: &String, id: &String, owner: &String, default_b
     return Err("invalid_default_branch");
   }
 
+  let create_lock_path = join_path(&root, &cat3(&id, &".lock", &""));
+  match lock_create(&create_lock_path) {
+    Ok(f) => {
+      let _ = f.close();
+    }
+    Err(_) => {
+      return Err("conflict");
+    }
+  }
+
   let r_id1 = cat3(&root, &"/", &id);
   let git_dir = cat3(&r_id1, &".git", &"");
   let has_head = file_exists(&join_path(&git_dir, &"HEAD")).unwrap_or(false);
   let has_dir = dir_exists(&git_dir).unwrap_or(false);
   if has_head || has_dir {
     if file_exists(&meta_file_path(&git_dir)).unwrap_or(false) {
+      let _ = remove_file_if_exists(&create_lock_path);
+      return Err("conflict");
+    }
+    if repo_has_real_data(&git_dir).unwrap_or(false) {
+      let _ = remove_file_if_exists(&create_lock_path);
       return Err("conflict");
     }
     let _ = remove_dir_rec(&git_dir);
@@ -661,6 +726,7 @@ pub fn create_repo_managed(root: &String, id: &String, owner: &String, default_b
   match init_repo(&git_dir, true, &branch) {
     Ok(_) => {}
     Err(e) => {
+      let _ = remove_file_if_exists(&create_lock_path);
       return match e {
         GitError.AlreadyExists(_) => Err("conflict"),
         _ => Err("init_failed"),
@@ -674,10 +740,12 @@ pub fn create_repo_managed(root: &String, id: &String, owner: &String, default_b
 
   match save_meta_atomic(&git_dir, &meta) {
     Ok(_) => {
+      let _ = remove_file_if_exists(&create_lock_path);
       return Ok(meta);
     }
     Err(_) => {
       let _ = remove_dir_rec(&git_dir);
+      let _ = remove_file_if_exists(&create_lock_path);
       return Err("storage_failure");
     }
   }
@@ -825,6 +893,7 @@ pub fn update_default_branch_managed(root: &String, id: &String, new_branch: &St
       match rename_file(&head_tmp, &head_path) {
         Ok(_) => {
           let _ = sync_dir(&git_dir);
+          let prev_branch = locked_meta.default_branch.clone();
           locked_meta.default_branch = new_branch.clone();
           match save_meta_atomic(&git_dir, &locked_meta) {
             Ok(_) => {
@@ -832,6 +901,17 @@ pub fn update_default_branch_managed(root: &String, id: &String, new_branch: &St
               return Ok(locked_meta);
             }
             Err(_) => {
+              let prev_head_content = cat3(&"ref: refs/heads/", &prev_branch, &"\n");
+              let rb_tmp = match random_hex(8) {
+                Ok(h) => cat3(&head_path, &".tmp-rb-", &h),
+                Err(_) => cat3(&head_path, &".tmp-rb-", &"1"),
+              };
+              if create_synced_file(&rb_tmp, &prev_head_content.as_bytes()).is_ok() {
+                let _ = rename_file(&rb_tmp, &head_path);
+                let _ = sync_dir(&git_dir);
+              } else {
+                let _ = remove_file_if_exists(&rb_tmp);
+              }
               let _ = remove_file_if_exists(&lock_path);
               return Err("storage_failure");
             }

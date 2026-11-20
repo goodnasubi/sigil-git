@@ -889,6 +889,65 @@ fn test_robustness_create_repo_debris_recovery() -> Bool
     return false;
   }
 
+  // 実データ（objects や refs）がある場合は metadata 欠落でも削除されず conflict で拒絶されること
+  let real_id = "real_data_repo";
+  let real_git_dir = cat3(&cat3(&root, &"/", &real_id), &".git", &"");
+  match init_repo(&real_git_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo for real data failed");
+    }
+  }
+  let ref_main = join_path(&real_git_dir, &"refs/heads/main");
+  let commit_hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n";
+  let _ = create_synced_file(&ref_main, &commit_hash.as_bytes());
+
+  let loose_dir = join_path(&real_git_dir, &"objects/ab");
+  make_dirs(&loose_dir).unwrap_or(true);
+  let loose_file = join_path(&loose_dir, &"cdef0123456789");
+  let _ = create_synced_file(&loose_file, &"dummy object".as_bytes());
+
+  let res_real = create_repo_managed(&root, &real_id, &"alice", &"main", &"admin", &"admin");
+  if !expect(res_real.is_err(), &"(d) repo with real data and missing metadata must be rejected with conflict") {
+    return false;
+  }
+  match res_real {
+    Ok(_) => {
+      return fail(&"(d) should not succeed when real data exists");
+    }
+    Err(e) => {
+      if !expect(e == "conflict", &"(d) error code is conflict") {
+        return false;
+      }
+    }
+  }
+  if !expect(file_exists(&ref_main).unwrap_or(false), &"(d) ref_main preserved and not destroyed") {
+    return false;
+  }
+  if !expect(file_exists(&loose_file).unwrap_or(false), &"(d) loose object preserved and not destroyed") {
+    return false;
+  }
+
+  // packed-refs がある場合も実データとして保護されること
+  let packed_id = "packed_data_repo";
+  let packed_git_dir = cat3(&cat3(&root, &"/", &packed_id), &".git", &"");
+  match init_repo(&packed_git_dir, true, &"main") {
+    Ok(_) => {}
+    Err(_) => {
+      return fail(&"init_repo for packed data failed");
+    }
+  }
+  let packed_refs_file = join_path(&packed_git_dir, &"packed-refs");
+  let _ = create_synced_file(&packed_refs_file, &"# pack-refs with: peeled fully-peeled sorted\n".as_bytes());
+
+  let res_packed = create_repo_managed(&root, &packed_id, &"alice", &"main", &"admin", &"admin");
+  if !expect(res_packed.is_err(), &"(d) repo with packed-refs must be rejected with conflict") {
+    return false;
+  }
+  if !expect(file_exists(&packed_refs_file).unwrap_or(false), &"(d) packed-refs preserved and not destroyed") {
+    return false;
+  }
+
   return true;
 }
 
