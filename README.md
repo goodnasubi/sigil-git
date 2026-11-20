@@ -112,6 +112,13 @@ SHA-256 のリポジトリで、`add` → `commit` → `checkout` の一連が�
 - `git/upload.sigil`、`git/gzip.sigil`、`git/crc32.sigil`、`git/acl.sigil`、`upload_server.sigil`（HMAC Bearer・固定 ACL の HTTP サーバー）。
 - 実 Git の確認: `SIGIL=... STAGE5_GIT=... ./interop_upload.sh`（STAGE5_GIT に git-remote-http が無ければ PATH の git を使う）
 
+## 転送 第3段「隔離受信と単一参照 push」（ADR 0048、Issue #13）
+
+スマート HTTP v0 の receive-pack（受信広告、pack の隔離検証、単一参照の更新、report-status、gzip 拒否、固定上限）です。詳細は [docs/RECEIVE_PACK.md](docs/RECEIVE_PACK.md)。
+
+- `git/recvpack.sigil`、`git/receive.sigil`、`git/acl.sigil`（`can_write`）、`upload_server.sigil`（write 権限の確認つき）。
+- 実 Git の確認: `SIGIL=... STAGE5_GIT=... ./interop_receive.sh`
+
 ## テストの実行
 
 前提として、Sigil コンパイラ（固定版コミット `33467e3b43238fdc69331c58a788c95f1de393e5`）が利用可能である必要があります。
@@ -131,4 +138,5 @@ SIGIL=/path/to/sigil ./interop.sh        # 第2段: init・書き込み・参照
 SIGIL=/path/to/sigil ./interop_pack.sh   # 第3段: gc 済みの pack の読み取り（オブジェクト・log --topo-order・ls-tree -r・diff）
 SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_history.sh  # 第5段
 SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_transfer.sh  # 転送 第1段: 広告を実 Git と比較、pack を index-pack --strict・verify-pack・fsck で検証
+SIGIL=/path/to/sigil STAGE5_GIT=/path/to/git ./interop_receive.sh  # 転送 第3段: 実 Git の push と拒否、認可、上限
 ```

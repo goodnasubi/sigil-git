@@ -1,0 +1,963 @@
+module git.receive
+  targets server
+  trust none
+
+use git.acl.can_read;
+use git.acl.can_write;
+use git.acl.parse_fixed_acl;
+use git.commit.commit_parents;
+use git.commit.commit_tree_id;
+use git.commit.decode_commit;
+use git.error.GitError;
+use git.fsio.cat3;
+use git.fsio.create_synced_file;
+use git.fsio.file_exists;
+use git.fsio.join_path;
+use git.fsio.lock_create;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.fsio.read_file_opt;
+use git.fsio.remove_file_if_exists;
+use git.gzip.select_encoding;
+use git.gzip.trimmed_lower;
+use git.hash.bytes_to_hex;
+use git.hash.is_valid_hex_id;
+use git.limits.max_advertised_refs;
+use git.limits.max_graph_walk_items;
+use git.limits.max_transfer_objects;
+use git.limits.max_transfer_response_size;
+use git.object.ObjectType;
+use git.odb.odb_read_in;
+use git.odb.odb_write;
+use git.odb.open_packs;
+use git.pack.PackStore;
+use git.pktline.PktLine;
+use git.pktline.pkt_encode_str;
+use git.pktline.pkt_flush;
+use git.pktline.pkt_read;
+use git.recvpack.RecvObject;
+use git.recvpack.kind_to_type;
+use git.recvpack.new_recv_object;
+use git.recvpack.recv_pack_parse;
+use git.refs.ExpectOld;
+use git.refs.check_ref_name;
+use git.refs.read_ref;
+use git.refs.update_ref;
+use git.repo.Repo;
+use git.tag.decode_tag;
+use git.tag.tag_object_id;
+use git.tag.tag_object_type;
+use git.transfer.advertise_receive_pack;
+use git.transfer.check_requested_capabilities;
+use git.transfer.collect_adv_set;
+use git.tree.decode_tree;
+use git.tree.entry_id;
+use git.tree.entry_mode;
+use git.walk.index_of;
+
+// ADR 0048 決定 1「push」/ 決定 2: receive-pack の要求処理（Smart HTTP v0、単一参照）。
+// 流れ: 要求の解読（400／ERR）→ 参照名・操作の方針（削除・タグ上書き・heads/tags 以外・複数参照は pack を読まずに ng）→
+//   pack を専用の非公開 staging（`<git_dir>/sigil-staging/`。objects の外で、upload-pack は読まない）に置いて隔離検証 →
+//   new から必要な全オブジェクトが受信集合または同じリポジトリの既存オブジェクトで閉じること、branch の先端が commit であること、
+//   既存 branch は old の子孫への fast-forward であること → リポジトリの排他（`<git_dir>/sigil-receive.lock`）を取り、
+//   最新の ACL と参照名・方針・旧値（CAS）を再検査 → 到達する受信オブジェクトを loose として同期・原子的に公開 →
+//   その後にだけ単一参照を 0047 の update_ref（.lock・CAS・同期・rename・親ディレクトリの同期）で公開 → report-status。
+// 失敗の固定理由（ng の理由）: unsupported_ref / invalid_ref / delete_not_allowed / tag_exists / multiple_refs（pack を読まない。unpack は skipped）、
+//   bad_pack / thin_pack / unsupported_pack / pack_limit_exceeded（unpack の失敗。ng は unpack_failed）、
+//   missing_objects / bad_object / not_a_commit / non_fast_forward / walk_limit_exceeded（unpack ok の ng）。
+// HTTP の段階: 認証 401・read 権限なし 404・write 権限なし 403（最新 ACL の再検査を含む）・競合（ロック・旧値不一致）409・
+//   不正形式 400・上限超過 413・未対応媒体／符号化 415・保存の失敗 500（リポジトリを使用停止にする）・使用停止中 503。
+
+pub struct ReceiveReply {
+  status: Int,
+  content_type: String,
+  body: Bytes,
+}
+
+pub struct ReceiveCommand {
+  old_id: String,
+  new_id: String,
+  ref_name: String,
+  caps: List<String>,
+}
+
+pub struct ReceiveRequest {
+  cmd: ReceiveCommand,
+  multiple: Bool,
+  pack: Bytes,
+}
+
+pub struct WriteCheck {
+  acl_path: String,
+  repo_id: String,
+  subject: String,
+  allow: Bool,
+}
+
+pub fn new_write_check(acl_path: String, repo_id: String, subject: String, allow: Bool) -> WriteCheck
+  intent "WriteCheck を構築する（他のモジュールから構造体リテラルは作れないため）"
+  requires none
+  ensures none
+  effects none
+{
+  return WriteCheck { acl_path: acl_path, repo_id: repo_id, subject: subject, allow: allow };
+}
+
+pub struct Prepared {
+  cmd: ReceiveCommand,
+  reach: List<RecvObject>,
+}
+
+struct Found {
+  kind: Int,
+  content: Bytes,
+}
+
+fn text_reply(status: Int, reason: &String) -> ReceiveReply
+  intent "固定理由だけを本文にした text/plain の応答を作る"
+  requires 200 <= status && status <= 599
+  ensures none
+  effects none
+{
+  return ReceiveReply { status: status, content_type: "text/plain", body: reason.as_bytes() };
+}
+
+fn result_reply(body: Bytes) -> ReceiveReply
+  intent "receive-pack の結果（200）の応答を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return ReceiveReply { status: 200, content_type: "application/x-git-receive-pack-result", body: body };
+}
+
+fn zeros64() -> String
+  intent "ゼロ識別子（64 桁の 0）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < 64 {
+    b.push(48);
+    i = i + 1;
+  }
+  return b.to_string_utf8().unwrap_or("");
+}
+
+fn tok_at(toks: &List<String>, i: Int) -> String
+  intent "i 番目の項目（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match toks.get(i) {
+    Some(t) => t.clone(),
+    None => "",
+  };
+}
+
+fn split_ws(b: &Bytes) -> Result<List<String>, GitError>
+  intent "空白 1 つ区切りの項目に分ける。空の項目は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut cur = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if c == 32 {
+      if cur.len() == 0 {
+        return Err(GitError.Corrupt("empty token in a command line"));
+      }
+      out.push(cur.to_string_utf8().map_err(|e| GitError.Corrupt("command line is not UTF-8"))?);
+      cur = Bytes.new();
+    } else {
+      cur.push(c);
+    }
+    i = i + 1;
+  }
+  if cur.len() == 0 {
+    if b.len() > 0 {
+      return Err(GitError.Corrupt("empty token in a command line"));
+    }
+    return Ok(out);
+  }
+  out.push(cur.to_string_utf8().map_err(|e| GitError.Corrupt("command line is not UTF-8"))?);
+  return Ok(out);
+}
+
+fn is_hex40(s: &String) -> Bool
+  intent "40 桁の小文字 hex か（SHA-1 形式の識別子の検出用）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  if b.len() != 40 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.len() {
+    let c = b.get(i).unwrap_or(0);
+    if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn check_id(s: &String) -> Result<Bool, GitError>
+  intent "コマンド行の識別子が SHA-256 の 64 桁か。40 桁（SHA-1）は UnsupportedFormat、それ以外の不正は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  if is_hex40(&s) {
+    return Err(GitError.UnsupportedFormat("sha1_not_supported"));
+  }
+  if !is_valid_hex_id(&s) {
+    return Err(GitError.Corrupt("object id is not a SHA-256 object id"));
+  }
+  return Ok(true);
+}
+
+pub fn parse_receive_request(body: &Bytes) -> Result<ReceiveRequest, GitError>
+  intent "receive-pack の要求（`<old> <new> <ref>\\0<capabilities>` の 1 行、flush、pack）を読む。能力は report-status が必須で、広告に無い能力（atomic・push-options・side-band-64k・agent・SHA-1 の object-format など）と shallow／push-cert 行は UnsupportedFormat。2 行目以降のコマンドがあれば multiple（pack は読まない）。1 pkt-line 65520 byte 超は LimitExceeded、それ以外の不正は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  if body.len() == 0 {
+    return Err(GitError.Corrupt("request is empty"));
+  }
+  let first = pkt_read(&body, 0)?;
+  let mut payload = Bytes.new();
+  match first.line {
+    PktLine.Flush => {
+      return Err(GitError.Corrupt("request has no command"));
+    }
+    PktLine.Data(p) => {
+      payload = p;
+    }
+  }
+  if payload.len() > 0 && payload.get(payload.len() - 1).unwrap_or(0) == 10 {
+    payload = payload.slice(0, payload.len() - 1).unwrap_or(Bytes.new());
+  }
+  let mut nul = 0 - 1;
+  let mut k = 0;
+  while k < payload.len() && nul < 0 {
+    if payload.get(k).unwrap_or(1) == 0 {
+      nul = k;
+    }
+    k = k + 1;
+  }
+  let head = match nul >= 0 {
+    true => payload.slice(0, nul).unwrap_or(Bytes.new()),
+    false => payload.clone(),
+  };
+  let toks = split_ws(&head)?;
+  let first_name = tok_at(&toks, 0);
+  if first_name == "shallow" || first_name == "push-cert" || first_name == "push-cert=" {
+    return Err(GitError.UnsupportedFormat("unsupported_request"));
+  }
+  if toks.len() != 3 {
+    return Err(GitError.Corrupt("command line must be old, new and ref"));
+  }
+  if nul < 0 {
+    return Err(GitError.Corrupt("capabilities are missing"));
+  }
+  let old_id = tok_at(&toks, 0);
+  let new_id = tok_at(&toks, 1);
+  let ref_name = tok_at(&toks, 2);
+  check_id(&old_id)?;
+  check_id(&new_id)?;
+  // 実 Git は能力の列の先頭に空白を 1 つ置く（`\0 report-status ...`）。その 1 つだけは許す
+  let mut caps_from = nul + 1;
+  if caps_from < payload.len() && payload.get(caps_from).unwrap_or(0) == 32 {
+    caps_from = caps_from + 1;
+  }
+  let caps_bytes = payload.slice(caps_from, payload.len()).unwrap_or(Bytes.new());
+  let caps = split_ws(&caps_bytes)?;
+  check_requested_capabilities(false, &caps)?;
+  if index_of(&caps, &"report-status") < 0 {
+    return Err(GitError.UnsupportedFormat("report_status_required"));
+  }
+  let cmd = ReceiveCommand { old_id: old_id, new_id: new_id, ref_name: ref_name, caps: caps };
+  let second = pkt_read(&body, first.next)?;
+  match second.line {
+    PktLine.Data(_) => {
+      return Ok(ReceiveRequest { cmd: cmd, multiple: true, pack: Bytes.new() });
+    }
+    PktLine.Flush => {}
+  }
+  let pack = body.slice(second.next, body.len()).unwrap_or(Bytes.new());
+  // 削除（new がゼロ）は pack を伴わない（実 Git の要求は flush で終わる）。方針の検査で delete_not_allowed に至らせる
+  if pack.len() == 0 && cmd.new_id != zeros64() {
+    return Err(GitError.Corrupt("pack is missing"));
+  }
+  return Ok(ReceiveRequest { cmd: cmd, multiple: false, pack: pack });
+}
+
+pub fn policy_reason(cmd: &ReceiveCommand) -> Option<String>
+  intent "コマンドだけで決まる方針の拒否理由を返す（pack を読む前）。refs/heads/* と refs/tags/* 以外・不正な参照名・削除・タグの上書き（old がゼロでないタグ）を拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  let is_head = string_prefix(&cmd.ref_name, &"refs/heads/");
+  let is_tag = string_prefix(&cmd.ref_name, &"refs/tags/");
+  if !is_head && !is_tag {
+    return Some("unsupported_ref");
+  }
+  match check_ref_name(&cmd.ref_name) {
+    Err(_) => {
+      return Some("invalid_ref");
+    }
+    Ok(_) => {}
+  }
+  if cmd.new_id == zeros64() {
+    return Some("delete_not_allowed");
+  }
+  if is_tag && cmd.old_id != zeros64() {
+    return Some("tag_exists");
+  }
+  return None;
+}
+
+pub fn policy_check(old_id: &String, new_id: &String, ref_name: &String) -> String
+  intent "policy_reason を、コマンドの 3 要素から呼ぶ。許可なら空文字列、拒否なら固定理由"
+  requires none
+  ensures none
+  effects none
+{
+  let cmd = ReceiveCommand { old_id: old_id.clone(), new_id: new_id.clone(), ref_name: ref_name.clone(), caps: List.new() };
+  return match policy_reason(&cmd) {
+    Some(r) => r,
+    None => "",
+  };
+}
+
+fn string_prefix(s: &String, prefix: &String) -> Bool
+  intent "s が prefix で始まるか"
+  requires none
+  ensures none
+  effects none
+{
+  let sb = s.as_bytes();
+  let pb = prefix.as_bytes();
+  if sb.len() < pb.len() {
+    return false;
+  }
+  return sb.slice(0, pb.len()).unwrap_or(Bytes.new()) == pb;
+}
+
+fn type_kind(t: &ObjectType) -> Int
+  intent "オブジェクト型の番号 (1 commit, 2 tree, 3 blob, 4 tag)"
+  requires none
+  ensures none
+  effects none
+{
+  return match t {
+    ObjectType.Commit => 1,
+    ObjectType.Tree => 2,
+    ObjectType.Blob => 3,
+    ObjectType.Tag => 4,
+  };
+}
+
+fn name_kind(name: &String) -> Int
+  intent "tag の object 型名を番号にする（不明は 0）"
+  requires none
+  ensures none
+  effects none
+{
+  if name == "commit" {
+    return 1;
+  }
+  if name == "tree" {
+    return 2;
+  }
+  if name == "blob" {
+    return 3;
+  }
+  if name == "tag" {
+    return 4;
+  }
+  return 0;
+}
+
+fn read_any(repo: &Repo, packs: &List<PackStore>, objs: &List<RecvObject>, id: &String) -> Result<Option<Found>, GitError>
+  intent "受信集合を先に、無ければリポジトリから読む。どちらにも無ければ None"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut i = 0;
+  while i < objs.len() {
+    match objs.get(i) {
+      Some(o) => {
+        if o.id == id {
+          return Ok(Some(Found { kind: o.kind, content: o.content.clone() }));
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return match odb_read_in(&repo, &packs, &id) {
+    Ok(o) => Ok(Some(Found { kind: type_kind(&o.obj_type), content: o.content })),
+    Err(e) => match e {
+      GitError.NotFound(_) => Ok(None),
+      other => Err(other),
+    },
+  };
+}
+
+fn require_any(repo: &Repo, packs: &List<PackStore>, objs: &List<RecvObject>, id: &String) -> Result<Found, GitError>
+  intent "read_any で読み、無ければ NotFound（missing_objects）"
+  requires none
+  ensures none
+  effects fs
+{
+  return match read_any(&repo, &packs, &objs, &id)? {
+    Some(f) => Ok(f),
+    None => Err(GitError.NotFound("missing_objects")),
+  };
+}
+
+fn count_item(left: Int) -> Result<Int, GitError>
+  intent "走査件数を 1 つ使う。使い切っていれば LimitExceeded（walk_limit_exceeded）"
+  requires none
+  ensures none
+  effects none
+{
+  if left <= 0 {
+    return Err(GitError.LimitExceeded("walk_limit_exceeded"));
+  }
+  return Ok(left - 1);
+}
+
+fn verify_closure(repo: &Repo, packs: &List<PackStore>, objs: &List<RecvObject>, new_id: &String, branch: Bool, budget: Int) -> Result<List<String>, GitError>
+  intent "new から辿れるオブジェクトが、受信集合または同じリポジトリの既存オブジェクトで閉じていることを確かめ、到達する受信オブジェクトの識別子を返す。既存オブジェクトに着いたらそこから先は検証済みとみなす。欠落は NotFound（missing_objects）、型・形式の不正は TypeMismatch（bad_object）、branch の先端が commit でなければ TypeMismatch（not_a_commit）、走査件数超過は LimitExceeded"
+  requires budget >= 0
+  ensures none
+  effects fs
+{
+  let mut recv_ids = List.new();
+  let mut r = 0;
+  while r < objs.len() {
+    match objs.get(r) {
+      Some(o) => {
+        recv_ids.push(o.id.clone());
+      }
+      None => {}
+    }
+    r = r + 1;
+  }
+  let mut queue = List.new();
+  let mut want = List.new();
+  queue.push(new_id.clone());
+  want.push(0);
+  let mut seen = List.new();
+  let mut reached = List.new();
+  let mut head = 0;
+  let mut left = budget;
+  while head < queue.len() {
+    let id = tok_at(&queue, head);
+    let expected = match want.get(head) {
+      Some(w) => w + 0,
+      None => 0,
+    };
+    head = head + 1;
+    left = count_item(left)?;
+    if index_of(&seen, &id) < 0 {
+      let found = require_any(&repo, &packs, &objs, &id)?;
+      if expected != 0 && found.kind != expected {
+        return Err(GitError.TypeMismatch("bad_object"));
+      }
+      if branch && head == 1 && found.kind != 1 {
+        return Err(GitError.TypeMismatch("not_a_commit"));
+      }
+      seen.push(id.clone());
+      if index_of(&recv_ids, &id) >= 0 {
+        reached.push(id.clone());
+        if found.kind == 1 {
+          let c = decode_commit(&found.content).map_err(|e| GitError.TypeMismatch("bad_object"))?;
+          queue.push(commit_tree_id(&c));
+          want.push(2);
+          let parents = commit_parents(&c);
+          let mut i = 0;
+          while i < parents.len() {
+            queue.push(tok_at(&parents, i));
+            want.push(1);
+            i = i + 1;
+          }
+        } else if found.kind == 2 {
+          let entries = decode_tree(&found.content).map_err(|e| GitError.TypeMismatch("bad_object"))?;
+          let mut i = 0;
+          while i < entries.len() {
+            match entries.get(i) {
+              None => {}
+              Some(e) => {
+                let mode = entry_mode(&e);
+                if mode != 160000 {
+                  queue.push(bytes_to_hex(&entry_id(&e)));
+                  if mode == 40000 {
+                    want.push(2);
+                  } else {
+                    want.push(3);
+                  }
+                }
+              }
+            }
+            i = i + 1;
+          }
+        } else if found.kind == 4 {
+          let tg = decode_tag(&found.content).map_err(|e| GitError.TypeMismatch("bad_object"))?;
+          let k = name_kind(&tag_object_type(&tg));
+          if k == 0 {
+            return Err(GitError.TypeMismatch("bad_object"));
+          }
+          queue.push(tag_object_id(&tg));
+          want.push(k);
+        }
+      }
+    }
+  }
+  return Ok(reached);
+}
+
+fn is_ancestor(repo: &Repo, packs: &List<PackStore>, objs: &List<RecvObject>, old_id: &String, new_id: &String, budget: Int) -> Result<Bool, GitError>
+  intent "old が new の祖先（または同一）かを、親をたどって調べる。走査件数が budget を超えれば LimitExceeded"
+  requires budget >= 0
+  ensures none
+  effects fs
+{
+  let mut queue = List.new();
+  queue.push(new_id.clone());
+  let mut seen = List.new();
+  let mut head = 0;
+  let mut left = budget;
+  while head < queue.len() {
+    let id = tok_at(&queue, head);
+    head = head + 1;
+    left = count_item(left)?;
+    if id == old_id.clone() {
+      return Ok(true);
+    }
+    if index_of(&seen, &id) < 0 {
+      seen.push(id.clone());
+      let found = require_any(&repo, &packs, &objs, &id)?;
+      if found.kind != 1 {
+        return Err(GitError.TypeMismatch("bad_object"));
+      }
+      let c = decode_commit(&found.content).map_err(|e| GitError.TypeMismatch("bad_object"))?;
+      let parents = commit_parents(&c);
+      let mut i = 0;
+      while i < parents.len() {
+        queue.push(tok_at(&parents, i));
+        i = i + 1;
+      }
+    }
+  }
+  return Ok(false);
+}
+
+fn pack_reason(e: &GitError) -> String
+  intent "pack の解析の失敗を固定理由にする（内部の文言を漏らさない）"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    GitError.LimitExceeded(_) => "pack_limit_exceeded",
+    GitError.UnsupportedFormat(m) => match string_prefix(&m, &"thin pack") {
+      true => "thin_pack",
+      false => "unsupported_pack",
+    },
+    _ => "bad_pack",
+  };
+}
+
+pub fn is_unpack_reason(reason: &String) -> Bool
+  intent "unpack の失敗の理由か（それ以外は unpack ok の ng）"
+  requires none
+  ensures none
+  effects none
+{
+  return reason == "bad_pack" || reason == "thin_pack" || reason == "unsupported_pack" || reason == "pack_limit_exceeded";
+}
+
+fn reason_of(e: &GitError) -> String
+  intent "検証の失敗の固定理由（エラーの文言そのもの。検証の内部で固定理由だけを文言にしてある）"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    GitError.LimitExceeded(m) => m.clone(),
+    GitError.NotFound(m) => m.clone(),
+    GitError.TypeMismatch(m) => m.clone(),
+    GitError.Corrupt(m) => m.clone(),
+    GitError.UnsupportedFormat(m) => m.clone(),
+    _ => "internal_error",
+  };
+}
+
+pub fn receive_verify(repo: &Repo, req: &ReceiveRequest, object_limit: Int, total_limit: Int, single_limit: Int, walk_budget: Int) -> Result<Prepared, GitError>
+  intent "隔離検証。pack の解析（件数・長さ・SHA-256 trailer・zlib・OID・delta）、new の閉包と型、既存 branch の fast-forward を確かめる。リポジトリは変更しない。失敗は固定理由を文言にした GitError（pack の失敗は bad_pack／thin_pack／unsupported_pack／pack_limit_exceeded）"
+  requires object_limit >= 0 && total_limit >= 0 && single_limit >= 0 && walk_budget >= 0
+  ensures none
+  effects fs
+{
+  let objs = recv_pack_parse(&req.pack, object_limit, total_limit, single_limit).map_err(|e| GitError.Corrupt(pack_reason(&e)))?;
+  let packs = open_packs(&repo)?;
+  let branch = string_prefix(&req.cmd.ref_name, &"refs/heads/");
+  let reached_ids = verify_closure(&repo, &packs, &objs, &req.cmd.new_id, branch, walk_budget).map_err(|e| GitError.Corrupt(reason_of(&e)))?;
+  if branch && req.cmd.old_id != zeros64() {
+    let ff = is_ancestor(&repo, &packs, &objs, &req.cmd.old_id, &req.cmd.new_id, walk_budget).map_err(|e| GitError.Corrupt(reason_of(&e)))?;
+    if !ff {
+      return Err(GitError.Corrupt("non_fast_forward"));
+    }
+  }
+  let mut reach = List.new();
+  let mut i = 0;
+  while i < objs.len() {
+    match objs.get(i) {
+      Some(o) => {
+        if index_of(&reached_ids, &o.id) >= 0 {
+          reach.push(new_recv_object(o.id.clone(), o.kind, o.content.clone()));
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(Prepared { cmd: ReceiveCommand { old_id: req.cmd.old_id.clone(), new_id: req.cmd.new_id.clone(), ref_name: req.cmd.ref_name.clone(), caps: req.cmd.caps.clone() }, reach: reach });
+}
+
+fn report_bytes(unpack: &String, ref_name: &String, ok: Bool, reason: &String) -> Bytes
+  intent "report-status の本文（unpack 行、ok／ng 行、flush）を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = pkt_encode_str(&cat3(&"unpack ", &unpack, &"\n")).unwrap_or(Bytes.new());
+  if ok {
+    out.extend(&pkt_encode_str(&cat3(&"ok ", &ref_name, &"\n")).unwrap_or(Bytes.new()));
+  } else {
+    out.extend(&pkt_encode_str(&cat3(&cat3(&"ng ", &ref_name, &" "), &reason, &"\n")).unwrap_or(Bytes.new()));
+  }
+  out.extend(&pkt_flush());
+  return out;
+}
+
+pub fn rejection_reply(cmd: &ReceiveCommand, reason: &String, skipped: Bool) -> ReceiveReply
+  intent "拒否の report-status を作る。skipped は pack を読まずに拒否した場合（unpack skipped）。unpack の失敗は `unpack <理由>` と `ng <ref> unpack_failed`、それ以外は `unpack ok` と `ng <ref> <理由>`"
+  requires none
+  ensures none
+  effects none
+{
+  if skipped {
+    return result_reply(report_bytes(&"skipped", &cmd.ref_name, false, &reason));
+  }
+  if is_unpack_reason(&reason) {
+    return result_reply(report_bytes(&reason, &cmd.ref_name, false, &"unpack_failed"));
+  }
+  return result_reply(report_bytes(&"ok", &cmd.ref_name, false, &reason));
+}
+
+fn quarantine_path(repo: &Repo) -> String
+  intent "使用停止の印のファイルの場所"
+  requires none
+  ensures none
+  effects none
+{
+  return join_path(&repo.git_dir, &"sigil-quarantine");
+}
+
+pub fn repo_is_quarantined(repo: &Repo) -> Bool
+  intent "保存の失敗でリポジトリが使用停止になっているか"
+  requires none
+  ensures none
+  effects fs
+{
+  return file_exists(&quarantine_path(&repo)).unwrap_or(true);
+}
+
+fn mark_quarantined(repo: &Repo)
+  intent "保存の失敗の後、復旧確認まで当該リポジトリを使用停止にする印を書く（書けなくても失敗は呼び出し側が報告する）"
+  requires none
+  ensures none
+  effects fs
+{
+  let _ = create_synced_file(&quarantine_path(&repo), &"storage failure; verify the repository before reuse\n".as_bytes());
+}
+
+fn write_status(wc: &WriteCheck) -> Int
+  intent "最新の ACL で書き込み権限を再検査する。0 は許可、404 は read 権限なし（存在を隠す）、403 は write 権限なし。acl_path が空なら allow を使う。ACL を読めない・解釈できないときは拒否側（404）に倒す"
+  requires none
+  ensures none
+  effects fs.read
+{
+  if wc.acl_path == "" {
+    if wc.allow {
+      return 0;
+    }
+    return 403;
+  }
+  let text = match read_file_opt(&wc.acl_path, 65536, false) {
+    Ok(Some(b)) => b.to_string_utf8().unwrap_or(""),
+    _ => "",
+  };
+  return match parse_fixed_acl(&text) {
+    Err(_) => 404,
+    Ok(acl) => match can_read(&acl, &wc.subject, &wc.repo_id) {
+      false => 404,
+      true => match can_write(&acl, &wc.subject, &wc.repo_id) {
+        true => 0,
+        false => 403,
+      },
+    },
+  };
+}
+
+fn publish(repo: &Repo, p: &Prepared) -> Result<Bool, GitError>
+  intent "到達する受信オブジェクトを loose として同期・原子的に公開し（odb_write）、その後にだけ単一参照を update_ref で公開する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let mut i = 0;
+  while i < p.reach.len() {
+    match p.reach.get(i) {
+      Some(o) => {
+        let id = odb_write(&repo, &kind_to_type(o.kind), &o.content)?;
+        if id != o.id {
+          return Err(GitError.Io("persisted object id does not match"));
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let expect = match p.cmd.old_id == zeros64() {
+    true => ExpectOld.Absent,
+    false => ExpectOld.Is(p.cmd.old_id.clone()),
+  };
+  update_ref(&repo, &p.cmd.ref_name, &p.cmd.new_id, expect)?;
+  return Ok(true);
+}
+
+pub fn receive_commit(repo: &Repo, p: &Prepared, wc: &WriteCheck) -> ReceiveReply
+  intent "リポジトリの排他（sigil-receive.lock）の下で、最新 ACL（403／404）・方針・旧値（CAS。違えば 409）を再検査し、オブジェクト→参照の順に公開して、同期の完了後にだけ ok を返す。ロックが取れなければ 409。保存の失敗は 500 でリポジトリを使用停止にする。参照公開前の拒否では参照を変更しない"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let lock_path = join_path(&repo.git_dir, &"sigil-receive.lock");
+  match lock_create(&lock_path) {
+    Err(e) => {
+      return match e {
+        GitError.Locked(_) => text_reply(409, &"conflict"),
+        _ => text_reply(500, &"storage_failure"),
+      };
+    }
+    Ok(f) => {
+      let mut lf = f;
+      let _ = lf.close();
+    }
+  }
+  let reply = commit_locked(&repo, &p, &wc);
+  let _ = remove_file_if_exists(&lock_path);
+  return reply;
+}
+
+fn commit_locked(repo: &Repo, p: &Prepared, wc: &WriteCheck) -> ReceiveReply
+  intent "排他を取った後の再検査と公開（receive_commit の本体）"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let ws = write_status(&wc);
+  if ws == 403 {
+    return text_reply(403, &"forbidden");
+  }
+  if ws == 404 {
+    return text_reply(404, &"not found");
+  }
+  match policy_reason(&p.cmd) {
+    Some(r) => {
+      return rejection_reply(&p.cmd, &r, false);
+    }
+    None => {}
+  }
+  let current = match read_ref(&repo, &p.cmd.ref_name) {
+    Ok(c) => c,
+    Err(_) => None,
+  };
+  let readable = read_ref(&repo, &p.cmd.ref_name).is_ok();
+  if !readable {
+    return text_reply(500, &"storage_failure");
+  }
+  let ok_old = match current {
+    None => p.cmd.old_id == zeros64(),
+    Some(v) => v == p.cmd.old_id,
+  };
+  if !ok_old {
+    return text_reply(409, &"conflict");
+  }
+  return match publish(&repo, &p) {
+    Ok(_) => result_reply(report_bytes(&"ok", &p.cmd.ref_name, true, &"")),
+    Err(e) => match e {
+      GitError.RefMismatch(_) => text_reply(409, &"conflict"),
+      GitError.Locked(_) => text_reply(409, &"conflict"),
+      GitError.AlreadyExists(_) => text_reply(409, &"conflict"),
+      _ => storage_failed(&repo),
+    },
+  };
+}
+
+fn storage_failed(repo: &Repo) -> ReceiveReply
+  intent "保存の失敗: 当該リポジトリを使用停止にして 500 を返す（成功表示は出さない。途中に永続化した未到達オブジェクトは残り得る）"
+  requires none
+  ensures none
+  effects fs
+{
+  mark_quarantined(&repo);
+  return text_reply(500, &"storage_failure");
+}
+
+fn stage_pack(repo: &Repo, pack: &Bytes) -> Result<String, GitError>
+  intent "pack を専用の非公開 staging（objects の外）へ書いて同期する。返すのは staging ファイルの場所"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let dir = join_path(&repo.git_dir, &"sigil-staging");
+  make_dirs(&dir)?;
+  let path = join_path(&dir, &cat3(&random_hex(16)?, &".pack", &""));
+  create_synced_file(&path, &pack)?;
+  return Ok(path);
+}
+
+pub fn receive_pack_post_limited(repo: &Repo, encodings: &List<Bytes>, content_type: &Option<Bytes>, body: &Bytes, wc: &WriteCheck, object_limit: Int, total_limit: Int, single_limit: Int, walk_budget: Int) -> ReceiveReply
+  intent "認証・認可（write 権限）の後の POST を処理する。順序: Content-Encoding（gzip を含め identity 以外は 415）→ Content-Type（415）→ 本文 1 MiB（413）→ 要求の解読（400／未対応は ERR）→ 方針（pack を読まずに ng）→ staging と隔離検証 → 排他の下の再検査と公開 → report-status"
+  requires object_limit >= 0 && total_limit >= 0 && single_limit >= 0 && walk_budget >= 0
+  ensures none
+  effects fs, random
+{
+  match select_encoding(&encodings, false) {
+    Ok(_) => {}
+    Err(r) => {
+      return text_reply(r.status, &r.reason);
+    }
+  }
+  let ct_ok = match content_type {
+    Some(ct) => trimmed_lower(&ct) == "application/x-git-receive-pack-request".as_bytes(),
+    None => false,
+  };
+  if !ct_ok {
+    return text_reply(415, &"unsupported_media_type");
+  }
+  if body.len() > 1048576 {
+    return text_reply(413, &"request_too_large");
+  }
+  return match parse_receive_request(&body) {
+    Err(e) => parse_error_reply(&e),
+    Ok(req) => run_request(&repo, &req, &wc, object_limit, total_limit, single_limit, walk_budget),
+  };
+}
+
+fn parse_error_reply(e: &GitError) -> ReceiveReply
+  intent "要求の解読の失敗を HTTP 応答か ERR 行にする（413／ERR／400）"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    GitError.LimitExceeded(_) => text_reply(413, &"limit_exceeded"),
+    GitError.UnsupportedFormat(_) => result_reply(pkt_encode_str(&"ERR receive-pack: unsupported request").unwrap_or(Bytes.new())),
+    _ => text_reply(400, &"invalid_request"),
+  };
+}
+
+fn run_request(repo: &Repo, req: &ReceiveRequest, wc: &WriteCheck, object_limit: Int, total_limit: Int, single_limit: Int, walk_budget: Int) -> ReceiveReply
+  intent "解読済みの要求を処理する: 方針（pack を読まずに ng）→ staging と隔離検証 → 排他の下の再検査と公開"
+  requires object_limit >= 0 && total_limit >= 0 && single_limit >= 0 && walk_budget >= 0
+  ensures none
+  effects fs, random
+{
+  if req.multiple {
+    return rejection_reply(&req.cmd, &"multiple_refs", true);
+  }
+  match policy_reason(&req.cmd) {
+    Some(r) => {
+      return rejection_reply(&req.cmd, &r, true);
+    }
+    None => {}
+  }
+  let staged_res = stage_pack(&repo, &req.pack);
+  if staged_res.is_err() {
+    return text_reply(500, &"storage_failure");
+  }
+  let staged = staged_res.unwrap_or("");
+  let verified = receive_verify(&repo, &req, object_limit, total_limit, single_limit, walk_budget);
+  let _ = remove_file_if_exists(&staged);
+  return match verified {
+    Err(e) => rejection_reply(&req.cmd, &reason_of(&e), false),
+    Ok(p) => receive_commit(&repo, &p, &wc),
+  };
+}
+
+pub fn receive_pack_post(repo: &Repo, encodings: &List<Bytes>, content_type: &Option<Bytes>, body: &Bytes, wc: &WriteCheck) -> ReceiveReply
+  intent "固定上限（オブジェクト 4096、展開累計 16 MiB、単体 8 MiB、グラフ走査 100000）で POST を処理する"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return receive_pack_post_limited(&repo, &encodings, &content_type, &body, &wc, max_transfer_objects(), 16777216, 8388608, max_graph_walk_items());
+}
+
+pub fn receive_advertisement(repo: &Repo) -> Result<Bytes, GitError>
+  intent "GET info/refs?service=git-receive-pack の応答本体を作る（`# service=git-receive-pack` と flush を前置き）。peeled 行は出さず、空のリポジトリはゼロ識別子と capabilities^{}。参照数 1024・全体 1 MiB を超えれば LimitExceeded"
+  requires none
+  ensures none
+  effects fs
+{
+  let set = collect_adv_set(&repo)?;
+  if set.refs.len() > max_advertised_refs() {
+    return Err(GitError.LimitExceeded("too many advertised references"));
+  }
+  let adv = advertise_receive_pack(&set.refs)?;
+  let mut out = pkt_encode_str(&"# service=git-receive-pack\n")?;
+  out.extend(&pkt_flush());
+  out.extend(&adv);
+  if out.len() > max_transfer_response_size() {
+    return Err(GitError.LimitExceeded("advertisement exceeds the response limit"));
+  }
+  return Ok(out);
+}
+
+pub fn receive_info_refs_reply(repo: &Repo, query: &Bytes) -> ReceiveReply
+  intent "GET info/refs の応答（認証・認可の後）。query は `service=git-receive-pack` ちょうど 1 つだけを受理し、重複・余分・別 service は 400"
+  requires none
+  ensures none
+  effects fs
+{
+  if query != "service=git-receive-pack".as_bytes() {
+    return text_reply(400, &"invalid_query");
+  }
+  return match receive_advertisement(&repo) {
+    Ok(body) => ReceiveReply { status: 200, content_type: "application/x-git-receive-pack-advertisement", body: body },
+    Err(e) => match e {
+      GitError.LimitExceeded(_) => text_reply(413, &"limit_exceeded"),
+      _ => text_reply(500, &"repository_error"),
+    },
+  };
+}

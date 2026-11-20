@@ -13,6 +13,7 @@ use tests.test_limits.run_limits_tests;
 use tests.test_object.run_object_tests;
 use tests.test_ops.run_ops_tests;
 use tests.test_pack.run_pack_tests;
+use tests.test_receive.run_receive_tests;
 use tests.test_repo.run_repo_tests;
 use tests.test_tag.run_tag_tests;
 use tests.test_transfer.run_transfer_tests;
@@ -147,6 +148,12 @@ pub fn main() -> Int
   if !run_upload_tests() {
     console.log(&"FAIL: upload-pack tests");
     return 20;
+  }
+
+  console.log(&"Running tests: receive-pack (quarantine verification, single-ref push, limits)");
+  if !run_receive_tests() {
+    console.log(&"FAIL: receive-pack tests");
+    return 21;
   }
 
   console.log(&"ALL TESTS PASSED SUCCESSFULLY");

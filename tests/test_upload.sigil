@@ -316,7 +316,7 @@ pub struct Fixture {
   ok: Bool,
 }
 
-fn build_fixture(repo: Repo) -> Fixture
+pub fn build_fixture(repo: Repo) -> Fixture
   intent "テスト用の履歴を作る。main = commit2（親 commit1）、feature = commit1、注釈付きタグ t1 → commit2、軽量タグ lw → commit1、注釈付きタグ t4 → commit4（先端ではない）。commit3 と secret はどの参照からも到達できない（未公開）"
   requires none
   ensures none

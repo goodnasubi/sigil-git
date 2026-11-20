@@ -4,11 +4,18 @@ module upload_server
 
 use git.acl.FixedAcl;
 use git.acl.can_read;
+use git.acl.can_write;
 use git.acl.parse_fixed_acl;
 use git.acl.repo_id_ok;
 use git.fsio.cat3;
+use git.fsio.read_file_opt;
 use git.gzip.gzip_decode;
 use git.hash.int_to_str;
+use git.receive.ReceiveReply;
+use git.receive.new_write_check;
+use git.receive.receive_info_refs_reply;
+use git.receive.receive_pack_post;
+use git.receive.repo_is_quarantined;
 use git.repo.Repo;
 use git.repo.open_repo;
 use git.upload.UploadReply;
@@ -21,11 +28,14 @@ use git.upload.upload_pack_post;
 // 認証は ADR 0037 の固定 HMAC Bearer 検証器（std.web）。認可は git.acl の固定の表だけ（本格的な ACL は第 4 段）。
 // 順序: 経路の形と query の形 → Bearer 認証（401）→ 認可（読めなければ存在を明かさず 404）→ Content-Encoding の検査 → 本文の処理。
 // 環境変数: SIGIL_GIT_REPO_ROOT（`<id>.git` の置き場）、SIGIL_GIT_ACL（`repo:subject,subject;...`）、SIGIL_AUTH_HMAC_KEY_HEX、SIGIL_AUTH_AUDIENCE、
+// receive-pack（第 3 段）: GET info/refs?service=git-receive-pack と POST /repos/<id>/git-receive-pack。read に加えて write 権限（`repo:sub=rw`）が要る。
+// SIGIL_GIT_ACL_FILE を指定すると要求ごとに ACL を読み直し、公開の直前にも再検査する（ACL 変更と push の競合の試験用）。
 // SIGIL_GIT_SERVE_CONNS（受け付ける接続の数。既定 64）、SIGIL_GIT_LOG_REQUESTS=1（POST の符号化前後の本文サイズを標準出力へ出す。試験用）。
 
 struct Ctx {
   router: Router,
   acl: FixedAcl,
+  acl_file: String,
   root: String,
   log: Bool,
 }
@@ -53,6 +63,7 @@ fn build_router() -> Result<Router, ConfigError>
   let mut router = Router.new().with_auth(verifier);
   router = router.route("GET", "/repos/:id/info/refs", RouteHandler { handle: authorize }).unwrap_or(Router.new());
   router = router.route("POST", "/repos/:id/git-upload-pack", RouteHandler { handle: authorize }).unwrap_or(Router.new());
+  router = router.route("POST", "/repos/:id/git-receive-pack", RouteHandler { handle: authorize }).unwrap_or(Router.new());
   return Ok(router);
 }
 
@@ -72,6 +83,37 @@ fn to_response(r: &UploadReply) -> HttpResponse
   effects none
 {
   return no_store(HttpResponse.new(r.status, r.body.clone()).with_header(&"content-type", &r.content_type.as_bytes()));
+}
+
+fn to_receive_response(r: &ReceiveReply) -> HttpResponse
+  intent "receive-pack の応答を HTTP 応答にする"
+  requires 200 <= r.status && r.status <= 599
+  ensures none
+  effects none
+{
+  return no_store(HttpResponse.new(r.status, r.body.clone()).with_header(&"content-type", &r.content_type.as_bytes()));
+}
+
+fn current_acl(ctx: &Ctx) -> FixedAcl
+  intent "要求ごとの最新の ACL。SIGIL_GIT_ACL_FILE があれば毎回読み直し（読めない・解釈できないときは何も許さない空の表）、無ければ起動時の表"
+  requires none
+  ensures none
+  effects fs.read
+{
+  if ctx.acl_file == "" {
+    return ctx.acl.clone();
+  }
+  let text = match read_file_opt(&ctx.acl_file, 65536, false) {
+    Ok(Some(b)) => b.to_string_utf8().unwrap_or(""),
+    _ => "",
+  };
+  return match parse_fixed_acl(&text) {
+    Ok(a) => a,
+    Err(_) => match parse_fixed_acl(&"") {
+      Ok(empty) => empty,
+      Err(_) => ctx.acl.clone(),
+    },
+  };
 }
 
 fn plain(status: Int, text: &String) -> HttpResponse
@@ -157,14 +199,16 @@ fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
   }
   let id = seg_at(&segs, 1);
   let upload_path = req.path() == cat3(&"/repos/", &id, &"/git-upload-pack").as_bytes();
+  let receive_path = req.path() == cat3(&"/repos/", &id, &"/git-receive-pack").as_bytes();
   let refs_path = req.path() == cat3(&"/repos/", &id, &"/info/refs").as_bytes();
-  if !upload_path && !refs_path {
+  if !upload_path && !receive_path && !refs_path {
     return no_store(ctx.router.dispatch(&req));
   }
-  if refs_path && req.query() != "service=git-upload-pack".as_bytes() {
+  let receive_refs = refs_path && req.query() == "service=git-receive-pack".as_bytes();
+  if refs_path && !receive_refs && req.query() != "service=git-upload-pack".as_bytes() {
     return plain(400, &"invalid_query");
   }
-  if upload_path && req.query().len() != 0 {
+  if (upload_path || receive_path) && req.query().len() != 0 {
     return plain(400, &"invalid_query");
   }
   let auth = ctx.router.dispatch(&req);
@@ -172,14 +216,52 @@ fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
     return no_store(auth);
   }
   let subject = auth.body().to_string_utf8().unwrap_or("");
-  if !repo_id_ok(&id) || !can_read(&ctx.acl, &subject, &id) {
+  let acl = current_acl(&ctx);
+  if !repo_id_ok(&id) || !can_read(&acl, &subject, &id) {
     return plain(404, &"not found");
+  }
+  let is_receive = receive_path || receive_refs;
+  if is_receive && !can_write(&acl, &subject, &id) {
+    return plain(403, &"forbidden");
   }
   let path = cat3(&cat3(&ctx.root, &"/", &id), &".git", &"");
   return match open_repo(&path) {
     Err(_) => plain(404, &"not found"),
-    Ok(repo) => respond(&ctx, &repo, &req, refs_path),
+    Ok(repo) => serve_repo(&ctx, &repo, &req, is_receive, receive_refs, refs_path, &id, &subject),
   };
+  return plain(500, &"internal_error");
+}
+
+fn serve_repo(ctx: &Ctx, repo: &Repo, req: &HttpRequest, is_receive: Bool, receive_refs: Bool, refs_path: Bool, id: &String, subject: &String) -> HttpResponse
+  intent "開いたリポジトリが使用停止でなければ、upload-pack か receive-pack の処理に渡す（使用停止は 503）"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  if repo_is_quarantined(&repo) {
+    return plain(503, &"repository_unavailable");
+  }
+  if is_receive {
+    return respond_receive(&ctx, &repo, &req, receive_refs, &id, &subject);
+  }
+  return respond(&ctx, &repo, &req, refs_path);
+}
+
+fn respond_receive(ctx: &Ctx, repo: &Repo, req: &HttpRequest, receive_refs: Bool, id: &String, subject: &String) -> HttpResponse
+  intent "認証・認可（read と write）の後に、receive-pack の info/refs か POST を処理する。POST は公開の直前にも最新の ACL を読み直す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  if receive_refs {
+    return to_receive_response(&receive_info_refs_reply(&repo, &req.query()));
+  }
+  let body = req.body();
+  if ctx.log {
+    log_sizes(&req, &body);
+  }
+  let wc = new_write_check(ctx.acl_file.clone(), id.clone(), subject.clone(), can_write(&ctx.acl, &subject, &id));
+  return to_receive_response(&receive_pack_post(&repo, &encodings_of(&req), &req.header(&"content-type"), &body, &wc));
 }
 
 fn respond(ctx: &Ctx, repo: &Repo, req: &HttpRequest, refs_path: Bool) -> HttpResponse
@@ -265,14 +347,14 @@ fn read_conns() -> Int
   }
 }
 
-fn serve(root: String, acl: FixedAcl, router: Router) -> Int
+fn serve(root: String, acl: FixedAcl, acl_file: String, router: Router) -> Int
   intent "待ち受けを開始し、受け付けた接続を順に処理して終了する"
   requires none
   ensures none
   effects clock, console, db, env, fs, net.server, random, task
 {
   let log = env.get(&"SIGIL_GIT_LOG_REQUESTS").unwrap_or("") == "1";
-  let shared = SyncShared.new(Ctx { router: router, acl: acl, root: root, log: log });
+  let shared = SyncShared.new(Ctx { router: router, acl: acl, acl_file: acl_file, root: root, log: log });
   let n = read_conns();
   match net.listen(&"127.0.0.1", 0, 16) {
     Err(_) => {
@@ -310,6 +392,7 @@ pub fn main() -> Int
 {
   let root = env.get(&"SIGIL_GIT_REPO_ROOT").unwrap_or("");
   let acl_text = env.get(&"SIGIL_GIT_ACL").unwrap_or("");
+  let acl_file = env.get(&"SIGIL_GIT_ACL_FILE").unwrap_or("");
   if root == "" {
     console.log(&"missing SIGIL_GIT_REPO_ROOT");
     return 1;
@@ -326,7 +409,7 @@ pub fn main() -> Int
           return 1;
         }
         Ok(router) => {
-          return serve(root, acl, router);
+          return serve(root, acl, acl_file, router);
         }
       }
     }

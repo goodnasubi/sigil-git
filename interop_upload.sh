@@ -194,7 +194,7 @@ test "$(code -H "Authorization: Bearer ${TOKEN}x" "$B/info/refs?service=git-uplo
 test "$(code -H "Authorization: Bearer $TOKEN_BOB" "$B/info/refs?service=git-upload-pack")" = 404 || fail "non-ACL subject 404"
 test "$(code -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/repos/nosuch/info/refs?service=git-upload-pack")" = 404 || fail "unknown repo 404"
 test "$(code -H "Authorization: Bearer $TOKEN" "$B/info/refs")" = 400 || fail "missing service 400"
-test "$(code -H "Authorization: Bearer $TOKEN" "$B/info/refs?service=git-receive-pack")" = 400 || fail "receive-pack not served"
+test "$(code -H "Authorization: Bearer $TOKEN" "$B/info/refs?service=git-receive-pack")" = 403 || fail "receive-pack needs write permission"
 test "$(code -H "Authorization: Bearer $TOKEN" "$B/info/refs?service=git-upload-pack&x=1")" = 400 || fail "extra query"
 test "$(code -H "Authorization: Bearer $TOKEN" "$B/info/refs?service=git-upload-pack&service=git-upload-pack")" = 400 || fail "dup service"
 test "$(code -H "Authorization: Bearer $TOKEN" "$B/info/refs?service=git-upload-pack")" = 200 || fail "good adv"
