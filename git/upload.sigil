@@ -333,7 +333,7 @@ fn count_item(left: Int) -> Result<Int, GitError>
 }
 
 pub fn reachable_objects(repo: &Repo, packs: &List<PackStore>, tips: &List<String>, object_limit: Int, walk_budget: Int) -> Result<List<String>, GitError>
-  intent "tips から到達できるすべてのオブジェクト（commit の tree と親、tree のエントリ（gitlink を除く）、tag の対象）の識別子を、重複なく決定的な順（深さ優先）で集める。オブジェクト数が object_limit、走査件数が walk_budget を超えれば LimitExceeded。各オブジェクトは 0047 の核で読み、識別子を再計算して検証する"
+  intent "tips から到達できるすべてのオブジェクト（commit の tree と親、tree のエントリ（gitlink を除く）、tag の対象）の識別子を、重複なく決定的な順（幅優先。先頭から取り出し、末尾に足す）で集める。オブジェクト数が object_limit、走査件数が walk_budget を超えれば LimitExceeded。各オブジェクトは 0047 の核で読み、識別子を再計算して検証する"
   requires object_limit >= 0 && walk_budget >= 0
   ensures none
   effects fs
@@ -595,17 +595,17 @@ fn negotiate(repo: &Repo, request: &Bytes, object_limit: Int, walk_budget: Int, 
     }
     Err(e) => {
       let text = failure_text(&e);
-      let mut body = acks.clone();
       if sideband {
+        // side-band では ACK／NAK の後に channel 3 で失敗を伝える。
+        let mut body = acks.clone();
         body.extend(&sideband_error(&text));
         body.extend(&pkt_flush());
-      } else {
-        body.extend(&err_pkt(&text));
+        return Ok(result_reply(body));
       }
-      return Ok(result_reply(body));
+      // side-band 無しでは、ACK／NAK の直後を利用側が生の pack として読むため、ACK／NAK を付けず ERR だけを返す。
+      return Ok(result_reply(err_pkt(&text)));
     }
   }
-  return Ok(result_reply(acks));
 }
 
 pub fn upload_pack_respond_limited(repo: &Repo, request: &Bytes, object_limit: Int, walk_budget: Int, response_limit: Int) -> UploadReply

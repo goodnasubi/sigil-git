@@ -365,7 +365,7 @@ fn run_encoding_tests() -> Bool
     }
   }
   let cases = words(&"identity|IDENTITY| Identity |gzip|GZIP|Gzip|x-gzip|X-Gzip|deflate|br|gzip, gzip|gzip,identity|identity, gzip|compress|chunked||gzip;q=1");
-  // 期待: 先頭 7 件の後 → identity, identity, identity, gzip, gzip, gzip, 以降は拒否
+  // 期待: 先頭 6 件の後 → identity, identity, identity, gzip, gzip, gzip, 以降は拒否
   let want = words(&"identity|identity|identity|gzip|gzip|gzip|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected|rejected");
   let mut i = 0;
   while i < cases.len() {

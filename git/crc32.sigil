@@ -44,7 +44,7 @@ fn table_at(t: &List<Int>, i: Int) -> Int
 
 pub fn crc32_update(table: &List<Int>, crc: Int, data: &Bytes, start: Int, end: Int) -> Int
   intent "data[start, end) を畳み込んだ CRC-32 の途中値を返す（初期値は 4294967295、最後に 4294967295 と XOR して確定する）"
-  requires start >= 0 && end >= start
+  requires start >= 0 && end >= start && end <= data.len()
   ensures none
   effects none
 {

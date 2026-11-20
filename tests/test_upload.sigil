@@ -659,7 +659,7 @@ fn run_limits(f: &Fixture) -> Bool
   let ub = unframe(&b.body, 8);
   ok = expect(ub.valid && ub.ended && ub.error == "upload-pack: limit exceeded\n" && ub.pack.len() == 0, &"limit: the side-band failure is a channel-3 message followed by flush") && ok;
   let c = upload_pack_respond_limited(&f.repo, &req_raw, 5, 100000, 1048576);
-  ok = expect(c.body == cat_bytes(&pkt(&"NAK\n"), &pkt(&"ERR upload-pack: limit exceeded")), &"limit: without side-band the failure is an ERR line") && ok;
+  ok = expect(c.body == pkt(&"ERR upload-pack: limit exceeded"), &"limit: without side-band the failure is an ERR line alone (no ACK/NAK before it)") && ok;
   // 走査件数: 成功する最小の予算を探し、その直下は失敗する。
   let mut budget = 0;
   let mut found = 0 - 1;
