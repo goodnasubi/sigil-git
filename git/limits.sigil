@@ -201,3 +201,50 @@ pub fn max_index_size() -> Int
 {
   return 67108864;
 }
+
+// ADR 0048 決定 2: 転送の固定上限（0047 のより厳しい上限を適用する）
+
+pub fn max_pkt_line_len() -> Int
+  intent "1 つの pkt-line の最大長 (長さの 4 桁を含めて 65520 byte) を返す"
+  requires none
+  ensures result == 65520
+  effects none
+{
+  return 65520;
+}
+
+pub fn max_transfer_objects() -> Int
+  intent "1 回の転送が持てるオブジェクト数の上限 (4096) を返す"
+  requires none
+  ensures result == 4096
+  effects none
+{
+  return 4096;
+}
+
+pub fn max_transfer_response_size() -> Int
+  intent "1 回の転送の応答の大きさの上限 (1 MiB = 1048576 byte) を返す"
+  requires none
+  ensures result == 1048576
+  effects none
+{
+  return 1048576;
+}
+
+pub fn max_advertised_refs() -> Int
+  intent "能力広告に載せる参照の数の上限 (1024) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+pub fn max_graph_walk_items() -> Int
+  intent "転送のためのグラフ走査（参照の検査・tag の剥がし）の件数の上限 (100000) を返す"
+  requires none
+  ensures result == 100000
+  effects none
+{
+  return 100000;
+}

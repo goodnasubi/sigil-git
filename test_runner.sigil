@@ -14,9 +14,12 @@ use tests.test_ops.run_ops_tests;
 use tests.test_pack.run_pack_tests;
 use tests.test_repo.run_repo_tests;
 use tests.test_tag.run_tag_tests;
+use tests.test_transfer.run_transfer_tests;
 use tests.test_tree.run_tree_tests;
 use tests.test_validate.run_validate_tests;
+use tests.test_wirepack.run_wirepack_tests;
 use tests.test_xcheck.run_xcheck_tests;
+use tests.test_xcheck_transfer.run_xcheck_transfer_tests;
 
 pub fn main() -> Int
   intent "すべてのテストを実行し、全合格なら 0、不合格なら 1 以上のコードを返す"
@@ -112,6 +115,24 @@ pub fn main() -> Int
   if !run_xcheck_tests() {
     console.log(&"FAIL: xcheck tests");
     return 15;
+  }
+
+  console.log(&"Running tests: transfer codec (pkt-line, advertisement, support table)");
+  if !run_transfer_tests() {
+    console.log(&"FAIL: transfer tests");
+    return 16;
+  }
+
+  console.log(&"Running tests: wire pack and advertisement from a repository");
+  if !run_wirepack_tests() {
+    console.log(&"FAIL: wire pack tests");
+    return 17;
+  }
+
+  console.log(&"Running tests: transfer cross-check digest");
+  if !run_xcheck_transfer_tests() {
+    console.log(&"FAIL: transfer xcheck tests");
+    return 18;
   }
 
   console.log(&"ALL TESTS PASSED SUCCESSFULLY");

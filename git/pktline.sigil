@@ -1,0 +1,167 @@
+module git.pktline
+  targets server
+  trust none
+
+use git.error.GitError;
+use git.limits.max_pkt_line_len;
+
+// ADR 0048 決定 1・2: pkt-line の符号化と復号（プロトコル v0 だけ）。
+// 形: 4 桁の小文字 hex の長さ（長さ自身の 4 byte を含む）＋ 内容。0000 は flush。
+// v0 に無い 0001（delimiter）と 0002（response-end）は解釈せず拒否する。0003 は不正、0004（内容が空）も拒否する。
+// 長さの上限は 65520 byte（4 桁を含む）。超える符号化・宣言は自動分割せず LimitExceeded にする。
+
+pub enum PktLine {
+  Data(Bytes),
+  Flush,
+}
+
+pub struct PktRead {
+  line: PktLine,
+  next: Int,
+}
+
+fn hex_digit(v: Int) -> Int
+  intent "0..15 を小文字 hex の ASCII コードにする"
+  requires v >= 0 && v < 16
+  ensures none
+  effects none
+{
+  if v < 10 {
+    return 48 + v;
+  }
+  return 87 + v;
+}
+
+fn hex_value(c: Int) -> Int
+  intent "小文字 hex の ASCII コードを 0..15 にする。hex でなければ -1（大文字も -1）"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return c - 48;
+  }
+  if c >= 97 && c <= 102 {
+    return c - 87;
+  }
+  return 0 - 1;
+}
+
+pub fn pkt_flush() -> Bytes
+  intent "flush-pkt (0000) を返す"
+  requires none
+  ensures result.len() == 4
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push(48);
+  out.push(48);
+  out.push(48);
+  out.push(48);
+  return out;
+}
+
+pub fn pkt_encode(payload: &Bytes) -> Result<Bytes, GitError>
+  intent "内容を 1 つの pkt-line にする。内容が空なら Corrupt、4 桁を含めて 65520 byte を超えるなら LimitExceeded"
+  requires none
+  ensures none
+  effects none
+{
+  if payload.len() == 0 {
+    return Err(GitError.Corrupt("pkt-line payload is empty"));
+  }
+  let total = payload.len() + 4;
+  if total > max_pkt_line_len() {
+    return Err(GitError.LimitExceeded("pkt-line exceeds 65520 bytes"));
+  }
+  let mut out = Bytes.new();
+  out.push(hex_digit(total / 4096 % 16));
+  out.push(hex_digit(total / 256 % 16));
+  out.push(hex_digit(total / 16 % 16));
+  out.push(hex_digit(total % 16));
+  out.extend(&payload);
+  return Ok(out);
+}
+
+pub fn pkt_encode_str(text: &String) -> Result<Bytes, GitError>
+  intent "文字列を 1 つの pkt-line にする"
+  requires none
+  ensures none
+  effects none
+{
+  return pkt_encode(&text.as_bytes());
+}
+
+pub fn pkt_read(data: &Bytes, pos: Int) -> Result<PktRead, GitError>
+  intent "data の pos から pkt-line を 1 つ読む。長さの桁が足りない・hex でない・不正な長さ・内容が足りないは Corrupt、delimiter／response-end は UnsupportedFormat、65520 byte 超は LimitExceeded"
+  requires pos >= 0
+  ensures none
+  effects none
+{
+  if pos + 4 > data.len() {
+    return Err(GitError.Corrupt("truncated pkt-line length"));
+  }
+  let mut len = 0;
+  let mut i = 0;
+  while i < 4 {
+    let v = hex_value(data.get(pos + i).unwrap_or(0));
+    if v < 0 {
+      return Err(GitError.Corrupt("pkt-line length is not 4 lowercase hex digits"));
+    }
+    len = len * 16 + v;
+    i = i + 1;
+  }
+  if len == 0 {
+    return Ok(PktRead { line: PktLine.Flush, next: pos + 4 });
+  }
+  if len == 1 {
+    return Err(GitError.UnsupportedFormat("delimiter-pkt (0001) is not part of protocol v0"));
+  }
+  if len == 2 {
+    return Err(GitError.UnsupportedFormat("response-end-pkt (0002) is not part of protocol v0"));
+  }
+  if len == 3 {
+    return Err(GitError.Corrupt("invalid pkt-line length 0003"));
+  }
+  if len == 4 {
+    return Err(GitError.Corrupt("pkt-line payload is empty"));
+  }
+  if len > max_pkt_line_len() {
+    return Err(GitError.LimitExceeded("pkt-line exceeds 65520 bytes"));
+  }
+  if pos + len > data.len() {
+    return Err(GitError.Corrupt("truncated pkt-line payload"));
+  }
+  let payload = data.slice(pos + 4, pos + len).unwrap_or(Bytes.new());
+  return Ok(PktRead { line: PktLine.Data(payload), next: pos + len });
+}
+
+pub fn pkt_decode_section(data: &Bytes) -> Result<List<Bytes>, GitError>
+  intent "data を「pkt-line の列＋ flush」の 1 区間として復号し、内容の列を返す。flush が無い・flush の後に余剰データがある場合は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut pos = 0;
+  let mut done = false;
+  while !done {
+    if pos >= data.len() {
+      return Err(GitError.Corrupt("missing flush-pkt"));
+    }
+    let r = pkt_read(&data, pos)?;
+    pos = r.next;
+    match r.line {
+      PktLine.Flush => {
+        done = true;
+      }
+      PktLine.Data(b) => {
+        out.push(b);
+      }
+    }
+  }
+  if pos != data.len() {
+    return Err(GitError.Corrupt("trailing data after flush-pkt"));
+  }
+  return Ok(out);
+}

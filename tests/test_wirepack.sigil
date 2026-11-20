@@ -1,0 +1,668 @@
+module tests.test_wirepack
+  targets server
+  trust none
+
+use git.commit.encode_commit;
+use git.commit.new_commit_object_str;
+use git.error.GitError;
+use git.error.error_kind_name;
+use git.fsio.cat3;
+use git.fsio.join_path;
+use git.fsio.make_dirs;
+use git.fsio.random_hex;
+use git.hash.compute_sha256;
+use git.hash.hex_to_bytes;
+use git.hash.int_to_str;
+use git.limits.max_transfer_objects;
+use git.limits.max_transfer_response_size;
+use git.object.ObjectType;
+use git.object.object_type_name;
+use git.odb.odb_read;
+use git.odb.odb_write;
+use git.pktline.pkt_decode_section;
+use git.refs.create_branch;
+use git.refs.create_tag;
+use git.refs.set_head_symbolic;
+use git.repo.Repo;
+use git.repo.init_repo;
+use git.tag.encode_tag;
+use git.tag.new_tag_object_str;
+use git.transfer.AdvSet;
+use git.transfer.advertise_upload_pack;
+use git.transfer.collect_adv_set;
+use git.transfer.collect_adv_set_limited;
+use git.tree.TreeEntry;
+use git.tree.encode_tree;
+use git.tree.new_tree_entry_str;
+use git.wirepack.stored_zlib_len;
+use git.wirepack.wire_pack_build;
+use git.wirepack.wire_pack_build_limited;
+use git.zlib.zlib_stored;
+
+// ADR 0048 第 1 段: wire 専用 pack v2 の構造、検査、固定上限（オブジェクト数・走査・応答 1 MiB）と、リポジトリからの広告の収集を試す。
+// 本物の Git が受理することは interop_transfer.sh で確かめる。
+
+fn fail(label: &String) -> Bool
+  intent "失敗したラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&cat3(&"  FAILED: ", &label, &""));
+  return false;
+}
+
+fn expect(cond: Bool, label: &String) -> Bool
+  intent "cond が偽ならラベルを出力して false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  if !cond {
+    return fail(&label);
+  }
+  return true;
+}
+
+fn kind_of_bytes(r: Result<Bytes, GitError>) -> String
+  intent "結果がエラーならその種別名、成功なら ok を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn rep_bytes(ch: &String, n: Int) -> Bytes
+  intent "文字 ch（1 byte）を n 回並べたバイト列を返す（倍々に伸ばして速くする）"
+  requires n >= 0
+  ensures none
+  effects none
+{
+  let one = ch.as_bytes().get(0).unwrap_or(97);
+  let mut b = Bytes.new();
+  if n == 0 {
+    return b;
+  }
+  b.push(one);
+  while b.len() * 2 <= n {
+    let copy = b.clone();
+    b.extend(&copy);
+  }
+  let rest = n - b.len();
+  if rest > 0 {
+    let part = b.slice(0, rest).unwrap_or(Bytes.new());
+    b.extend(&part);
+  }
+  return b;
+}
+
+fn rep(ch: &String, n: Int) -> String
+  intent "文字 ch（1 byte）を n 回並べた文字列を返す"
+  requires n >= 0
+  ensures none
+  effects none
+{
+  return rep_bytes(&ch, n).to_string_utf8().unwrap_or("");
+}
+
+fn str_at(l: &List<String>, i: Int) -> String
+  intent "文字列のリストの i 番目の複製を返す（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    Some(v) => v.clone(),
+    None => "",
+  };
+}
+
+fn write_obj(repo: &Repo, t: &ObjectType, content: &Bytes) -> String
+  intent "オブジェクトを書いて識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return match odb_write(&repo, &t, &content) {
+    Ok(id) => id,
+    Err(_) => "",
+  };
+}
+
+fn tree_of(repo: &Repo, entries: &List<TreeEntry>) -> String
+  intent "tree を符号化して書き、識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  return match encode_tree(&entries) {
+    Ok(c) => write_obj(&repo, &ObjectType.Tree, &c),
+    Err(_) => "",
+  };
+}
+
+fn commit_of(repo: &Repo, tree: &String, parents: &List<String>, msg: &String) -> String
+  intent "commit を符号化して書き、識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let c = new_commit_object_str(tree.clone(), parents.clone(), "A <a@example.com> 1700000000 +0000", "A <a@example.com> 1700000000 +0000", List.new(), msg.clone());
+  return match encode_commit(&c) {
+    Ok(b) => write_obj(&repo, &ObjectType.Commit, &b),
+    Err(_) => "",
+  };
+}
+
+fn tag_of(repo: &Repo, target: &String, target_type: &String, name: &String) -> String
+  intent "注釈付きタグを符号化して書き、識別子を返す。失敗すれば空"
+  requires none
+  ensures none
+  effects fs, random
+{
+  let t = new_tag_object_str(target.clone(), target_type.clone(), name.clone(), "A <a@example.com> 1700000000 +0000", "tag\n");
+  return match encode_tag(&t) {
+    Ok(b) => write_obj(&repo, &ObjectType.Tag, &b),
+    Err(_) => "",
+  };
+}
+
+fn be32(b: &Bytes, pos: Int) -> Int
+  intent "b の pos から 4 byte の big endian の整数を読む"
+  requires none
+  ensures none
+  effects none
+{
+  return b.read_u32_be(pos).unwrap_or(0 - 1);
+}
+
+fn code_name(code: Int) -> String
+  intent "pack の種別番号を型名にする"
+  requires none
+  ensures none
+  effects none
+{
+  if code == 1 {
+    return "commit";
+  }
+  if code == 2 {
+    return "tree";
+  }
+  if code == 3 {
+    return "blob";
+  }
+  if code == 4 {
+    return "tag";
+  }
+  return "?";
+}
+
+fn check_pack(repo: &Repo, pack: &Bytes, want_ids: &List<String>, label: &String) -> Bool
+  intent "pack v2 の構造を検査する: 先頭・版・件数・各オブジェクト（型・長さ・stored の zlib・内容）・順序・SHA-256 の検査値"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let n = pack.len();
+  if n < 44 {
+    return fail(&cat3(&label, &": pack is too short", &""));
+  }
+  if pack.slice(0, 4).unwrap_or(Bytes.new()) != "PACK".as_bytes() {
+    return fail(&cat3(&label, &": missing PACK magic", &""));
+  }
+  if be32(&pack, 4) != 2 {
+    return fail(&cat3(&label, &": version is not 2", &""));
+  }
+  if be32(&pack, 8) != want_ids.len() {
+    return fail(&cat3(&label, &": object count mismatch", &""));
+  }
+  let body_end = n - 32;
+  let digest = compute_sha256(&pack.slice(0, body_end).unwrap_or(Bytes.new()));
+  if pack.slice(body_end, n).unwrap_or(Bytes.new()) != digest {
+    return fail(&cat3(&label, &": trailer is not the SHA-256 of the pack", &""));
+  }
+  let mut pos = 12;
+  let mut idx = 0;
+  while idx < want_ids.len() {
+    let id = str_at(&want_ids, idx);
+    let mut got_type = "";
+    let mut got_content = Bytes.new();
+    match odb_read(&repo, &id) {
+      Ok(v) => {
+        got_type = object_type_name(&v.obj_type);
+        got_content = v.content.clone();
+      }
+      Err(_) => {
+        return fail(&cat3(&label, &": cannot read an expected object", &""));
+      }
+    }
+    // 種別と長さの可変長整数
+    let first = pack.get(pos).unwrap_or(0);
+    let code = first / 16 % 8;
+    let mut size = first % 16;
+    let mut shift = 16;
+    let mut more = first >= 128;
+    pos = pos + 1;
+    while more {
+      let b = pack.get(pos).unwrap_or(0);
+      size = size + b % 128 * shift;
+      shift = shift * 128;
+      more = b >= 128;
+      pos = pos + 1;
+    }
+    if code_name(code) != got_type {
+      return fail(&cat3(&label, &": object type code mismatch", &""));
+    }
+    if size != got_content.len() {
+      return fail(&cat3(&label, &": object size mismatch", &""));
+    }
+    let zl = stored_zlib_len(size);
+    let z = pack.slice(pos, pos + zl).unwrap_or(Bytes.new());
+    if z != zlib_stored(&got_content) {
+      return fail(&cat3(&label, &": object is not a stored zlib stream of its content", &""));
+    }
+    pos = pos + zl;
+    idx = idx + 1;
+  }
+  if pos != body_end {
+    return fail(&cat3(&label, &": unexpected bytes between the objects and the trailer", &""));
+  }
+  return true;
+}
+
+fn id_list(a: &String, b: &String) -> List<String>
+  intent "2 つの識別子のリストを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a.clone());
+  l.push(b.clone());
+  return l;
+}
+
+fn zlib_sizes() -> List<Int>
+  intent "stored_zlib_len を確かめる長さ（ブロック境界の前後）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(0);
+  l.push(1);
+  l.push(65534);
+  l.push(65535);
+  l.push(65536);
+  l.push(131070);
+  l.push(131071);
+  l.push(131072);
+  return l;
+}
+
+fn run_in_repo(repo: &Repo) -> Bool
+  intent "init 済みのリポジトリで wire pack と広告の収集を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let blob1 = write_obj(&repo, &ObjectType.Blob, &"hello\n".as_bytes());
+  let blob2 = write_obj(&repo, &ObjectType.Blob, &"second file\n".as_bytes());
+  let mut e1 = List.new();
+  e1.push(new_tree_entry_str(100644, "a.txt", hex_to_bytes(&blob1).unwrap_or(Bytes.new())));
+  let tree1 = tree_of(&repo, &e1);
+  let mut e2 = List.new();
+  e2.push(new_tree_entry_str(100644, "a.txt", hex_to_bytes(&blob1).unwrap_or(Bytes.new())));
+  e2.push(new_tree_entry_str(100644, "b.txt", hex_to_bytes(&blob2).unwrap_or(Bytes.new())));
+  let tree2 = tree_of(&repo, &e2);
+  let commit1 = commit_of(&repo, &tree1, &List.new(), &"first\n");
+  let mut parents = List.new();
+  parents.push(commit1.clone());
+  let commit2 = commit_of(&repo, &tree2, &parents, &"second\n");
+  let tag1 = tag_of(&repo, &commit2, &"commit", &"t1");
+  let tag2 = tag_of(&repo, &tag1, &"tag", &"t2");
+  if blob1 == "" || blob2 == "" || tree1 == "" || tree2 == "" || commit1 == "" || commit2 == "" || tag1 == "" || tag2 == "" {
+    return fail(&"setup: cannot write the test objects");
+  }
+
+  // 1. 正常な pack: 4 種類すべて、重複を除き、与えた順
+  let mut all = List.new();
+  all.push(commit2.clone());
+  all.push(tree2.clone());
+  all.push(blob1.clone());
+  all.push(blob2.clone());
+  all.push(commit1.clone());
+  all.push(tree1.clone());
+  all.push(tag1.clone());
+  all.push(tag2.clone());
+  let mut with_dups = List.new();
+  with_dups.push(commit2.clone());
+  with_dups.push(tree2.clone());
+  with_dups.push(blob1.clone());
+  with_dups.push(blob2.clone());
+  with_dups.push(blob1.clone());
+  with_dups.push(commit1.clone());
+  with_dups.push(tree1.clone());
+  with_dups.push(commit2.clone());
+  with_dups.push(tag1.clone());
+  with_dups.push(tag2.clone());
+  match wire_pack_build(&repo, &with_dups) {
+    Err(_) => {
+      ok = fail(&"pack: build with duplicates");
+    }
+    Ok(p) => {
+      ok = check_pack(&repo, &p, &all, &"pack: all four types, duplicates removed") && ok;
+    }
+  }
+  // 2. 空の集合: 件数 0 の pack（44 byte）
+  match wire_pack_build(&repo, &List.new()) {
+    Err(_) => {
+      ok = fail(&"pack: empty set");
+    }
+    Ok(p) => {
+      ok = expect(p.len() == 44, &"pack: empty set is 44 bytes") && check_pack(&repo, &p, &List.new(), &"pack: empty set") && ok;
+    }
+  }
+  // 3. 同じ入力は同じバイト列（決定的）
+  let a1 = wire_pack_build(&repo, &all);
+  let a2 = wire_pack_build(&repo, &all);
+  ok = expect(match a1 {
+    Ok(x) => match a2 {
+      Ok(y) => x == y,
+      Err(_) => false,
+    },
+    Err(_) => false,
+  }, &"pack: deterministic output") && ok;
+
+  // 4. 検査: 不正な識別子・存在しない・型と内容と参照
+  let mut bad = List.new();
+  bad.push("xyz");
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &bad)) == "Corrupt", &"check: invalid id") && ok;
+  let mut upper = List.new();
+  upper.push(rep(&"A", 64));
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &upper)) == "Corrupt", &"check: uppercase id") && ok;
+  let mut missing = List.new();
+  missing.push(rep(&"1", 64));
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &missing)) == "NotFound", &"check: missing object") && ok;
+  // 参照先が無い commit
+  let lost_commit = commit_of(&repo, &rep(&"2", 64), &List.new(), &"lost tree\n");
+  let mut one = List.new();
+  one.push(lost_commit.clone());
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &one)) == "NotFound", &"check: commit whose tree is missing") && ok;
+  // 参照先が無い tree
+  let mut le = List.new();
+  le.push(new_tree_entry_str(100644, "gone.txt", hex_to_bytes(&rep(&"3", 64)).unwrap_or(Bytes.new())));
+  let lost_tree = tree_of(&repo, &le);
+  let mut two = List.new();
+  two.push(lost_tree.clone());
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &two)) == "NotFound", &"check: tree whose blob is missing") && ok;
+  // gitlink は別リポジトリの commit なので存在を求めない
+  let mut ge = List.new();
+  ge.push(new_tree_entry_str(160000, "sub", hex_to_bytes(&rep(&"4", 64)).unwrap_or(Bytes.new())));
+  let gtree = tree_of(&repo, &ge);
+  let mut three = List.new();
+  three.push(gtree.clone());
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &three)) == "ok", &"check: gitlink entry is not required to exist") && ok;
+  // 宣言した型が対象と違う tag
+  let wrong = tag_of(&repo, &blob1, &"commit", &"wrong");
+  let mut four = List.new();
+  four.push(wrong.clone());
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &four)) == "TypeMismatch", &"check: tag with a wrong declared type") && ok;
+  // 対象が無い tag
+  let lost_tag = tag_of(&repo, &rep(&"5", 64), &"commit", &"lost");
+  let mut five = List.new();
+  five.push(lost_tag.clone());
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &five)) == "NotFound", &"check: tag whose target is missing") && ok;
+
+  // 5. 走査件数の上限（参照の検査）: commit2 は tree と親の 2 件、tree2 は 2 エントリ、tag1 は 1 件
+  let mut c2 = List.new();
+  c2.push(commit2.clone());
+  ok = expect(kind_of_bytes(wire_pack_build_limited(&repo, &c2, 2)) == "ok", &"walk: exactly at the limit (commit, 2 refs)") && ok;
+  ok = expect(kind_of_bytes(wire_pack_build_limited(&repo, &c2, 1)) == "LimitExceeded", &"walk: one over the limit (commit)") && ok;
+  let mut t2 = List.new();
+  t2.push(tree2.clone());
+  ok = expect(kind_of_bytes(wire_pack_build_limited(&repo, &t2, 2)) == "ok", &"walk: exactly at the limit (tree, 2 entries)") && ok;
+  ok = expect(kind_of_bytes(wire_pack_build_limited(&repo, &t2, 1)) == "LimitExceeded", &"walk: one over the limit (tree)") && ok;
+  let mut g1 = List.new();
+  g1.push(tag1.clone());
+  ok = expect(kind_of_bytes(wire_pack_build_limited(&repo, &g1, 1)) == "ok", &"walk: exactly at the limit (tag)") && ok;
+  ok = expect(kind_of_bytes(wire_pack_build_limited(&repo, &g1, 0)) == "LimitExceeded", &"walk: one over the limit (tag)") && ok;
+  ok = expect(kind_of_bytes(wire_pack_build_limited(&repo, &all, 7)) == "LimitExceeded", &"walk: the budget is shared by all objects") && ok;
+
+  // 6. オブジェクト数の上限: 4096 は通り、4097 は拒否
+  let mut dup_ok = List.new();
+  let mut i = 0;
+  while i < max_transfer_objects() {
+    dup_ok.push(blob1.clone());
+    i = i + 1;
+  }
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &dup_ok)) == "ok", &"count: 4096 ids (all duplicates) are accepted") && ok;
+  dup_ok.push(blob1.clone());
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &dup_ok)) == "LimitExceeded", &"count: 4097 ids are rejected") && ok;
+
+  // 7. 応答 1 MiB: 1048576 byte ちょうどは通り、1 byte 超えると何も作らず拒否
+  let limit = max_transfer_response_size();
+  // 44 byte（先頭 12 + 検査値 32）+ 種別と長さの 4 byte + stored の zlib（n + 5 × 16 ブロック + 6）= 1048576 → n = 1048442
+  let n_exact = 1048442;
+  ok = expect(44 + 4 + stored_zlib_len(n_exact) == limit, &"size: the chosen blob size hits the limit exactly") && ok;
+  let big_exact = write_obj(&repo, &ObjectType.Blob, &rep_bytes(&"q", n_exact));
+  let big_over = write_obj(&repo, &ObjectType.Blob, &rep_bytes(&"r", n_exact + 1));
+  let mut b1 = List.new();
+  b1.push(big_exact.clone());
+  match wire_pack_build(&repo, &b1) {
+    Err(_) => {
+      ok = fail(&"size: a pack of exactly 1 MiB is accepted");
+    }
+    Ok(p) => {
+      ok = expect(p.len() == limit && be32(&p, 8) == 1 && p.slice(0, 4).unwrap_or(Bytes.new()) == "PACK".as_bytes(), &"size: the pack is exactly 1048576 bytes") && ok;
+    }
+  }
+  let mut b2 = List.new();
+  b2.push(big_over.clone());
+  ok = expect(kind_of_bytes(wire_pack_build(&repo, &b2)) == "LimitExceeded", &"size: one byte over 1 MiB is rejected") && ok;
+  // stored_zlib_len は zlib_stored の実際の長さと一致する
+  let sizes = zlib_sizes();
+  let mut s = 0;
+  while s < sizes.len() {
+    let n = match sizes.get(s) {
+      Some(v) => v,
+      None => 0,
+    };
+    if zlib_stored(&rep_bytes(&"z", n)).len() != stored_zlib_len(n) {
+      ok = fail(&cat3(&"size: stored_zlib_len differs at ", &int_to_str(n), &""));
+    }
+    s = s + 1;
+  }
+  return ok;
+}
+
+fn lines_of(b: &Bytes) -> List<String>
+  intent "広告を pkt-line の区間として復号し、各行の文字列を返す。失敗なら空のリスト"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  match pkt_decode_section(&b) {
+    Err(_) => {}
+    Ok(ls) => {
+      let mut i = 0;
+      while i < ls.len() {
+        match ls.get(i) {
+          None => {}
+          Some(l) => {
+            out.push(l.to_string_utf8().unwrap_or(""));
+          }
+        }
+        i = i + 1;
+      }
+    }
+  }
+  return out;
+}
+
+fn kind_of_set(r: Result<AdvSet, GitError>) -> String
+  intent "結果がエラーならその種別名、成功なら ok を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match r {
+    Ok(_) => "ok",
+    Err(e) => error_kind_name(&e),
+  };
+}
+
+fn run_collect(repo: &Repo) -> Bool
+  intent "リポジトリからの広告の収集（HEAD・symref・軽量タグ・注釈付きタグ・入れ子のタグ・走査の上限）を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let blob = write_obj(&repo, &ObjectType.Blob, &"x\n".as_bytes());
+  let mut es = List.new();
+  es.push(new_tree_entry_str(100644, "x.txt", hex_to_bytes(&blob).unwrap_or(Bytes.new())));
+  let tree = tree_of(&repo, &es);
+  let c1 = commit_of(&repo, &tree, &List.new(), &"one\n");
+  let mut ps = List.new();
+  ps.push(c1.clone());
+  let c2 = commit_of(&repo, &tree, &ps, &"two\n");
+  let t1 = tag_of(&repo, &c2, &"commit", &"ann");
+  let t2 = tag_of(&repo, &t1, &"tag", &"ann2");
+  let _ = create_branch(&repo, &"main", &c2);
+  let _ = create_branch(&repo, &"dev", &c1);
+  let _ = create_tag(&repo, &"light", &c1);
+  let _ = create_tag(&repo, &"ann", &t1);
+  let _ = create_tag(&repo, &"ann2", &t2);
+  let _ = set_head_symbolic(&repo, &"refs/heads/main");
+  match collect_adv_set(&repo) {
+    Err(_) => {
+      ok = fail(&"collect: build the advertisement set");
+    }
+    Ok(set) => {
+      ok = expect(match &set.head_id {
+        Some(h) => h == c2,
+        None => false,
+      }, &"collect: HEAD resolves to main") && ok;
+      ok = expect(match &set.head_symref {
+        Some(t) => t == "refs/heads/main",
+        None => false,
+      }, &"collect: symref is refs/heads/main") && ok;
+      ok = expect(set.refs.len() == 5, &"collect: 2 branches + 3 tags") && ok;
+      match advertise_upload_pack(&set.refs, &set.head_id, &set.head_symref) {
+        Err(_) => {
+          ok = fail(&"collect: advertise");
+        }
+        Ok(out) => {
+          let ls = lines_of(&out);
+          // HEAD、dev、main、ann、ann^{}、ann2、ann2^{}、light
+          ok = expect(ls.len() == 8, &"collect: 8 advertised lines") && ok;
+          ok = expect(str_at(&ls, 3) == cat3(&t1, &" refs/tags/ann\n", &""), &"collect: annotated tag line") && ok;
+          ok = expect(str_at(&ls, 4) == cat3(&c2, &" refs/tags/ann^{}\n", &""), &"collect: peeled commit of the annotated tag") && ok;
+          ok = expect(str_at(&ls, 6) == cat3(&c2, &" refs/tags/ann2^{}\n", &""), &"collect: nested tags are peeled recursively to the commit") && ok;
+          ok = expect(str_at(&ls, 7) == cat3(&c1, &" refs/tags/light\n", &""), &"collect: lightweight tag has no peeled line") && ok;
+        }
+      }
+    }
+  }
+  // 剥がす走査の上限: ann は 2 件（tag と commit）、ann2 は 3 件。合計 5 件は通り、4 件は拒否
+  ok = expect(kind_of_set(collect_adv_set_limited(&repo, 5)) == "ok", &"collect: peel budget exactly at the limit") && ok;
+  ok = expect(kind_of_set(collect_adv_set_limited(&repo, 4)) == "LimitExceeded", &"collect: peel budget one over the limit") && ok;
+  return ok;
+}
+
+fn run_collect_unborn(dir: &String) -> Bool
+  intent "空のリポジトリと、HEAD の指すブランチが無いリポジトリの広告を試す"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let mut ok = true;
+  let path = join_path(&dir, &"empty.git");
+  match init_repo(&path, true, &"main") {
+    Err(_) => {
+      return fail(&"collect: init the empty repository");
+    }
+    Ok(repo) => {
+      match collect_adv_set(&repo) {
+        Err(_) => {
+          ok = fail(&"collect: empty repository");
+        }
+        Ok(set) => {
+          ok = expect(set.refs.len() == 0 && set.head_id.is_none() && set.head_symref.is_none(), &"collect: empty repository has no refs and no HEAD") && ok;
+          match advertise_upload_pack(&set.refs, &set.head_id, &set.head_symref) {
+            Err(_) => {
+              ok = fail(&"collect: advertise the empty repository");
+            }
+            Ok(out) => {
+              let ls = lines_of(&out);
+              ok = expect(ls.len() == 1 && str_at(&ls, 0) == cat3(&rep(&"0", 64), &" capabilities^{}\u{0}object-format=sha256 side-band-64k\n", &""), &"collect: empty repository uses capabilities^{}") && ok;
+            }
+          }
+        }
+      }
+      // HEAD が生まれていないブランチを指し、別のブランチだけがある
+      let blob = write_obj(&repo, &ObjectType.Blob, &"y\n".as_bytes());
+      let mut es = List.new();
+      es.push(new_tree_entry_str(100644, "y.txt", hex_to_bytes(&blob).unwrap_or(Bytes.new())));
+      let tree = tree_of(&repo, &es);
+      let c = commit_of(&repo, &tree, &List.new(), &"only\n");
+      let _ = create_branch(&repo, &"other", &c);
+      match collect_adv_set(&repo) {
+        Err(_) => {
+          ok = fail(&"collect: unborn HEAD");
+        }
+        Ok(set) => {
+          ok = expect(set.refs.len() == 1 && set.head_id.is_none() && set.head_symref.is_none(), &"collect: unborn HEAD is not advertised") && ok;
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+pub fn run_wirepack_tests() -> Bool
+  intent "wire 専用 pack と広告の収集の全テストを実行し全合格なら true を返す。作業用ディレクトリは tmp/ の下に作る"
+  requires none
+  ensures none
+  effects console, fs, random
+{
+  let suffix = match random_hex(6) {
+    Ok(s) => s,
+    Err(_) => "fallback",
+  };
+  let dir = cat3(&"tmp/w_", &suffix, &"");
+  match make_dirs(&dir) {
+    Err(_) => {
+      return fail(&"cannot create the work directory");
+    }
+    Ok(_) => {}
+  }
+  let mut ok = true;
+  console.log(&"  wire pack");
+  match init_repo(&join_path(&dir, &"pack.git"), true, &"main") {
+    Err(_) => {
+      ok = fail(&"init the pack repository");
+    }
+    Ok(repo) => {
+      ok = run_in_repo(&repo) && ok;
+    }
+  }
+  console.log(&"  advertisement from a repository");
+  match init_repo(&join_path(&dir, &"adv.git"), true, &"main") {
+    Err(_) => {
+      ok = fail(&"init the advertisement repository");
+    }
+    Ok(repo) => {
+      ok = run_collect(&repo) && ok;
+    }
+  }
+  ok = run_collect_unborn(&dir) && ok;
+  return ok;
+}
