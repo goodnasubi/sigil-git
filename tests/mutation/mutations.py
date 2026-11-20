@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ADR 0047 決定 6 変異試験（意図した誤りが検出されるかの測定）。
-# 5 つの変異（識別子の検証省略、オブジェクト未同期、ロック無視、パス検査省略、symlink検査省略）を
-# 1 つずつ埋め、試験群（mutation_runner.sigil）が落ちることを確かめる。
-# 検出（DETECTED）または許可された持ち越し（ALLOWED_UNDETECTED）であることを確認する。
-# 許可リスト以外の未検出（UNDETECTED）またはビルド失敗（BUILD_ERROR）があれば終了コード 1。
+# 6 つの変異（識別子の検証省略、オブジェクト未同期、参照・索引の未同期、ロック無視、パス検査省略、symlink検査省略）を
+# 1 つずつ埋め、試験群が落ちることを確かめる。試験群は Sigil の入口（mutation_runner.sigil）と、
+# 電源断の模擬（tests/fault_crash.sh）のようなスクリプトの 2 種類。
+# 検出（DETECTED）であることを確認する。許可リスト（ALLOWED_UNDETECTED）は空で、未検出（UNDETECTED）または
+# ビルド失敗（BUILD_ERROR）があれば終了コード 1。
 
 import os
 import shutil
@@ -12,8 +13,11 @@ import sys
 import tempfile
 import time
 
-ALLOWED_UNDETECTED = {"object_sync_omitted"}
+# 許可された未検出は無い。object_sync_omitted は、電源断の模擬（tests/fault_crash.sh）で検出できるようになった（Issue #634 (c)）。
+ALLOWED_UNDETECTED = set()
 M = []
+# スクリプトの入口: 変異を入れたソースから interop_ops をビルドし、電源断の模擬だけを走らせる（速い）。
+SCRIPT_POWERLOSS = ("script", "tests/fault_crash.sh", {"FAULT_POWERLOSS_ONLY": "1"})
 
 def mut(name, desc, path, old, new, entries):
     M.append(dict(name=name, desc=desc, path=path, old=old, new=new, entries=entries))
@@ -35,7 +39,19 @@ mut(
     "git/fsio.sigil",
     '      match file.sync_all() {\n        Err(_) => {\n          let _ = file.close();\n          return Err(GitError.Io("failed to sync file"));\n        }\n        Ok(_) => {}\n      }',
     '      // sync_all call omitted',
-    ["fault"],
+    # 同一プロセス・OS のページキャッシュのままでは検出できない（直後の読み取りがキャッシュから返る）ので、
+    # 未同期のデータを捨てる電源断の模擬（空になったオブジェクトを git fsck が報告する）で検出する。
+    ["fault", SCRIPT_POWERLOSS],
+)
+
+# 2b. 参照・索引の公開（lock_publish）で内容を同期しない
+mut(
+    "publish_sync_omitted",
+    "参照・索引を公開する書き込み（lock_publish）で fsync (sync_all) を省略する",
+    "git/fsio.sigil",
+    '  match file.sync_all() {\n    Err(_) => {\n      let _ = file.close();\n      return Err(GitError.Io("failed to sync lock file"));\n    }\n    Ok(_) => {}\n  }',
+    '  // sync_all call omitted',
+    [SCRIPT_POWERLOSS],
 )
 
 # 3. ロックの無視
@@ -97,6 +113,7 @@ def main():
                 if os.path.exists(src_d):
                     shutil.copytree(src_d, os.path.join(work, d))
             shutil.copy(os.path.join(root, "mutation_runner.sigil"), work)
+            shutil.copy(os.path.join(root, "interop_ops.sigil"), work)
 
             target_file = os.path.join(work, m["path"])
             with open(target_file, "r") as f:
@@ -116,6 +133,25 @@ def main():
             total_time = 0.0
 
             for entry in m["entries"]:
+                if isinstance(entry, tuple):
+                    # スクリプトの入口: 変異を入れた作業ツリーの中で、そのスクリプトを走らせる
+                    _, script, extra_env = entry
+                    env = dict(os.environ)
+                    env.update(extra_env)
+                    env["SIGIL"] = sigil
+                    env["KEEP"] = ""
+                    t0 = time.time()
+                    try:
+                        r = subprocess.run(["bash", script], cwd=work, capture_output=True, text=True, timeout=300, env=env)
+                        rc, out = r.returncode, r.stdout + r.stderr
+                    except subprocess.TimeoutExpired:
+                        rc, out = 124, "timeout"
+                    total_time += time.time() - t0
+                    if rc != 0:
+                        status = "DETECTED"
+                        note = f"試験失敗 (script {os.path.basename(script)})"
+                        break
+                    continue
                 bin_path = os.path.join(work, "mut_bin")
                 rc, out, dt = sh([sigil, "build", "--root", ".", "mutation_runner.sigil", entry, "-o", bin_path], work, 120)
                 total_time += dt
@@ -156,11 +192,6 @@ def main():
     if unexpected_undetected:
         print(f"\nエラー: 許可されていない未検出の変異が存在します: {unexpected_undetected}", file=sys.stderr)
         sys.exit(1)
-
-    allowed_undetected = [name for name, _, s, _, _ in results if s == "UNDETECTED" and name in ALLOWED_UNDETECTED]
-    if allowed_undetected:
-        print(f"\n注意: 許可された未検出の変異（{', '.join(allowed_undetected)}）は実 OS ページキャッシュ環境のため未検出。"
-              "ADR 0047 の定めに従い、本変異は未検証（持ち越し）として記録します。")
 
     sys.exit(0)
 

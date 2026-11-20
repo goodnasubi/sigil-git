@@ -64,6 +64,9 @@ SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_ops.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_history.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" bash tests/fault_interop.sh
+# Issue #634: ステップ単位の強制終了・電源断の模擬、カーネル障害注入（Linux x86_64 の ptrace。他の環境では明示的に失敗する）
+SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" bash tests/fault_crash.sh
+SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" bash tests/fault_kernel.sh
 grep -E '^# [0-9a-f]{64}' fixtures/v1/manifest.txt | sed 's/^# //' | (cd fixtures/v1 && sha256sum -c - >/dev/null)
 echo "Fixture v1 SHA-256 checksums verified!"
 
