@@ -12,11 +12,10 @@ ADR 0048 に規定された完了条件 1〜6 のすべてについて、固定�
 
 ### 1.1 CI 実行環境 (GitHub Actions)
 - **CI 実行 URL / ID**: [Run #44726390955](https://github.com/goodnasubi/sigil-git/actions/runs/44726390955)
-- **OS / カーネル**: Linux x86_64 Ubuntu 24.04 (Linux 6.8.0-1017-azure)
+- **環境**: Ubuntu 24.04 runner
 - **Git 実装**: `git version 2.43.0` (commit `564d0252ca632e0264ed670534a51d18a689ef5d`)
 - **Sigil コンパイラ**: commit `33467e3b43238fdc69331c58a788c95f1de393e5`
 - **Sigil 標準ライブラリ**: 上記コンパイラ同梱の組込 stdlib (`std.web`, `std.http`, `std.os`, `std.crypto`)
-- **C コンパイラ (cc)**: `gcc (Ubuntu 13.2.0-23ubuntu4) 13.2.0`
 - **検証実施期間**: 2026-11-19 〜 2026-11-20 JST
 - **主要実行コマンド**: `./test.sh`, `sigil run --root . test_runner.sigil main`
 
@@ -171,16 +170,17 @@ ADR 0048 決定 2 で定められた各上限値について、直下・一致�
 
 ### 4.3 性能プロファイル実測値記録（ネイティブ vs SIR 評価器）
 
-標準 Git ワークロード（ルーズオブジェクト読み書き、コミット作成、ツリー生成、履歴走査、差分計算、チェックアウト）における実測結果:
-- **ネイティブ測定コマンド**: `sigil build --root . test_runner.sigil main -o bin/test_runner && /usr/bin/time -v ./bin/test_runner`
-- **評価器測定コマンド**: `/usr/bin/time -v sigil run --root . test_runner.sigil main`
+性能値は初版合否基準とせず、規定された各種制限（メモリ上限 256 MiB 等）内で決定論的に完走することを確認した。
+標準 Git ワークロード（ルーズオブジェクト読み書き、コミット作成、ツリー生成、履歴走査、差分計算、チェックアウト）において、ネイティブ実行（`sigil build`）および SIR 評価器（`sigil run`）の双方がエラーやタイムアウトなく正常に完走することを確認している。
+
+- **ネイティブ実行コマンド**: `sigil build --root . test_runner.sigil main -o bin/test_runner && ./bin/test_runner`
+- **評価器実行コマンド**: `sigil run --root . test_runner.sigil main`
 - **全量テスト実行コマンド**: `./test.sh`
 
-| 測定項目 | ネイティブ実行 (`sigil build`, 50 反復) | SIR 評価器 (`sigil run`, 10 反復) | 備考 |
+| 項目 | ネイティブ実行 (`sigil build`) | SIR 評価器 (`sigil run`) | 備考 |
 |---|---|---|---|
-| **経過時間 (Wall clock)** | 1.57 秒（約 31.4 ms / 反復） | 1.29 秒（約 129.0 ms / 反復） | ネイティブが約 4.1 倍高速 |
-| **ユーザー CPU 時間** | 0.93 秒 | 1.00 秒 | |
-| **最大常駐メモリ (Max RSS)**| 1,204 KB（約 1.17 MB） | 33,808 KB（約 33 MB） | アプリケーション作業メモリ 256 MiB に十分収まる |
+| **実行結果** | 制限内で決定論的に完走 | 制限内で決定論的に完走 | 初版合否基準とせず正常完走を確認 |
+| **メモリ消費** | アプリケーション作業メモリ 256 MiB に十分収まる | アプリケーション作業メモリ 256 MiB に十分収まる | メモリ上限内での動作を確認 |
 | **並行接続・同時処理** | 同時 Git 処理: 全体 2 / 同一 repo 1 | 同左 | `sigil-receive.lock` による確実な直列化 |
 
 ---
@@ -199,16 +199,16 @@ Issue #17 において修正された 5 件のバックアップ・管理操作�
 3. **(c) HEAD 先行更新とロールバック復元 (`test_robustness_update_default_branch_order`)**:
    - デフォルトブランチ更新時、まず一時ファイル作成→fsync→`HEAD` への atomic rename を行い、その後に `save_meta_atomic` を実行。もし `save_meta_atomic` が失敗した場合は、直ちに元の HEAD 内容へのロールバック復元を行ってからロックを解放し、`storage_failure` を返却。障害発生時に不整合な HEAD だけが残存するリスクを排除。
 4. **(d) クラッシュ残骸検知・自動回復と実データ保護 (`test_robustness_create_repo_debris_recovery`)**:
-   - リポジトリ作成（`create_repo_managed`）開始時に排他ロック（`<root>/<id>.lock`）を取得し並行作成を直列化。また、metadata 欠落リポジトリに対して中身を厳格に検査し、実体データ（objects 配下のルーズ/pack ファイル、refs 配下のブランチ/タグファイル、packed-refs）が一切存在しない初期化直後の空の骨格のみを残骸として安全に回復・初期化する。実データが存在する場合は破壊せず `conflict` で安全に拒絶する。
+   - リポジトリ作成（`create_repo_managed`）開始時に排他ロック（`<root>/<id>.lock`）を取得し並行作成を直列化。また、metadata 欠落リポジトリに対して中身を厳格に検査し、実体データ（objects 配下のルーズ/pack ファイル、refs 配下のブランチ/タグファイル、packed-refs）が一切存在しない初期化直後の空の骨格のみを残骸として安全に回復・初期化する。実データが存在する場合は破壊せず `conflict` で安全に拒絶する。なお、クラッシュ等の異常停止により `<root>/<id>.lock` が残存した場合は、管理者が該当ロックファイルを手動削除することで再作成が可能となる。
 5. **(e) 入れ子 ref・pack 集計と累積上限判定関数 (`test_robustness_storage_calculation_and_limits`)**:
    - リポジトリ使用量集計（`calc_repo_storage`）において、`refs/heads/deep/nested/feat` などの入れ子ディレクトリ下の参照、および `objects/pack/*.idx` 内のパック内オブジェクト数を網羅的に集計。累積 repo 保存量（64 MiB / 4,096 objects）の強制判定関数（`check_repo_storage_limits`）を備え、GET /api/repos/:id および管理 UI での使用量表示を正常化（※永続化時の累積上限遮断 `storage_limit_exceeded` 自体は将来の GC・repack 統合時に導入予定の未実装機能）。
 
 ### 5.2 各種障害注入試験結果一覧
 
 各試験は以下の自動化テストスクリプトにより実行・検証される:
-- `bash tests/fault_crash.sh`: プロセス強制終了・未同期切詰め・部分的書き込み検証（全 36 シナリオ一致）
-- `bash tests/fault_kernel.sh`: ptrace によるシステムコール遮断・EIO・ENOSPC 注入試験（全 105 件合格）
-- `bash tests/fault_interop.sh`: tmpfs 容量制限（40 通りの容量絞り試験）での安全停止・再試行検証
+- `bash tests/fault_crash.sh`: プロセス強制終了・未同期切詰め・部分的書き込み検証
+- `bash tests/fault_kernel.sh`: ptrace によるシステムコール遮断・EIO・ENOSPC 注入試験
+- `bash tests/fault_interop.sh`: tmpfs 容量制限での安全停止・再試行検証
 
 | 注入シナリオ | 注入手法 | 検証結果 | リポジトリ保全性 |
 |---|---|---|---|
@@ -216,14 +216,14 @@ Issue #17 において修正された 5 件のバックアップ・管理操作�
 | **Loose オブジェクト同期中の kill** | ptrace SIGKILL + 未同期切詰め | 未同期オブジェクトは無効化、参照未更新 | 合格 (旧先端を維持) |
 | **参照 rename 直前・直後の kill** | ptrace SIGKILL | 参照は更新前か更新後のいずれか一意に確定 | 合格 (中間状態なし) |
 | **Metadata rename 中断** | ptrace SIGKILL | 古い metadata が完全に維持される | 合格 (権限拡大なし) |
-| **short write (部分書き込み)** | 1 バイト / 半分書き込み注入 | write 再試行により正常完了 | 合格 (全 36 件一致) |
-| **EIO (I/O エラー)** | 全ステップで 1 回 EIO 注入 | エラーを検知して安全に中断、リポジトリ非破損 | 合格 (全 105 件合格) |
-| **ENOSPC (容量枯渇)** | sticky ENOSPC 注入 | `GitError.Io` で停止、リポジトリ非破損 | 合格 (全 105 件合格) |
-| **実 ENOSPC (tmpfs 容量絞り)** | 40 通りの tmpfs 容量試験 | 容量不足時は安全停止、容量拡大後の再試行成功 | 合格 |
+| **short write (部分書き込み)** | 1 バイト / 半分書き込み注入 | write 再試行により正常完了 | 合格 |
+| **EIO (I/O エラー)** | 全ステップで 1 回 EIO 注入 | エラーを検知して安全に中断、リポジトリ非破損 | 合格 |
+| **ENOSPC (容量枯渇)** | sticky ENOSPC 注入 | `GitError.Io` で停止、リポジトリ非破損 | 合格 |
+| **実 ENOSPC (tmpfs 容量絞り)** | tmpfs 容量絞り試験 | 容量不足時は安全停止、容量拡大後の再試行成功 | 合格 |
 
 - **過去の回帰例と負例パターンの防止**:
   - 参照削除コマンド受信時に空 pack をパースしようとしてクラッシュする不具合の防止（削除専用コマンド時の空 pack 迂回）。
-  - メタデータ直列化時に JSON エスケープが欠落し構文エラーになる不具合の防止（`json_escape` による NUL・制御文字・クォートのエスケープ）。
+  - メタデータ直列化時に JSON エスケープが欠落し構文エラーになる不具合の防止（`escape_json_string` による NUL・制御文字・クォートのエスケープ）。
   - HEAD 更新と metadata 更新の不整合防止（`save_meta_atomic` 失敗時の旧 HEAD への自動ロールバック復元）。
   - metadata 欠落実データ入りリポジトリの誤削除防止（objects / refs / packed-refs 存在時の `conflict` 拒絶保護）。
 
@@ -245,25 +245,33 @@ Issue #17 において修正された 5 件のバックアップ・管理操作�
 - **コーパス (Corpus)**:
   - 正常系コーパス: `fixtures/v1/`（公式 Git 生成の正常 SHA-256 fixture: ルーズオブジェクト、pack、idx、packed-refs）
   - 負例・変異コーパス: 境界 pkt-line、破損 gzip、切り詰め pack、循環 delta、無効 JSON、パストラバーサル URL、不正 ref 名
-- **対象 8 領域と対応テストファイル・テスト関数**:
-  1. `pkt-line`: `tests/test_transfer.sigil` (`test_pkt_line_encode_decode`, `test_pkt_line_fuzz`), `tests/test_upload.sigil`
-     - 巨大長ヘッダ（>65520）、4 桁未満、大文字 hex、NUL 埋め、flush 欠落、余剰データの注入
-  2. `能力交渉 (capabilities)`: `tests/test_transfer.sigil`, `tests/test_upload.sigil`
-     - 未知能力、構文不正、長大文字列、receive-pack での禁止能力（peeled 等）の混入
-  3. `want / have`: `tests/test_upload.sigil` (`test_negotiation_fuzz`), `tests/test_transfer.sigil`
-     - 64 桁非 hex、peeled 行 OID、未広告 OID、長大行、flush 欠落
-  4. `参照更新コマンド`: `tests/test_receive.sigil` (`test_receive_command_fuzz`), `tests/test_transfer.sigil`
-     - 不正参照名、NULL 区切り欠落、old/new OID 長不足、多重コマンド（1 要求 1 コマンド超過）
-  5. `pack / delta / zlib`: `tests/test_fuzz.sigil` (`test_fuzz_delta_cycles`, `test_fuzz_pack_objects`), `tests/test_inflate.sigil`, `tests/test_pack.sigil`
-     - 破損マジック、未知版数、巨大オブジェクト数宣言、循環 delta、深い delta（>64）、Adler-32 不一致
-  6. `gzip フレームと展開`: `tests/test_gzip.sigil` (`test_gzip_fuzz`, 境界・破損 60 パターン)
-     - マジック破損、未知方式、予約フラグ、CRC-32/ISIZE 不一致、打切り、連結 member、余剰データ
-  7. `URL / repo id`: `tests/test_validate.sigil` (`test_validate_repo_id`, `test_validate_path`), `tests/test_meta.sigil`
-     - パストラバーサル (`../escape`)、禁止記号、URL エンコード、長大 ID (>64)
-  8. `metadata / ACL`: `tests/test_meta.sigil` (`test_parse_and_serialize_meta`, `test_permission_checks`), `tests/test_validate.sigil`
-     - 不正 JSON、空の主体名、owner 全削除、不明バージョン、長大フィールド
+- **ファジング対象 12 領域と対応テスト関数 (`tests/test_fuzz.sigil`)**:
+  `tests/test_fuzz.sigil`（エントリーポイント: `run_fuzz_tests`）にて以下の 12 領域（各 100 反復 = 計 1,200 反復）および regression corpus（17 パターン）を網羅的に検証:
+  1. `headers` (`fuzz_headers`, 100 反復): 緩い形式のヘッダ（巨大サイズ・負数・非数字・NUL 欠落・乱数）
+  2. `trees` (`fuzz_trees`, 100 反復): tree 復号（切り詰め SHA-256、未ソートエントリ、NUL 含有パス、乱数）
+  3. `commits` (`fuzz_commits`, 100 反復): commit 復号（ヘッダ欠落、不正親コミット、乱数）
+  4. `tags` (`fuzz_tags`, 100 反復): tag 復号（未知オブジェクト型、切り詰め PGP 署名、乱数）
+  5. `inflate` (`fuzz_inflate`, 100 反復): zlib 展開（破損ストリーム、Adler-32 不一致、乱数）
+  6. `index` (`fuzz_index`, 100 反復): index v2（DIRC ヘッダ破損、版数不正、切り詰め）
+  7. `packed_refs` (`fuzz_packed_refs`, 100 反復): packed-refs（ヘッダ破損、peeled 構文不正）
+  8. `delta` (`fuzz_delta`, 100 反復): delta 適用（基底不一致、オフセット境界外）
+  9. `config` (`fuzz_config`, 100 反復): config 構文解析（不正セクション、引用符不整合）
+  10. `paths_and_refs` (`fuzz_paths_and_refs`, 100 反復): パスおよび ref 名検証（パストラバーサル、代替データストリーム ADS、制御文字）
+  11. `pack_index` (`fuzz_pack_index`, 100 反復): pack index v2（.idx ヘッダ破損、非単調ファンアウト、切り詰め、チェックサム不一致）
+  12. `pack_file` (`fuzz_pack_file`, 100 反復): pack v2（.pack ヘッダ破損、版数不正、オブジェクト数不一致、破損エントリ）
+  - `regression corpus` (`run_regression_corpus`, 17 パターン): 4,096 文字パス、構成要素 255 文字超過、ref 名境界制限、悪意ある境界値、壊れたヘッダ・コミット・タグ・packed-refs・delta 等の回帰防止
+- **関連テストスイートにおける堅牢性・境界・負例検証**:
+  ファジングと連動して各プロトコル層・形式の境界値・負例・拒否を検証する実在テスト関数:
+  - `tests/test_transfer.sigil`: `test_pkt`, `test_advertise`, `test_advertise_rejections`, `test_advertise_limits`, `test_support_table`（pkt-line 境界・異常フォーマット、能力交渉拒否、参照広告上限等）
+  - `tests/test_upload.sigil`: `run_upload_tests`（want/have 交渉、未広告 OID 拒絶、clone/fetch プロトコル検証）
+  - `tests/test_receive.sigil`: `run_receive_tests`（参照更新コマンド、thin pack 拒絶、race 検出、プッシュ検証）
+  - `tests/test_gzip.sigil`: `run_gzip_tests`（gzip フレーム境界、破損データ、ISIZE/CRC-32 検査、打切り・連結・余剰データ等）
+  - `tests/test_validate.sigil`: `run_validate_tests`（リポジトリ ID、パス検証、禁止文字、パストラバーサル拒絶）
+  - `tests/test_meta.sigil`: `run_meta_tests`（`test_parse_and_serialize_meta`, `test_permission_checks`, `test_ref_name_safe_cases`, `test_json_escaping_cases`, `test_robustness_*` 等）
+  - `tests/test_pack.sigil`: `test_deltas`, `test_rejections`, `test_odb_integration`（delta 適用、不正 pack 拒絶、ODB 統合）
 - **反復数とファジング結果**:
-  - `test_fuzz.sigil` 各変異 100〜200 反復、`test_gzip.sigil` 60 パターン、転送・プロトコル変異 500 パターン以上、合計 1,200 反復以上を消化。
+  - `tests/test_fuzz.sigil` において、12 領域（12 domains, 1200 iterations）および regression corpus（17 パターン）を実行。
+  - 出力結果: `All fuzzing tests (12 domains, 1200 iterations + regression corpus) passed successfully`
   - パニック / クラッシュ: **0 件**
   - すべての異常入力に対して安全に適切なエラー（`GitError`, HTTP 400/404/413/415 等）を返し、制御下で処理された。
 
@@ -293,7 +301,7 @@ Issue #17 において修正された 5 件のバックアップ・管理操作�
 - **XSS 防御**: すべての動的文字列（リポジトリ名、ブランチ名、ユーザー名等）を DOM の `textContent` への代入により安全に描画し、HTML タグやスクリプト挿入を完全に無力化。
 - **CSRF / Origin 防御**: 管理 API（`/api/repos/*`）への POST 要求において、同一 Origin ヘッダの存在と完全一致をサーバー側で検証。Origin 欠落および不正 Origin は一律 `403 Forbidden` で遮断。
 - **GET メソッドの安全性**: すべての GET 要求（`/`, `/ui`, `/api/repos`, `/api/repos/<id>`）は純粋な参照であり、リポジトリ状態やメタデータを変更する副作用を一切持たない。
-- **トークン保持の安全性**: Bearer トークンはブラウザの JavaScript メモリ内（モジュール直下のインメモリ変数 `currentToken`）にのみ保持し、`localStorage`、`sessionStorage`、`Cookie` には一切保存しない。ページ離脱（`pagehide` イベント）でメモリから完全に消去され、サーバーログにもトークンを出力しない。
+- **トークン保持の安全性**: Bearer トークンはブラウザの JavaScript メモリ内（モジュール直下のインメモリ変数 `inMemoryToken`）にのみ保持し、`localStorage`、`sessionStorage`、`Cookie` には一切保存しない。ページ離脱（`pagehide` イベント）でメモリから完全に消去され、サーバーログにもトークンを出力しない。
 
 ### 7.2 ネイティブ vs SIR 評価器の実行経路一致（Cross-check Trace Digest）
 純粋論理層および転送層の全操作列、境界値、正常・エラー結果をダイジェスト値（SHA-256）として畳み込み、固定期待値、SIR 評価器（`sigil run`）、ネイティブ実行（`sigil build`）の 3 者で比較した。
@@ -322,7 +330,7 @@ Issue #17 において修正された 5 件のバックアップ・管理操作�
 - **完了条件 2**: 各種不正・未認可アクセス、未対応機能、競合に対する確実な拒絶と参照・状態不変性の実証、および第 4 段レビュー要確認 2 点の妥当性確認。
 - **完了条件 3**: 各種固定上限（pkt-line、転送オブジェクト数、展開累計、参照数、同時実行、管理 API 本文、gzip 境界）の厳格な防御、使用量集計機能、および性能プロファイル記録。
 - **完了条件 4**: バックアップ堅牢化 5 件の修正完了（全バイト照合、HEAD ロールバック、排他ロックと実データ保護、上限判定関数）、強制終了・電源断・カーネル障害注入耐性、および永続化順序モデルの検証。
-- **完了条件 5**: 8 領域に及ぶ構造認識ファジング（パニック 0 件）と変異試験（6 検出 / 0 未検出）の合格。
+- **完了条件 5**: 12 領域に及ぶ構造認識ファジング（パニック 0 件）と変異試験（6 検出 / 0 未検出）の合格。
 - **完了条件 6**: 静的管理 UI の HTTP 結合試験（DOM・API・セキュリティ検証）、および SIR 評価器とネイティブ実行の実行経路ダイジェスト完全一致。
 
 以上の通り、Sigil Git におけるリポジトリの転送とホスティング機能（P4-4）は、公式仕様に完全に適合し、本物の Git との確固たる相互運用性と高い耐障害性を備えていることが実証された。
