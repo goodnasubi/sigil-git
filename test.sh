@@ -65,6 +65,13 @@ SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_history.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" bash tests/fault_interop.sh
 # Issue #634: ステップ単位の強制終了・電源断の模擬、カーネル障害注入（Linux x86_64 の ptrace。他の環境では明示的に失敗する）
+# tmpfs の本物の ENOSPC には root か sudo -n が要る。権限が無い手元の環境では、警告を出してその部分だけを省く。
+# CI（CI が設定されている環境）では省かず、権限が無ければ失敗させる。
+if [ "$(id -u)" != 0 ] && ! sudo -n true 2>/dev/null && [ -z "${CI:-}" ]; then
+  echo "警告: root でも sudo -n でも無いため、tmpfs の本物の ENOSPC の試験を省きます（FAULT_ALLOW_NO_MOUNT=1）" >&2
+  export FAULT_ALLOW_NO_MOUNT=1
+fi
+bash tests/fault_selftest.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" bash tests/fault_crash.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" bash tests/fault_kernel.sh
 grep -E '^# [0-9a-f]{64}' fixtures/v1/manifest.txt | sed 's/^# //' | (cd fixtures/v1 && sha256sum -c - >/dev/null)

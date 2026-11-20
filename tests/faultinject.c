@@ -12,8 +12,11 @@
 //   -m short        N 番目の write/pwrite64 の長さを -b バイトに縮める（カーネルが本当に短く書き、短い戻り値を返す）
 //   -d DURABLE      終了時に「同期されていないデータを持つファイル」の一覧（パス・同期済みの長さ）を書く。
 //                   電源断の模擬（未同期のデータを捨てる）に使う
-// ステップの種類: ファイルの作成・書き込み用 open、write/pwrite64、fsync/fdatasync、rename、unlink、mkdir、rmdir、
-//   ftruncate、fchmod（fd 0〜2 への write は数えない）。
+// ステップの種類: ファイルの作成・書き込み用 open（open/openat/openat2/creat）、write/pwrite64/writev/pwritev/pwritev2、
+//   fsync/fdatasync、rename、unlink、mkdir、rmdir、ftruncate/truncate、fchmod/chmod/fchmodat
+//   （fd 0〜2 への write、通常ファイルとディレクトリ以外（/dev/null・パイプなど）は数えない）。
+// 持続性の記録（-d）は syscall の「出口」で、成功したときだけ更新する。fsync の直前で止めたとき、fsync が失敗したときに、
+//   データを同期済みと誤認しないため。
 // 終了状態: 子の終了コード。シグナルで死んだときは 128 + シグナル番号。
 
 #define _GNU_SOURCE
@@ -58,7 +61,13 @@ struct task {
   char saved_b[PATH_MAX];  // rename の新パス（絶対）
   int open_write;       // 書き込み用 open か
   int open_trunc;       // O_TRUNC か
+  int open_creat;       // O_CREAT か
+  int open_existed;     // open の入口で、すでに通常ファイルとして存在したか
+  long open_size;       // open の入口での大きさ（existed のとき）
+  int op;               // 出口で記録する持続性の操作（OP_*）
+  char p1[PATH_MAX];    // 持続性の操作の対象パス（絶対）
 };
+enum { OP_NONE = 0, OP_WRITE, OP_TRUNCATE, OP_SYNC, OP_UNLINK };
 #define MAX_TASKS 64
 static struct task tasks[MAX_TASKS];
 static int ntasks = 0;
@@ -81,11 +90,21 @@ static struct task *find_task(pid_t pid) {
   return NULL;
 }
 
+// 空いた（終了した）スロットを再利用する。使い切ったら黙って追跡をやめず、その場で異常終了する（見逃しを防ぐ）。
 static struct task *add_task(pid_t pid) {
   struct task *t = find_task(pid);
   if (t) return t;
-  if (ntasks >= MAX_TASKS) return NULL;
-  t = &tasks[ntasks++];
+  int slot = -1;
+  for (int i = 0; i < ntasks; i++)
+    if (tasks[i].pid == 0) { slot = i; break; }
+  if (slot < 0) {
+    if (ntasks >= MAX_TASKS) {
+      fprintf(stderr, "faultinject: more than %d live tasks; the tracer cannot follow them\n", MAX_TASKS);
+      _exit(3);  // PTRACE_O_EXITKILL で子も終わる
+    }
+    slot = ntasks++;
+  }
+  t = &tasks[slot];
   memset(t, 0, sizeof(*t));
   t->pid = pid;
   return t;
@@ -146,7 +165,8 @@ static struct dirty *dirty_find(const char *path, int create) {
   return d;
 }
 
-static void dirty_mark(const char *path) {
+// 書き込みがあった。追跡に載っていなければ、新しく作ったファイルとして同期済みの長さ 0 で載せる。
+static void dirty_mark_keep(const char *path) {
   struct dirty *d = dirty_find(path, 1);
   if (d) d->dirty = 1;
 }
@@ -157,6 +177,13 @@ static void dirty_sync(const char *path) {
   if (!d) return;
   d->dirty = 0;
   d->synced_len = (stat(path, &st) == 0) ? (long)st.st_size : 0;
+}
+
+// 書き込み用に open した既存ファイルを、同期済みの長さ size で追跡に載せる（まだ載っていなければ）。
+static void dirty_baseline(const char *path, long size) {
+  if (dirty_find(path, 0)) return;
+  struct dirty *d = dirty_find(path, 1);
+  if (d) { d->dirty = 0; d->synced_len = size; }
 }
 
 static void dirty_forget(const char *path) {
@@ -188,17 +215,19 @@ static void write_durable(void) {
 
 static const char *sysname(long nr) {
   switch (nr) {
-    case SYS_open: case SYS_openat: case SYS_creat: return "open";
+    case SYS_open: case SYS_openat: case SYS_openat2: case SYS_creat: return "open";
     case SYS_write: return "write";
     case SYS_pwrite64: return "pwrite";
+    case SYS_writev: return "writev";
+    case SYS_pwritev: case SYS_pwritev2: return "pwritev";
     case SYS_fsync: return "fsync";
     case SYS_fdatasync: return "fdatasync";
     case SYS_rename: case SYS_renameat: case SYS_renameat2: return "rename";
     case SYS_unlink: case SYS_unlinkat: return "unlink";
     case SYS_mkdir: case SYS_mkdirat: return "mkdir";
     case SYS_rmdir: return "rmdir";
-    case SYS_ftruncate: return "ftruncate";
-    case SYS_fchmod: return "fchmod";
+    case SYS_ftruncate: case SYS_truncate: return "ftruncate";
+    case SYS_fchmod: case SYS_chmod: case SYS_fchmodat: return "fchmod";
     default: return NULL;
   }
 }
@@ -213,34 +242,66 @@ static void on_entry(struct task *t, struct user_regs_struct *r) {
   t->kill_after_this = 0;
   t->open_write = 0;
   t->open_trunc = 0;
+  t->open_creat = 0;
+  t->open_existed = 0;
+  t->open_size = 0;
+  t->op = OP_NONE;
+  t->p1[0] = '\0';
   if (!name) return;
   char detail[PATH_MAX + 64] = "";
   char p1[PATH_MAX] = "";
   int is_step = 1;
   switch (nr) {
-    case SYS_open: case SYS_openat: case SYS_creat: {
+    case SYS_open: case SYS_openat: case SYS_openat2: case SYS_creat: {
       long flags, dirfd = AT_FDCWD;
       unsigned long pathaddr;
       if (nr == SYS_open) { pathaddr = r->rdi; flags = (long)r->rsi; }
       else if (nr == SYS_creat) { pathaddr = r->rdi; flags = O_CREAT | O_WRONLY | O_TRUNC; }
+      else if (nr == SYS_openat2) {
+        // struct open_how { u64 flags; u64 mode; u64 resolve; } の flags を読む
+        dirfd = (long)r->rdi; pathaddr = r->rsi;
+        errno = 0;
+        long w = ptrace(PTRACE_PEEKDATA, t->pid, (void *)r->rdx, NULL);
+        flags = (errno == 0) ? w : 0;
+      }
       else { dirfd = (long)r->rdi; pathaddr = r->rsi; flags = (long)r->rdx; }
       if (!(flags & (O_CREAT | O_WRONLY | O_RDWR | O_TRUNC))) { is_step = 0; break; }
       char s[PATH_MAX] = "";
       read_tracee_string(t->pid, pathaddr, s, sizeof s);
       abs_path(t->pid, dirfd, s, p1, sizeof p1);
+      struct stat st;
+      int exists = (stat(p1, &st) == 0);
+      if (exists && !S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) { is_step = 0; break; }  // /dev/null など
       t->open_write = 1;
-      t->open_trunc = (flags & (O_CREAT | O_TRUNC)) != 0;
+      t->open_trunc = (flags & O_TRUNC) != 0;
+      t->open_creat = (flags & O_CREAT) != 0;
+      t->open_existed = exists && S_ISREG(st.st_mode);
+      t->open_size = t->open_existed ? (long)st.st_size : 0;
       snprintf(detail, sizeof detail, "%s%s%s", (flags & O_EXCL) ? "excl " : "", (flags & O_CREAT) ? "create " : "", s);
       break;
     }
-    case SYS_write: case SYS_pwrite64: case SYS_fsync: case SYS_fdatasync: case SYS_ftruncate: case SYS_fchmod: {
+    case SYS_write: case SYS_pwrite64: case SYS_writev: case SYS_pwritev: case SYS_pwritev2:
+    case SYS_fsync: case SYS_fdatasync: case SYS_ftruncate: case SYS_fchmod: {
       int fd = (int)r->rdi;
       if (fd < 3) { is_step = 0; break; }
       if (fd_path(t->pid, fd, p1, sizeof p1) != 0 || p1[0] != '/') { is_step = 0; break; }
       struct stat st;
-      int isdir = (stat(p1, &st) == 0 && S_ISDIR(st.st_mode));
+      int known = (stat(p1, &st) == 0);
+      if (known && !S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) { is_step = 0; break; }  // /dev/null など
+      int isdir = known && S_ISDIR(st.st_mode);
       snprintf(detail, sizeof detail, "%s%s", isdir ? "dir " : "", p1);
       if (nr == SYS_write || nr == SYS_pwrite64) snprintf(detail + strlen(detail), 40, " len=%lu", (unsigned long)r->rdx);
+      break;
+    }
+    case SYS_truncate: case SYS_chmod: case SYS_fchmodat: {
+      long dirfd = AT_FDCWD;
+      unsigned long pa;
+      if (nr == SYS_fchmodat) { dirfd = (long)r->rdi; pa = r->rsi; }
+      else pa = r->rdi;
+      char s[PATH_MAX] = "";
+      read_tracee_string(t->pid, pa, s, sizeof s);
+      abs_path(t->pid, dirfd, s, p1, sizeof p1);
+      snprintf(detail, sizeof detail, "%s", s);
       break;
     }
     case SYS_rename: case SYS_renameat: case SYS_renameat2: {
@@ -277,10 +338,12 @@ static void on_entry(struct task *t, struct user_regs_struct *r) {
     fprintf(g_log, "%ld\t%s\t%s\n", t->step, name, detail);
     fflush(g_log);
   }
-  // 持続性の追跡（入口で分かるもの）
-  if (nr == SYS_write || nr == SYS_pwrite64 || nr == SYS_ftruncate) dirty_mark(p1);
-  if (nr == SYS_fsync || nr == SYS_fdatasync) dirty_sync(p1);
-  if (nr == SYS_unlink || nr == SYS_unlinkat) dirty_forget(p1);
+  // 持続性の追跡: 対象を覚えておき、出口で、成功したときだけ記録する（実行されなかった・失敗した syscall では状態を変えない）
+  snprintf(t->p1, sizeof t->p1, "%s", p1);
+  if (nr == SYS_write || nr == SYS_pwrite64 || nr == SYS_writev || nr == SYS_pwritev || nr == SYS_pwritev2) t->op = OP_WRITE;
+  else if (nr == SYS_ftruncate || nr == SYS_truncate) t->op = OP_TRUNCATE;
+  else if (nr == SYS_fsync || nr == SYS_fdatasync) t->op = OP_SYNC;
+  else if (nr == SYS_unlink || nr == SYS_unlinkat) t->op = OP_UNLINK;
   // 障害の注入
   int hit = (g_n > 0) && (t->step == g_n || (g_sticky && g_mode == M_ERROR && t->step > g_n));
   if (!hit) return;
@@ -318,17 +381,25 @@ static void on_exit_stop(struct task *t, struct user_regs_struct *r) {
   }
   if (!t->counted) return;
   long ret = (long)r->rax;
-  if (ret >= 0 || ret < -4095) {
-    if (t->open_write) {
-      char p[PATH_MAX];
-      if (fd_path(t->pid, (int)ret, p, sizeof p) == 0 && p[0] == '/') {
-        if (t->open_trunc) {
-          struct dirty *d = dirty_find(p, 1);
-          if (d) { d->dirty = 1; d->synced_len = 0; }
-        }
+  // 持続性の記録（出口で、戻り値が成功のときだけ）
+  if (t->open_write && ret >= 0) {
+    char p[PATH_MAX];
+    if (fd_path(t->pid, (int)ret, p, sizeof p) == 0 && p[0] == '/') {
+      if (t->open_trunc || (t->open_creat && !t->open_existed)) {
+        // 切り詰めた、または新しく作った: 内容はまだ同期されていない
+        struct dirty *d = dirty_find(p, 1);
+        if (d) { d->dirty = 1; d->synced_len = 0; }
+      } else if (t->open_existed) {
+        // 既存のファイルをそのまま開いた: もとの大きさまでは耐久とみなす
+        dirty_baseline(p, t->open_size);
       }
     }
   }
+  if (t->op == OP_WRITE && ret > 0) dirty_mark_keep(t->p1);
+  else if (t->op == OP_TRUNCATE && ret == 0) dirty_mark_keep(t->p1);
+  else if (t->op == OP_SYNC && ret == 0) dirty_sync(t->p1);
+  else if (t->op == OP_UNLINK && ret == 0) dirty_forget(t->p1);
+  t->op = OP_NONE;
   // rename は出口で成功したときだけ状態を移す（入口では nr を見ているので syscall 番号は orig_rax に残らないことがある）
   if (t->saved_a[0] && ret >= 0) {
     dirty_rename(t->saved_a, t->saved_b);
@@ -388,7 +459,7 @@ int main(int argc, char **argv) {
   }
   int status;
   if (waitpid(child, &status, 0) < 0) { perror("waitpid"); return 2; }
-  long opts = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_EXITKILL;
+  long opts = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL;
   ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)opts);
   add_task(child);
   ptrace(PTRACE_SYSCALL, child, NULL, NULL);
@@ -427,6 +498,7 @@ int main(int argc, char **argv) {
         ptrace(PTRACE_GETEVENTMSG, pid, NULL, &np);
         add_task((pid_t)np);
       }
+      // PTRACE_EVENT_EXEC: execve の完了。syscall の入口・出口の組は変わらないので、ここでは何もしない
     } else if (sig == SIGSTOP && t && t->in_syscall == 0 && t->step == 0 && pid != child) {
       deliver = 0;  // 新しいタスクの最初の停止
     } else {

@@ -49,7 +49,6 @@ for FL_SCEN in $SCENARIOS; do
       fl_new_case "$FL_SCEN"
       if [ "$kind" = eio ]; then fl_run -m error -n "$i" -e EIO; else fl_run -m error -n "$i" -e ENOSPC -s; fi
       fl_check_exit "注入後"
-      grep -q 'failed with errno' "$FW/steps.$FL_SCEN.txt" 2>/dev/null || true
       fl_check_invariants "注入後"
       check_atomic "注入後"
       [ "$FL_SCEN" != checkout ] || fl_check_worktree_files "注入後"
@@ -88,7 +87,7 @@ done
 echo "注入した件数: EIO=${COUNT_FAULTS[eio]} ENOSPC=${COUNT_FAULTS[enospc]} short write=${COUNT_FAULTS[short]}"
 if [ "$SILENT_OK" -gt 0 ]; then
   echo "注意: 失敗を注入したのにエラーを返さなかった件数: $SILENT_OK（後始末の失敗など、結果に影響しない最終の手順）"
-  printf "$SILENT_LIST\n" | sed -n '1,40p'
+  printf '%b\n' "$SILENT_LIST" | sed -n '1,40p'
 fi
 
 # --- 2. 本物の ENOSPC（容量を絞った tmpfs） ---

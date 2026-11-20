@@ -147,11 +147,19 @@ def main():
                     except subprocess.TimeoutExpired:
                         rc, out = 124, "timeout"
                     total_time += time.time() - t0
-                    if rc != 0:
+                    if rc == 0:
+                        continue
+                    # 終了コード 1 で、試験が不変条件の違反を報告した（"FAIL [...]"）ときだけを検出とする。
+                    # 構文エラー・準備の不備（終了コード 2）・タイムアウトなどは、変異を検出したことにしない。
+                    if rc == 1 and "FAIL [" in out:
                         status = "DETECTED"
                         note = f"試験失敗 (script {os.path.basename(script)})"
                         break
-                    continue
+                    status = "BUILD_ERROR"
+                    note = f"スクリプトが想定外の終了 (rc={rc}, script {os.path.basename(script)})"
+                    has_build_error = True
+                    print(f"[{m['name']}] {script} の出力の末尾:\n" + "\n".join(out.splitlines()[-8:]), file=sys.stderr)
+                    break
                 bin_path = os.path.join(work, "mut_bin")
                 rc, out, dt = sh([sigil, "build", "--root", ".", "mutation_runner.sigil", entry, "-o", bin_path], work, 120)
                 total_time += dt

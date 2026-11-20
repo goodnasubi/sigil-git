@@ -79,7 +79,9 @@ OS キャッシュとディスクの同期境界（fsync）の振る舞いをモ
 | 同（short write） | 全 write で 1 バイトだけ／半分だけ書く本物の部分書き込み | 36 件全合格（結果は正常実行と完全に一致。write の再試行が正しい） |
 | 同（本物の ENOSPC） | 容量を絞った tmpfs（40 通りの容量）で実行 | ENOSPC に当たった 14 件はすべて fsck 成功・容量を増やしてのやり直し成功。26 件は成功 |
 
-実行時間は `fault_crash.sh` が約 60 秒、`fault_kernel.sh` が約 60 秒。`test.sh` が実行する。tmpfs の試験には root か `sudo -n` が要る（無い環境では `FAULT_ALLOW_NO_MOUNT=1` を明示したときだけ省略）。
+実行時間は `fault_crash.sh` が約 60 秒、`fault_kernel.sh` が約 60 秒。`test.sh` が実行する。tmpfs の試験には root か `sudo -n` が要る。権限が無い手元の環境では `test.sh` が警告を出してその部分だけを省く（`FAULT_ALLOW_NO_MOUNT=1`）。CI（環境変数 `CI` あり）では省かず、権限が無ければ失敗する。
+
+**注入器自身の試験**: `tests/fault_selftest.sh` が、小さな既知のプログラム（python3）で `faultinject.c` の挙動を確かめる（fsync の直前で止めたら未同期・直後なら同期済み、失敗した fsync は同期済みにしない、既存ファイルへの `O_CREAT` だけでは長さを 0 にしない、終了したプロセスのスロットの再利用、writev・openat2・chmod 系を数え `/dev/null` は数えない）。持続性の記録は syscall の出口で、成功したときだけ更新する。レビュー（PR #9）の指摘で、入口で同期済みにしていた誤りを直し、再発を防ぐために加えた。
 
 **限界（正直な記録）**:
 - dm-flakey（device-mapper）は本環境の Linux コンテナで使えない（`/dev/mapper` が無い）。ブロック層のエラーではなく、システムコールの戻り値のレベルで EIO・ENOSPC・short write を注入している。ただし tmpfs の本物の ENOSPC は別途確認した。
@@ -230,7 +232,7 @@ Sigil の 2 つの実行基盤である「SIR 評価器（インタープリタ:
 
 - **変異検出結果**: **6 DETECTED / 0 UNDETECTED**
 - `object_sync_omitted` は、同一プロセス・OS ページキャッシュ環境では直後の読み取りがキャッシュから返るため、以前は未検出で持ち越していた（許可リスト `ALLOWED_UNDETECTED`）。Issue #634 で、未同期データを捨てる電源断の模擬（3.4）を試験群に加えたところ、空のオブジェクトを `git fsck` が報告して検出できた。許可リストは空になり、`mutations.py` は未検出が 1 件でもあれば exit 1 とする。
-- 変異試験の入口にスクリプトを指定できるようにした（`SCRIPT_POWERLOSS`。`FAULT_POWERLOSS_ONLY=1` で全ステップの強制終了を省き、電源断の確認だけを走らせる）。
+- 変異試験の入口にスクリプトを指定できるようにした（`SCRIPT_POWERLOSS`。`FAULT_POWERLOSS_ONLY=1` で全ステップの強制終了を省き、電源断の確認だけを走らせる）。スクリプトが終了コード 1 で `FAIL [...]` を報告したときだけ検出とみなす。準備の不備（終了コード 2）や構文エラーは BUILD_ERROR にして、偽の検出を防ぐ。
 
 ---
 

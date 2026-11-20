@@ -4,9 +4,10 @@
 # 環境変数: SIGIL（コンパイラ）、STAGE5_GIT（実 Git）、OPS_BIN（試験の対象にする interop_ops のバイナリ。
 #   省略時は interop_ops.sigil をビルドする。変異試験が変異を入れたバイナリを渡すために使う）
 
+# 環境や準備の不備（試験が走らせられない）。終了コード 2。試験が不変条件の違反を見つけたとき（fl_fail、終了コード 1）と区別する。
 fl_die() {
-  echo "FAIL: $*" >&2
-  exit 1
+  echo "ERROR: $*" >&2
+  exit 2
 }
 
 fl_init() {
@@ -222,7 +223,8 @@ fl_powerloss() {
   [ -f "$dur" ] || return 0
   while IFS=$'\t' read -r len path; do
     [ -n "$path" ] || continue
-    if [ -f "$path" ]; then
+    # 同期済みの長さより長いときだけ切り詰める（短いファイルを 0 埋めで伸ばさない）
+    if [ -f "$path" ] && [ "$(stat -c %s "$path")" -gt "$len" ]; then
       truncate -s "$len" "$path"
       n=$((n + 1))
     fi
