@@ -110,7 +110,7 @@ SHA-256 のリポジトリで、`add` → `commit` → `checkout` の一連が�
 スマート HTTP v0 の upload-pack（参照広告、want／have／done、wire 専用 pack v2 応答、gzip 要求）です。詳細は [docs/UPLOAD_PACK.md](docs/UPLOAD_PACK.md)。
 
 - `git/upload.sigil`、`git/gzip.sigil`、`git/crc32.sigil`、`git/acl.sigil`、`upload_server.sigil`（HMAC Bearer・固定 ACL の HTTP サーバー）。
-- 実 Git の確認: `SIGIL=... STAGE5_GIT=... ./interop_upload.sh`
+- 実 Git の確認: `SIGIL=... STAGE5_GIT=... ./interop_upload.sh`（STAGE5_GIT に git-remote-http が無ければ PATH の git を使う）
 
 ## テストの実行
 

@@ -16,6 +16,21 @@ if [[ -n "${STAGE5_GIT_VERSION:-}" ]]; then
   test "$("$STAGE5_GIT" --version)" = "git version $STAGE5_GIT_VERSION"
 fi
 "$STAGE5_GIT" init --object-format=sha256 --bare -q "$(mktemp -d)" || { echo "this git does not support SHA-256" >&2; exit 1; }
+
+# HTTP の clone／fetch には git-remote-http が要る。STAGE5_GIT（curl 無しでビルドされていることがある）に無ければ、
+# PATH 上の git のうち remote-http と SHA-256 の両方を持つものを使い、使った版を表示する。どちらにも無ければ失敗する。
+has_http() {
+  local ep
+  ep="$("$1" --exec-path 2>/dev/null)" || return 1
+  [ -x "$ep/git-remote-http" ] && "$1" init --object-format=sha256 --bare -q "$(mktemp -d)" >/dev/null 2>&1
+}
+HTTP_GIT="$STAGE5_GIT"
+if ! has_http "$HTTP_GIT"; then
+  echo "note: $STAGE5_GIT has no git-remote-http; trying git from PATH"
+  HTTP_GIT=git
+  has_http "$HTTP_GIT" || { echo "no git with git-remote-http and SHA-256 support found" >&2; exit 1; }
+fi
+echo "Git for HTTP: $("$HTTP_GIT" --version)"
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 
@@ -30,7 +45,7 @@ trap cleanup EXIT
 export GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=T GIT_COMMITTER_EMAIL=t@example.com
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 unset GIT_PROTOCOL
-G="$STAGE5_GIT"
+G="$HTTP_GIT"
 t=1700000000
 tick() { t=$((t + 60)); export GIT_AUTHOR_DATE="$t +0000" GIT_COMMITTER_DATE="$t +0000"; }
 fail() {
