@@ -266,13 +266,24 @@ fn test_fault_orphaned_tmp_obj(repo: &Repo) -> Bool
   }
   match odb_read(&repo, &new_id) {
     Err(_) => {
+      let _ = remove_file_if_exists(&junk_tmp);
       return false;
     }
     Ok(obj) => {
       if obj.content.len() != new_data.len() {
+        let _ = remove_file_if_exists(&junk_tmp);
         return false;
       }
     }
+  }
+
+  // 孤立一時ファイル自体はオブジェクトとして解決されない
+  match odb_read(&repo, &"12deadbeef123456780000000000000000000000000000000000000000000000") {
+    Ok(_) => {
+      let _ = remove_file_if_exists(&junk_tmp);
+      return false;
+    }
+    Err(_) => {}
   }
 
   // 掃除
@@ -318,7 +329,7 @@ fn test_fault_orphaned_ref_lock(repo: &Repo) -> Bool
     }
   }
 
-  // 既存の HEAD は健全
+  // 既存の HEAD と参照値は不変
   match read_head(&repo) {
     Err(_) => {
       let _ = remove_file_if_exists(&lock_path);
@@ -326,6 +337,19 @@ fn test_fault_orphaned_ref_lock(repo: &Repo) -> Bool
     }
     Ok(HeadState.Symbolic(sym)) => {
       if sym != "refs/heads/main" {
+        let _ = remove_file_if_exists(&lock_path);
+        return false;
+      }
+    }
+    _ => {
+      let _ = remove_file_if_exists(&lock_path);
+      return false;
+    }
+  }
+
+  match read_ref(&repo, &"refs/heads/main") {
+    Ok(Some(s)) => {
+      if s != head_cid {
         let _ = remove_file_if_exists(&lock_path);
         return false;
       }

@@ -3,6 +3,7 @@ module perf_runner
   trust none
 
 use git.checkout.checkout;
+use git.diff.diff_worktree;
 use git.fsio.cat3;
 use git.fsio.create_synced_file;
 use git.fsio.join_path;
@@ -138,12 +139,23 @@ pub fn run_perf(count: Int) -> Int
         }
       }
 
-      // 4. checkout
+      // 4. diff
+      if last_commit_id != "" {
+        match diff_worktree(&repo, &last_commit_id) {
+          Err(_) => {
+            console.log(&"FAIL: diff in perf");
+            return 6;
+          }
+          Ok(_) => {}
+        }
+      }
+
+      // 5. checkout
       if last_commit_id != "" {
         match checkout(&repo, &last_commit_id) {
           Err(_) => {
             console.log(&"FAIL: checkout in perf");
-            return 6;
+            return 7;
           }
           Ok(_) => {}
         }

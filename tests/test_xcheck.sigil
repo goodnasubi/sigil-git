@@ -5,93 +5,257 @@ module tests.test_xcheck
 use git.commit.decode_commit;
 use git.commit.encode_commit;
 use git.commit.new_commit_object_str;
+use git.error.error_kind_name;
 use git.hash.bytes_to_hex;
+use git.hash.compute_raw_object_id;
 use git.hash.hex_to_bytes;
+use git.inflate.inflate_zlib;
 use git.object.ObjectType;
 use git.object.encode_raw_object;
+use git.tag.decode_tag;
+use git.tag.encode_tag;
+use git.tag.new_tag_object_str;
 use git.tree.decode_tree;
 use git.tree.encode_tree;
 use git.tree.new_tree_entry;
 use git.validate.validate_path;
+use git.validate.validate_ref_name;
+use git.zlib.zlib_stored;
+
+fn record_result(h: &mut Sha256, tag: &String, is_ok: Bool, detail: &String)
+  intent "操作結果の成否と詳細（正常値またはエラー種別）をダイジェストに畳み込む"
+  requires none
+  ensures none
+  effects none
+{
+  h.update(&tag.as_bytes());
+  if is_ok {
+    h.update(&"OK:".as_bytes());
+  } else {
+    h.update(&"ERR:".as_bytes());
+  }
+  h.update(&detail.as_bytes());
+}
+
+pub fn expected_trace_digest() -> String
+  intent "決定論的操作列・エラー・上限から算出される固定された期待トレースダイジェスト（ADR 0047 決定 6-8）"
+  requires none
+  ensures none
+  effects none
+{
+  // 決定論的アルゴリズムに基づき算出された固定ダイジェスト値
+  return "ebce0bdaaee7081c671596c80c526ab634eaacb2d0dcd4c1b5b0787a69f227f6";
+}
 
 pub fn compute_trace_digest() -> String
-  intent "一連の決定論的操作を実行し、その結果から単一のハッシュダイジェストを算出する（両実行経路一致の検証用、ADR 0047 決定 6-8）"
+  intent "一連の決定論的操作・エラー経路・上限検査を実行し、単一のハッシュダイジェストを算出する（両実行経路一致の検証用、ADR 0047 決定 6-8）"
   requires none
   ensures none
   effects none
 {
   let mut h = Sha256.new();
 
-  // 1. blob
+  // 1. 正常操作: blob
   let mut b = Bytes.new();
   b.extend(&"xcheck blob payload".as_bytes());
   let raw_blob = encode_raw_object(&ObjectType.Blob, &b);
-  h.update(&raw_blob);
+  let blob_id = bytes_to_hex(&compute_raw_object_id(&raw_blob));
+  record_result(&mut h, &"blob", true, &blob_id);
 
-  // 2. tree
+  // 2. 正常操作: tree
   let mut entries = List.new();
-  let dummy_id = hex_to_bytes(&"8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60").unwrap_or(Bytes.new());
-  entries.push(new_tree_entry(33188, "file.txt".as_bytes(), dummy_id.clone()));
-  let raw_tree = encode_tree(&entries).unwrap_or(Bytes.new());
-  h.update(&raw_tree);
-
-  // 3. commit
-  let c = new_commit_object_str("8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60", List.new(), "Test <t@example.com> 1700000000 +0000", "Test <t@example.com> 1700000000 +0000", List.new(), "commit for xcheck\n");
-  let raw_commit = encode_commit(&c).unwrap_or(Bytes.new());
-  h.update(&raw_commit);
-
-  // 4. decode and round-trip
-  match decode_commit(&raw_commit) {
-    Ok(c_dec) => {
-      h.update(&c_dec.tree_id.as_bytes());
-      h.update(&c_dec.message);
-    }
-    Err(_) => {}
-  }
-  match decode_tree(&raw_tree) {
-    Ok(t_entries) => {
-      let mut ti = 0;
-      while ti < t_entries.len() {
-        match t_entries.get(ti) {
-          None => {}
-          Some(te) => {
-            h.update(&te.name);
+  let dummy_id = hex_to_bytes(&"2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4").unwrap_or(Bytes.new());
+  entries.push(new_tree_entry(33188, "file1.txt".as_bytes(), dummy_id.clone()));
+  entries.push(new_tree_entry(33188, "file2.txt".as_bytes(), dummy_id.clone()));
+  match encode_tree(&entries) {
+    Ok(raw_tree) => {
+      record_result(&mut h, &"tree_enc", true, &bytes_to_hex(&compute_raw_object_id(&encode_raw_object(&ObjectType.Tree, &raw_tree))));
+      match decode_tree(&raw_tree) {
+        Ok(t_entries) => {
+          let mut count_str = "count_";
+          if t_entries.len() == 2 {
+            count_str = "count_2";
           }
+          record_result(&mut h, &"tree_dec", true, &count_str);
         }
-        ti = ti + 1;
+        Err(e) => {
+          record_result(&mut h, &"tree_dec", false, &error_kind_name(&e));
+        }
       }
     }
-    Err(_) => {}
+    Err(e) => {
+      record_result(&mut h, &"tree_enc", false, &error_kind_name(&e));
+    }
   }
 
-  // 5. validation & limits
-  let v1 = validate_path(&"valid/path.txt");
-  let v2 = validate_path(&"../invalid.txt");
-  let mut v_bytes = Bytes.new();
-  match v1 {
-    Ok(_) => {
-      v_bytes.push(1);
+  // 3. 正常操作: commit
+  let c = new_commit_object_str("ea3b6ce0df88dc227083adba05c43d15da3a824a98da9bcaaf1930277fb07f30", List.new(), "Author <a@example.com> 1700000000 +0000", "Committer <c@example.com> 1700000000 +0000", List.new(), "xcheck commit\n");
+  match encode_commit(&c) {
+    Ok(raw_c) => {
+      record_result(&mut h, &"commit_enc", true, &bytes_to_hex(&compute_raw_object_id(&encode_raw_object(&ObjectType.Commit, &raw_c))));
+      match decode_commit(&raw_c) {
+        Ok(dec_c) => {
+          record_result(&mut h, &"commit_dec", true, &dec_c.tree_id);
+        }
+        Err(e) => {
+          record_result(&mut h, &"commit_dec", false, &error_kind_name(&e));
+        }
+      }
     }
-    Err(_) => {
-      v_bytes.push(0);
-    }
-  }
-  match v2 {
-    Ok(_) => {
-      v_bytes.push(1);
-    }
-    Err(_) => {
-      v_bytes.push(0);
+    Err(e) => {
+      record_result(&mut h, &"commit_enc", false, &error_kind_name(&e));
     }
   }
-  h.update(&v_bytes);
+
+  // 4. 正常操作: tag
+  let tag = new_tag_object_str("b1e071267937c1c2a8baa1a9ee2c6a448dc9e35685da97521b1f019e9d3e5fe6", "commit", "v1.0", "Tagger <t@example.com> 1700000000 +0000", "tag message\n");
+  match encode_tag(&tag) {
+    Ok(raw_t) => {
+      record_result(&mut h, &"tag_enc", true, &bytes_to_hex(&compute_raw_object_id(&encode_raw_object(&ObjectType.Tag, &raw_t))));
+      match decode_tag(&raw_t) {
+        Ok(dec_t) => {
+          record_result(&mut h, &"tag_dec", true, &dec_t.tag_name);
+        }
+        Err(e) => {
+          record_result(&mut h, &"tag_dec", false, &error_kind_name(&e));
+        }
+      }
+    }
+    Err(e) => {
+      record_result(&mut h, &"tag_enc", false, &error_kind_name(&e));
+    }
+  }
+
+  // 5. 正常操作: inflate roundtrip
+  let mut payload = Bytes.new();
+  payload.extend(&"zlib roundtrip compression payload for xcheck".as_bytes());
+  let compressed = zlib_stored(&payload);
+  match inflate_zlib(&compressed, 0, 1048576) {
+    Ok(inf) => {
+      let mut is_eq = "inflated_neq";
+      if inf.data.len() == payload.len() {
+        is_eq = "inflated_eq";
+      }
+      record_result(&mut h, &"inflate", true, &is_eq);
+    }
+    Err(e) => {
+      record_result(&mut h, &"inflate", false, &error_kind_name(&e));
+    }
+  }
+
+  // 6. エラー経路: 壊れた tree エントリ
+  let mut bad_tree = Bytes.new();
+  bad_tree.extend(&"100644 truncated_entry".as_bytes());
+  bad_tree.push(0);
+  match decode_tree(&bad_tree) {
+    Ok(_) => {
+      record_result(&mut h, &"bad_tree", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"bad_tree", false, &error_kind_name(&e));
+    }
+  }
+
+  // 7. エラー経路: 壊れた commit (tree 欠落)
+  let mut bad_commit = Bytes.new();
+  bad_commit.extend(&"author A <a@example.com> 0 +0000\n\nno tree\n".as_bytes());
+  match decode_commit(&bad_commit) {
+    Ok(_) => {
+      record_result(&mut h, &"bad_commit", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"bad_commit", false, &error_kind_name(&e));
+    }
+  }
+
+  // 8. エラー経路: 壊れた tag (未知のオブジェクト型)
+  let mut bad_tag = Bytes.new();
+  bad_tag.extend(&"object 2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4\ntype unknown_type\ntag v\ntagger T <t@example.com> 0 +0000\n\nmsg".as_bytes());
+  match decode_tag(&bad_tag) {
+    Ok(_) => {
+      record_result(&mut h, &"bad_tag", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"bad_tag", false, &error_kind_name(&e));
+    }
+  }
+
+  // 9. エラー経路: 壊れた zlib ストリーム
+  let mut bad_z = Bytes.new();
+  bad_z.push(120);
+  bad_z.push(156);
+  bad_z.push(255);
+  bad_z.push(255);
+  match inflate_zlib(&bad_z, 0, 1048576) {
+    Ok(_) => {
+      record_result(&mut h, &"bad_inflate", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"bad_inflate", false, &error_kind_name(&e));
+    }
+  }
+
+  // 10. エラー経路: パストラバーサル
+  match validate_path(&"../secret_file") {
+    Ok(_) => {
+      record_result(&mut h, &"path_traversal", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"path_traversal", false, &error_kind_name(&e));
+    }
+  }
+
+  // 11. エラー経路: 不正な参照名
+  match validate_ref_name(&"refs/heads/foo@{bar") {
+    Ok(_) => {
+      record_result(&mut h, &"bad_ref_name", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"bad_ref_name", false, &error_kind_name(&e));
+    }
+  }
+
+  // 12. 上限検査: パス構成要素長 255 超過
+  let mut long_comp = Bytes.new();
+  let mut li = 0;
+  while li < 260 {
+    long_comp.push(97);  // 'a'
+    li = li + 1;
+  }
+  let long_path = long_comp.to_string_utf8().unwrap_or("");
+  match validate_path(&long_path) {
+    Ok(_) => {
+      record_result(&mut h, &"limit_path_comp", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"limit_path_comp", false, &error_kind_name(&e));
+    }
+  }
+
+  // 13. 上限検査: 参照名長 1024 超過
+  let mut long_ref_bytes = Bytes.new();
+  long_ref_bytes.extend(&"refs/heads/".as_bytes());
+  li = 0;
+  while li < 1030 {
+    long_ref_bytes.push(97);  // 'a'
+    li = li + 1;
+  }
+  let long_ref = long_ref_bytes.to_string_utf8().unwrap_or("");
+  match validate_ref_name(&long_ref) {
+    Ok(_) => {
+      record_result(&mut h, &"limit_ref_len", true, &"unexpected_ok");
+    }
+    Err(e) => {
+      record_result(&mut h, &"limit_ref_len", false, &error_kind_name(&e));
+    }
+  }
 
   let digest = bytes_to_hex(&h.finalize());
   return digest;
 }
 
 pub fn run_xcheck_tests() -> Bool
-  intent "xcheck ダイジェストが正しく計算できることを確認する"
+  intent "xcheck ダイジェストが正しく計算され、固定された期待値と完全一致することを確認する"
   requires none
   ensures none
   effects console
@@ -99,5 +263,12 @@ pub fn run_xcheck_tests() -> Bool
   let digest = compute_trace_digest();
   console.log(&"xcheck trace digest: ");
   console.log(&digest);
-  return digest.len() == 64;
+  let expected = expected_trace_digest();
+  if digest != expected {
+    console.log(&"FAIL: trace digest mismatch with pinned expected digest");
+    console.log(&"expected: ");
+    console.log(&expected);
+    return false;
+  }
+  return true;
 }

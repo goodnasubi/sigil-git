@@ -63,8 +63,10 @@ SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_pack.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_ops.sh
 SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" ./interop_history.sh
+SIGIL="$SIGIL" STAGE5_GIT="${STAGE5_GIT:-git}" STAGE5_GIT_VERSION="${STAGE5_GIT_VERSION:-}" bash tests/fault_interop.sh
 
 echo "=== 6. Execution path equivalence (SIR evaluator vs Native binary) ==="
+EXPECTED_DIGEST="ebce0bdaaee7081c671596c80c526ab634eaacb2d0dcd4c1b5b0787a69f227f6"
 SIR_DIGEST="$($SIGIL run --root . tests/test_xcheck.sigil compute_trace_digest | tail -n 1 | tr -d '"')"
 XCHECK_BIN="$(mktemp -t sigil_git_xcheck_XXXXXX)"
 trap 'rm -f "$XCHECK_BIN"' EXIT
@@ -75,8 +77,9 @@ trap - EXIT
 
 echo "SIR evaluator trace digest: $SIR_DIGEST"
 echo "Native binary trace digest: $NATIVE_DIGEST"
-if [ "$SIR_DIGEST" != "$NATIVE_DIGEST" ]; then
-  echo "Error: trace digest mismatch between SIR evaluator and Native binary" >&2
+echo "Pinned expected digest:    $EXPECTED_DIGEST"
+if [ "$SIR_DIGEST" != "$NATIVE_DIGEST" ] || [ "$SIR_DIGEST" != "$EXPECTED_DIGEST" ]; then
+  echo "Error: trace digest mismatch between SIR evaluator, Native binary, and Pinned digest" >&2
   exit 1
 fi
 echo "Execution path equivalence verified!"
