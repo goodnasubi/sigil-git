@@ -102,7 +102,7 @@ pub fn parse_object_header(data: &Bytes) -> Result<ObjectHeader, GitError>
   ensures none
   effects none
 {
-  let len = data.len();
+  let len = data.byte_len();
   if len < 3 {
     return Err(GitError.Corrupt("object data too short for header"));
   }
@@ -179,7 +179,7 @@ pub fn parse_object_header(data: &Bytes) -> Result<ObjectHeader, GitError>
 
 pub fn verify_object_bytes(data: &Bytes, expected_id: &Bytes) -> Result<ObjectHeader, GitError>
   intent "オブジェクトのヘッダを検証し、全体の SHA-256 識別子が expected_id と一致することを検証する"
-  requires expected_id.len() == 32
+  requires expected_id.byte_len() == 32
   ensures none
   effects none
 {
@@ -198,7 +198,7 @@ pub fn encode_raw_object(obj_type: &ObjectType, content: &Bytes) -> Bytes
   effects none
 {
   let type_name = object_type_name(&obj_type);
-  let mut out = format_object_header(&type_name, content.len());
+  let mut out = format_object_header(&type_name, content.byte_len());
   out.extend(&content);
   return out;
 }

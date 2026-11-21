@@ -101,7 +101,7 @@ fn validate_tag_field_no_newline_or_null(b: &Bytes, field_name: &String) -> Resu
   ensures none
   effects none
 {
-  let len = b.len();
+  let len = b.byte_len();
   let mut i = 0;
   while i < len {
     let c = b.get(i).unwrap_or(0);
@@ -128,7 +128,7 @@ pub fn decode_tag(content: &Bytes) -> Result<TagObject, GitError>
   ensures none
   effects none
 {
-  let total_len = content.len();
+  let total_len = content.byte_len();
   let mut object_id = "";
   let mut object_type = "";
   let mut name = "";
@@ -261,7 +261,7 @@ pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
     return Err(GitError.Corrupt("tag name cannot be empty"));
   }
   validate_tag_field_no_newline_or_null(&name.as_bytes(), &"tag")?;
-  if tagger.len() > 0 {
+  if tagger.byte_len() > 0 {
     validate_tag_field_no_newline_or_null(&tagger, &"tagger")?;
   }
 
@@ -283,7 +283,7 @@ pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
   buf.push(10);  // '\n'
 
   // tagger <tagger>\n
-  if tagger.len() > 0 {
+  if tagger.byte_len() > 0 {
     buf.extend(&"tagger ".as_bytes());
     buf.extend(&tagger);
     buf.push(10);  // '\n'
@@ -293,7 +293,7 @@ pub fn encode_tag(tag: &TagObject) -> Result<Bytes, GitError>
   buf.push(10);  // '\n'
 
   // message
-  if msg.len() > max_tag_message_size() {
+  if msg.byte_len() > max_tag_message_size() {
     return Err(GitError.LimitExceeded("tag message size exceeds 1 MiB limit"));
   }
   buf.extend(&msg);

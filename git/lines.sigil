@@ -17,7 +17,7 @@ pub fn bytes_match(a: &Bytes, start: Int, b: &Bytes, offset: Int, count: Int) ->
   ensures none
   effects none
 {
-  if start < 0 || offset < 0 || count < 0 || count > a.len() - start || count > b.len() - offset {
+  if start < 0 || offset < 0 || count < 0 || count > a.byte_len() - start || count > b.byte_len() - offset {
     return false;
   }
   let mut i = 0;
@@ -39,8 +39,8 @@ fn offsets(data: &Bytes) -> Result<List<Int>, GitError>
   let mut out = List.new();
   out.push(0);
   let mut i = 0;
-  while i < data.len() {
-    if data.get(i).unwrap_or(0) == 10 || i + 1 == data.len() {
+  while i < data.byte_len() {
+    if data.get(i).unwrap_or(0) == 10 || i + 1 == data.byte_len() {
       if out.len() >= max_work_memory() / 1024 {
         return Err(GitError.LimitExceeded("line offsets exceed working memory limit"));
       }
@@ -188,7 +188,7 @@ pub fn merge_lines(base: &Bytes, ours: &Bytes, theirs: &Bytes) -> Result<Option<
   ensures none
   effects none
 {
-  if base.len() + ours.len() + theirs.len() > max_work_memory() / 4 {
+  if base.byte_len() + ours.byte_len() + theirs.byte_len() > max_work_memory() / 4 {
     return Err(GitError.LimitExceeded("merge input exceeds working memory limit"));
   }
   let left = edits(&base, &ours)?;
@@ -217,7 +217,7 @@ pub fn merge_lines(base: &Bytes, ours: &Bytes, theirs: &Bytes) -> Result<Option<
           Some(r) => {
             // 同じ位置への挿入も含め、同じ範囲への変更は内容が一致するときだけ一度適用する。
             if l.start == r.start && l.end == r.end {
-              if l.content.len() != r.content.len() || !bytes_match(&l.content, 0, &r.content, 0, l.content.len()) {
+              if l.content.byte_len() != r.content.byte_len() || !bytes_match(&l.content, 0, &r.content, 0, l.content.byte_len()) {
                 return Ok(None);
               }
               cursor = append_edit(&mut out, &base, cursor, &l);
@@ -237,6 +237,6 @@ pub fn merge_lines(base: &Bytes, ours: &Bytes, theirs: &Bytes) -> Result<Option<
       }
     }
   }
-  out.extend(&base.slice(cursor, base.len()).unwrap_or(Bytes.new()));
+  out.extend(&base.slice(cursor, base.byte_len()).unwrap_or(Bytes.new()));
   return Ok(Some(out));
 }

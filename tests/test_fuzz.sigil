@@ -511,7 +511,7 @@ fn fuzz_pack_index(rng: &mut Rng, iterations: Int, base_idx: &Bytes, base_pack: 
     let mut b = base_idx.clone();
     let pat = i % 5;
     if pat == 0 {
-      let trunc_len = rng_next(&mut rng) % base_idx.len();
+      let trunc_len = rng_next(&mut rng) % base_idx.byte_len();
       b = base_idx.slice(0, trunc_len).unwrap_or(Bytes.new());
     } else if pat == 1 {
       let _ = b.set(0, rng_next(&mut rng) % 256);
@@ -520,15 +520,15 @@ fn fuzz_pack_index(rng: &mut Rng, iterations: Int, base_idx: &Bytes, base_pack: 
       let _ = b.set(100, 255);
       let _ = b.set(104, 0);
     } else if pat == 3 {
-      if b.len() > 32 {
-        let last_idx = b.len() - 1;
+      if b.byte_len() > 32 {
+        let last_idx = b.byte_len() - 1;
         let v = (b.get(last_idx).unwrap_or(0) + 1) % 256;
         let _ = b.set(last_idx, v);
       }
     } else {
       let mut off = 1032;
-      if b.len() > 1032 {
-        off = 1032 + rng_next(&mut rng) % (b.len() - 1032);
+      if b.byte_len() > 1032 {
+        off = 1032 + rng_next(&mut rng) % (b.byte_len() - 1032);
       }
       let v = (b.get(off).unwrap_or(0) + 1) % 256;
       let _ = b.set(off, v);
@@ -560,7 +560,7 @@ fn fuzz_pack_file(rng: &mut Rng, iterations: Int, base_idx: &Bytes, base_pack: &
     let mut b = base_pack.clone();
     let pat = i % 5;
     if pat == 0 {
-      let trunc_len = rng_next(&mut rng) % base_pack.len();
+      let trunc_len = rng_next(&mut rng) % base_pack.byte_len();
       b = base_pack.slice(0, trunc_len).unwrap_or(Bytes.new());
     } else if pat == 1 {
       let _ = b.set(0, 88);
@@ -569,15 +569,15 @@ fn fuzz_pack_file(rng: &mut Rng, iterations: Int, base_idx: &Bytes, base_pack: &
       let cur = b.get(11).unwrap_or(0);
       let _ = b.set(11, (cur + 5) % 256);
     } else if pat == 3 {
-      if b.len() > 32 {
-        let last_idx = b.len() - 1;
+      if b.byte_len() > 32 {
+        let last_idx = b.byte_len() - 1;
         let v = (b.get(last_idx).unwrap_or(0) + 1) % 256;
         let _ = b.set(last_idx, v);
       }
     } else {
       let mut off = 12;
-      if b.len() > 12 {
-        off = 12 + rng_next(&mut rng) % (b.len() - 12);
+      if b.byte_len() > 12 {
+        off = 12 + rng_next(&mut rng) % (b.byte_len() - 12);
       }
       let v = (b.get(off).unwrap_or(0) + 1) % 256;
       let _ = b.set(off, v);
@@ -832,7 +832,7 @@ pub fn run_fuzz_tests() -> Bool
     _ => Bytes.new(),
   };
 
-  if idx_fixture.len() > 0 && pack_fixture.len() > 0 {
+  if idx_fixture.byte_len() > 0 && pack_fixture.byte_len() > 0 {
     let _ = make_dirs(&"tmp/fuzz_pack");
     console.log(&"Fuzzing 11/12: pack index v2 (.idx header, non-monotonic fanout, truncation, checksums)");
     if !fuzz_pack_index(&mut rng, iters, &idx_fixture, &pack_fixture) {

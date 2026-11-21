@@ -43,7 +43,7 @@ pub fn binary_content(content: &Bytes) -> Bool
   effects none
 {
   let mut i = 0;
-  while i < content.len() && i < 8000 {
+  while i < content.byte_len() && i < 8000 {
     if content.get(i).unwrap_or(0) == 0 {
       return true;
     }
@@ -77,7 +77,7 @@ fn append_path(out: &mut Bytes, side: Int, path: &String)
   let bytes = path.as_bytes();
   let mut quote = false;
   let mut i = 0;
-  while i < bytes.len() {
+  while i < bytes.byte_len() {
     let b = bytes.get(i).unwrap_or(0);
     if b < 32 || b >= 127 || b == 34 || b == 92 {
       quote = true;
@@ -90,7 +90,7 @@ fn append_path(out: &mut Bytes, side: Int, path: &String)
   out.push(side);
   out.push(47);
   i = 0;
-  while i < bytes.len() {
+  while i < bytes.byte_len() {
     let b = bytes.get(i).unwrap_or(0);
     if b == 34 || b == 92 {
       out.push(92);
@@ -118,7 +118,7 @@ fn line_count(data: &Bytes) -> Int
 {
   let mut lines = 0;
   let mut i = 0;
-  while i < data.len() {
+  while i < data.byte_len() {
     if data.get(i).unwrap_or(0) == 10 {
       lines = lines + 1;
     }
@@ -138,7 +138,7 @@ fn append_lines(out: &mut Bytes, prefix: Int, data: &Bytes)
 {
   let mut beginning = true;
   let mut i = 0;
-  while i < data.len() {
+  while i < data.byte_len() {
     if beginning {
       out.push(prefix);
     }
@@ -197,7 +197,7 @@ fn append_file_patch(out: &mut Bytes, path: &String, old_mode: Int, new_mode: In
     append_mode(&mut out, &"new mode ", new_mode);
   }
   let mut binary = false;
-  if content_changed && prior.len() + next.len() > 0 {
+  if content_changed && prior.byte_len() + next.byte_len() > 0 {
     if binary_content(&prior) || binary_content(&next) {
       binary = true;
       out.extend(&"Binary files differ\n".as_bytes());
@@ -232,7 +232,7 @@ fn file_patch(change: &Change, prior: &Bytes, next: &Bytes, budget: Int) -> Resu
   ensures none
   effects none
 {
-  if (prior.len() + next.len()) * 2 + change.path.as_bytes().len() * 16 + 512 > budget {
+  if (prior.byte_len() + next.byte_len()) * 2 + change.path.as_bytes().byte_len() * 16 + 512 > budget {
     return Err(GitError.LimitExceeded("patch exceeds working memory limit"));
   }
   let mut out = Bytes.new();
@@ -286,7 +286,7 @@ fn patches(repo: &Repo, packs: &List<PackStore>, changes: &List<Change>, worktre
           }
         }
         let file_diff = file_patch(&change, &prior, &next, remaining)?;
-        remaining = remaining - file_diff.patch.len() - change.path.as_bytes().len() - 256;
+        remaining = remaining - file_diff.patch.byte_len() - change.path.as_bytes().byte_len() - 256;
         out.push(file_diff);
       }
     }

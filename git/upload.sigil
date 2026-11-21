@@ -116,7 +116,7 @@ pub fn frame_advertisement(adv: &Bytes, limit: Int) -> Result<Bytes, GitError>
   let mut out = pkt_encode_str(&"# service=git-upload-pack\n")?;
   out.extend(&pkt_flush());
   out.extend(&adv);
-  if out.len() > limit {
+  if out.byte_len() > limit {
     return Err(GitError.LimitExceeded("advertisement exceeds the response limit"));
   }
   return Ok(out);
@@ -158,8 +158,8 @@ fn strip_lf(b: &Bytes) -> Bytes
   ensures none
   effects none
 {
-  if b.len() > 0 && b.get(b.len() - 1).unwrap_or(0) == 10 {
-    return b.slice(0, b.len() - 1).unwrap_or(Bytes.new());
+  if b.byte_len() > 0 && b.get(b.byte_len() - 1).unwrap_or(0) == 10 {
+    return b.slice(0, b.byte_len() - 1).unwrap_or(Bytes.new());
   }
   return b.clone();
 }
@@ -173,10 +173,10 @@ fn split_spaces(b: &Bytes) -> Result<List<String>, GitError>
   let mut out = List.new();
   let mut cur = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c == 32 {
-      if cur.len() == 0 {
+      if cur.byte_len() == 0 {
         return Err(GitError.Corrupt("empty token in a request line"));
       }
       out.push(cur.to_string_utf8().map_err(|e| GitError.Corrupt("request line is not UTF-8"))?);
@@ -186,8 +186,8 @@ fn split_spaces(b: &Bytes) -> Result<List<String>, GitError>
     }
     i = i + 1;
   }
-  if cur.len() == 0 {
-    if b.len() > 0 {
+  if cur.byte_len() == 0 {
+    if b.byte_len() > 0 {
       return Err(GitError.Corrupt("empty token in a request line"));
     }
     return Ok(out);
@@ -242,7 +242,7 @@ pub fn parse_upload_request(body: &Bytes) -> Result<UploadRequest, GitError>
   let mut phase = 0;
   let mut finished = false;
   while !finished {
-    if pos >= body.len() {
+    if pos >= body.byte_len() {
       return Err(GitError.Corrupt("request ended before its terminator"));
     }
     let r = pkt_read(&body, pos)?;
@@ -251,7 +251,7 @@ pub fn parse_upload_request(body: &Bytes) -> Result<UploadRequest, GitError>
       PktLine.Flush => {
         if phase == 0 {
           if wants.len() == 0 {
-            if pos != body.len() {
+            if pos != body.byte_len() {
               return Err(GitError.Corrupt("trailing data after an empty request"));
             }
             finished = true;
@@ -310,7 +310,7 @@ pub fn parse_upload_request(body: &Bytes) -> Result<UploadRequest, GitError>
       }
     }
   }
-  if pos != body.len() {
+  if pos != body.byte_len() {
     return Err(GitError.Corrupt("trailing data after the request terminator"));
   }
   return Ok(UploadRequest { wants: wants, haves: haves, caps: caps, done: done });
@@ -499,10 +499,10 @@ pub fn sideband_frames(pack: &Bytes) -> Result<Bytes, GitError>
 {
   let mut out = Bytes.new();
   let mut pos = 0;
-  while pos < pack.len() {
+  while pos < pack.byte_len() {
     let mut end = pos + 65515;
-    if end > pack.len() {
-      end = pack.len();
+    if end > pack.byte_len() {
+      end = pack.byte_len();
     }
     let mut payload = Bytes.new();
     payload.push(1);
@@ -537,7 +537,7 @@ fn pack_part(repo: &Repo, packs: &List<PackStore>, wants: &List<String>, sideban
   } else {
     framed = pack;
   }
-  if acks_len + framed.len() > response_limit {
+  if acks_len + framed.byte_len() > response_limit {
     return Err(GitError.LimitExceeded("response exceeds the response limit"));
   }
   return Ok(framed);
@@ -587,7 +587,7 @@ fn negotiate(repo: &Repo, request: &Bytes, object_limit: Int, walk_budget: Int, 
     // 共通の通知は done の要求だけで行い、利用側は have を尽くしてから done を送る。
     return Ok(result_reply(pkt_encode_str(&"NAK\n")?));
   }
-  match pack_part(&repo, &packs, &req.wants, sideband, acks.len(), object_limit, walk_budget, response_limit) {
+  match pack_part(&repo, &packs, &req.wants, sideband, acks.byte_len(), object_limit, walk_budget, response_limit) {
     Ok(framed) => {
       let mut body = acks.clone();
       body.extend(&framed);
@@ -666,7 +666,7 @@ pub fn upload_pack_post_limited(repo: &Repo, encodings: &List<Bytes>, content_ty
       }
     }
   }
-  if body.len() > 1048576 {
+  if body.byte_len() > 1048576 {
     return text_reply(413, &"request_too_large");
   }
   return upload_pack_respond_limited(&repo, &body, object_limit, walk_budget, response_limit);

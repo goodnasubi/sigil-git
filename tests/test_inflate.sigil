@@ -31,7 +31,7 @@ fn roundtrip(z_hex: &String, want_hex: &String, trailing: Int) -> Bool
     i = i + 1;
   }
   return match inflate_zlib(&padded, 0, 1000000) {
-    Ok(r) => r.data == want && r.consumed == z.len(),
+    Ok(r) => r.data == want && r.consumed == z.byte_len(),
     Err(_) => false,
   };
 }
@@ -72,9 +72,9 @@ pub fn run_inflate_tests() -> Bool
   let dyn_z = bytes_of(&"78da8d565b8e02310cbb0a579b682b58697848f42ba75f56195a3b4e111f54339d3c5cc749e997d6b75387f5a7edaff5bc5dafef9d78b669d21ecfdffd7ec30fdbfeb8bc3e74f6895d30883552c41a3be1e41945acef74f10562329aff67c30d6f12029cc334fb8c8d6ff0e2cf3499d788265536990a4fc98c8541432d159fe6f821e47142a2228700049a8f5dbde4cd121908c153915564f3e9783fc2632c847c103e228ed3e7423307d30df12fc5ad4c5055f5a056874613e498e401793d93e4b9b5a47bb844d22baa464807769e65304b674bb6b13f5775b0b2e3bc5115712daa070850c4965d3fc8152b0a07d4393890a9746844b1030696fa15129109cb0700b9f66256fa82277e2be4317b4ef5c9b9659c4371bcecf8aa995426d4c52acb1994c61a525a202fd8812056d54efba2108fb5eabe6a8b1b2ae19666d2e127b25f339987b95e3e6c872c65b5a49154f5b8fe0328bb426f2b2f446b0c85e5a6c34dc77da16bcf74ad665ecafb0792464274");
   let mut bad = Bytes.new();
   let mut i = 0;
-  while i < dyn_z.len() {
+  while i < dyn_z.byte_len() {
     let b = dyn_z.get(i).unwrap_or(0);
-    if i == dyn_z.len() - 1 {
+    if i == dyn_z.byte_len() - 1 {
       bad.push((b + 1) % 256);
     } else {
       bad.push(b);

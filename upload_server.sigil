@@ -156,10 +156,10 @@ fn segments(path: &Bytes) -> List<String>
   let mut out = List.new();
   let mut cur = Bytes.new();
   let mut i = 0;
-  while i < path.len() {
+  while i < path.byte_len() {
     let c = path.get(i).unwrap_or(0);
     if c == 47 {
-      if cur.len() > 0 {
+      if cur.byte_len() > 0 {
         out.push(cur.to_string_utf8().unwrap_or(""));
       }
       cur = Bytes.new();
@@ -168,7 +168,7 @@ fn segments(path: &Bytes) -> List<String>
     }
     i = i + 1;
   }
-  if cur.len() > 0 {
+  if cur.byte_len() > 0 {
     out.push(cur.to_string_utf8().unwrap_or(""));
   }
   return out;
@@ -242,7 +242,7 @@ fn handle_api(ctx: &Ctx, req: &HttpRequest, segs: &List<String>) -> HttpResponse
   ensures none
   effects clock, console, db, env, fs, random, task
 {
-  if req.body().len() > 16384 {
+  if req.body().byte_len() > 16384 {
     return plain(413, &"payload_too_large");
   }
   if req.method() == "DELETE" {
@@ -262,14 +262,14 @@ fn handle_api(ctx: &Ctx, req: &HttpRequest, segs: &List<String>) -> HttpResponse
       Some(b) => b.to_string_utf8().unwrap_or(""),
       None => "",
     };
-    if origin.len() == 0 {
+    if origin.byte_len() == 0 {
       return plain(403, &"forbidden");
     }
     let host = match req.header(&"host") {
       Some(b) => b.to_string_utf8().unwrap_or(""),
       None => "",
     };
-    if host.len() == 0 {
+    if host.byte_len() == 0 {
       return plain(403, &"forbidden");
     }
     let expected_http = cat2(&"http://", &host);
@@ -287,7 +287,7 @@ fn handle_api(ctx: &Ctx, req: &HttpRequest, segs: &List<String>) -> HttpResponse
   }
 
   let has_auth = match req.header(&"authorization") {
-    Some(b) => b.len() > 0,
+    Some(b) => b.byte_len() > 0,
     None => false,
   };
   let mut subject = None;
@@ -315,7 +315,7 @@ fn handle_api(ctx: &Ctx, req: &HttpRequest, segs: &List<String>) -> HttpResponse
             return plain(401, &"unauthorized");
           }
         }
-        if ctx.admin_subject.len() == 0 || caller != ctx.admin_subject {
+        if ctx.admin_subject.byte_len() == 0 || caller != ctx.admin_subject {
           return plain(403, &"forbidden");
         }
         match json.parse(&req.body()) {
@@ -325,7 +325,7 @@ fn handle_api(ctx: &Ctx, req: &HttpRequest, segs: &List<String>) -> HttpResponse
           Ok(val) => {
             let id = json_str(&val, &"id").unwrap_or("");
             let mut owner = json_str(&val, &"owner").unwrap_or("");
-            if owner.len() == 0 {
+            if owner.byte_len() == 0 {
               match json_string_list(&val, &"owners") {
                 Some(l) => {
                   if l.len() > 0 {
@@ -341,7 +341,7 @@ fn handle_api(ctx: &Ctx, req: &HttpRequest, segs: &List<String>) -> HttpResponse
               }
             }
             let branch = json_str(&val, &"default_branch").unwrap_or("main");
-            if id.len() == 0 || owner.len() == 0 {
+            if id.byte_len() == 0 || owner.byte_len() == 0 {
               return plain(400, &"invalid_request");
             }
             match create_repo_managed(&ctx.root, &id, &owner, &branch, &ctx.admin_subject, &caller) {
@@ -558,14 +558,14 @@ fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
   if refs_path && !receive_refs && req.query() != "service=git-upload-pack".as_bytes() {
     return plain(400, &"invalid_query");
   }
-  if (upload_path || receive_path) && req.query().len() != 0 {
+  if (upload_path || receive_path) && req.query().byte_len() != 0 {
     return plain(400, &"invalid_query");
   }
   let is_receive = receive_path || receive_refs;
 
   let repo_dir = cat3(&cat3(&ctx.root, &"/", &id), &".git", &"");
   let meta_file = join_path(&repo_dir, &"sigil-metadata");
-  let is_managed = ctx.admin_subject.len() > 0 || file_exists(&meta_file).unwrap_or(false);
+  let is_managed = ctx.admin_subject.byte_len() > 0 || file_exists(&meta_file).unwrap_or(false);
   if is_managed {
     let mut meta = empty_meta();
     match load_meta(&repo_dir, &id) {
@@ -577,7 +577,7 @@ fn handle(ctx: &Ctx, req: &HttpRequest) -> HttpResponse
       }
     }
     let has_auth = match req.header(&"authorization") {
-      Some(b) => b.len() > 0,
+      Some(b) => b.byte_len() > 0,
       None => false,
     };
     let mut subject = None;
@@ -697,17 +697,17 @@ fn log_sizes(req: &HttpRequest, body: &Bytes)
   }
   if gz {
     let n = match gzip_decode(&body) {
-      Ok(plain_body) => plain_body.len(),
+      Ok(plain_body) => plain_body.byte_len(),
       Err(_) => 0 - 1,
     };
-    let enc = int_to_str(body.len());
+    let enc = int_to_str(body.byte_len());
     let dec = match n >= 0 {
       true => int_to_str(n),
       false => "invalid",
     };
     console.log(&cat3(&cat3(&"POST content-encoding=gzip encoded=", &enc, &" decoded="), &dec, &""));
   } else {
-    console.log(&cat3(&"POST content-encoding=identity encoded=", &int_to_str(body.len()), &""));
+    console.log(&cat3(&"POST content-encoding=identity encoded=", &int_to_str(body.byte_len()), &""));
   }
 }
 

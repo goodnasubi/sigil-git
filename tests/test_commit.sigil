@@ -44,7 +44,7 @@ pub fn run_commit_tests() -> Bool
     Ok(b) => b,
     Err(_) => Bytes.new(),
   };
-  if encoded.len() == 0 {
+  if encoded.byte_len() == 0 {
     return false;
   }
 
@@ -95,7 +95,7 @@ pub fn run_commit_tests() -> Bool
     Ok(b) => b,
     Err(_) => Bytes.new(),
   };
-  if root_encoded.len() == 0 {
+  if root_encoded.byte_len() == 0 {
     return false;
   }
   match decode_commit(&root_encoded) {
@@ -121,7 +121,7 @@ pub fn run_commit_tests() -> Bool
     Ok(b) => b,
     Err(_) => Bytes.new(),
   };
-  if enc16.len() == 0 {
+  if enc16.byte_len() == 0 {
     return false;
   }
   match decode_commit(&enc16) {
@@ -178,7 +178,7 @@ pub fn run_commit_tests() -> Bool
     Ok(b) => b,
     Err(_) => Bytes.new(),
   };
-  if non_utf8_enc.len() == 0 {
+  if non_utf8_enc.byte_len() == 0 {
     return false;
   }
   match decode_commit(&non_utf8_enc) {

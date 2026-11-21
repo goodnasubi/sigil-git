@@ -88,11 +88,11 @@ fn rep_bytes(ch: &String, n: Int) -> Bytes
     return b;
   }
   b.push(one);
-  while b.len() * 2 <= n {
+  while b.byte_len() * 2 <= n {
     let copy = b.clone();
     b.extend(&copy);
   }
-  let rest = n - b.len();
+  let rest = n - b.byte_len();
   if rest > 0 {
     let part = b.slice(0, rest).unwrap_or(Bytes.new());
     b.extend(&part);
@@ -207,7 +207,7 @@ fn check_pack(repo: &Repo, pack: &Bytes, want_ids: &List<String>, label: &String
   ensures none
   effects console, fs
 {
-  let n = pack.len();
+  let n = pack.byte_len();
   if n < 44 {
     return fail(&cat3(&label, &": pack is too short", &""));
   }
@@ -257,7 +257,7 @@ fn check_pack(repo: &Repo, pack: &Bytes, want_ids: &List<String>, label: &String
     if code_name(code) != got_type {
       return fail(&cat3(&label, &": object type code mismatch", &""));
     }
-    if size != got_content.len() {
+    if size != got_content.byte_len() {
       return fail(&cat3(&label, &": object size mismatch", &""));
     }
     let zl = stored_zlib_len(size);
@@ -365,7 +365,7 @@ fn run_in_repo(repo: &Repo) -> Bool
       ok = fail(&"pack: empty set");
     }
     Ok(p) => {
-      ok = expect(p.len() == 44, &"pack: empty set is 44 bytes") && check_pack(&repo, &p, &List.new(), &"pack: empty set") && ok;
+      ok = expect(p.byte_len() == 44, &"pack: empty set is 44 bytes") && check_pack(&repo, &p, &List.new(), &"pack: empty set") && ok;
     }
   }
   // 3. 同じ入力は同じバイト列（決定的）
@@ -459,7 +459,7 @@ fn run_in_repo(repo: &Repo) -> Bool
       ok = fail(&"size: a pack of exactly 1 MiB is accepted");
     }
     Ok(p) => {
-      ok = expect(p.len() == limit && be32(&p, 8) == 1 && p.slice(0, 4).unwrap_or(Bytes.new()) == "PACK".as_bytes(), &"size: the pack is exactly 1048576 bytes") && ok;
+      ok = expect(p.byte_len() == limit && be32(&p, 8) == 1 && p.slice(0, 4).unwrap_or(Bytes.new()) == "PACK".as_bytes(), &"size: the pack is exactly 1048576 bytes") && ok;
     }
   }
   let mut b2 = List.new();
@@ -473,7 +473,7 @@ fn run_in_repo(repo: &Repo) -> Bool
       Some(v) => v,
       None => 0,
     };
-    if zlib_stored(&rep_bytes(&"z", n)).len() != stored_zlib_len(n) {
+    if zlib_stored(&rep_bytes(&"z", n)).byte_len() != stored_zlib_len(n) {
       ok = fail(&cat3(&"size: stored_zlib_len differs at ", &int_to_str(n), &""));
     }
     s = s + 1;

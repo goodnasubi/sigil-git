@@ -180,7 +180,7 @@ fn inflate_entry(pack: &Bytes, start: Int, size: Int, end: Int) -> Result<Bytes,
       };
     }
     Ok(r) => {
-      if r.data.len() != size {
+      if r.data.byte_len() != size {
         return Err(GitError.Corrupt("pack entry size does not match its declared size"));
       }
       if start + r.consumed > end {
@@ -209,7 +209,7 @@ pub fn recv_pack_parse(pack: &Bytes, object_limit: Int, total_limit: Int, single
   ensures none
   effects none
 {
-  if pack.len() < 12 + 32 {
+  if pack.byte_len() < 12 + 32 {
     return Err(GitError.Corrupt("pack is too short"));
   }
   let magic = pack.slice(0, 4).unwrap_or(Bytes.new());
@@ -223,10 +223,10 @@ pub fn recv_pack_parse(pack: &Bytes, object_limit: Int, total_limit: Int, single
   if count > object_limit {
     return Err(GitError.LimitExceeded("pack has too many objects"));
   }
-  let end = pack.len() - 32;
+  let end = pack.byte_len() - 32;
   let body = pack.slice(0, end).unwrap_or(Bytes.new());
   let want_trailer = compute_sha256(&body);
-  let got_trailer = pack.slice(end, pack.len()).unwrap_or(Bytes.new());
+  let got_trailer = pack.slice(end, pack.byte_len()).unwrap_or(Bytes.new());
   if want_trailer != got_trailer {
     return Err(GitError.Corrupt("pack trailer checksum does not match"));
   }
@@ -303,10 +303,10 @@ pub fn recv_pack_parse(pack: &Bytes, object_limit: Int, total_limit: Int, single
             return Err(GitError.LimitExceeded("delta chain is too deep"));
           }
           let out = apply_delta(&bytes_at(&r_content, b), &bytes_at(&datas, j))?;
-          if out.len() > single_limit {
+          if out.byte_len() > single_limit {
             return Err(GitError.LimitExceeded("delta result exceeds the single object limit"));
           }
-          total = total + out.len();
+          total = total + out.byte_len();
           if total > total_limit {
             return Err(GitError.LimitExceeded("pack exceeds the cumulative inflate limit"));
           }

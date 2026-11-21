@@ -88,7 +88,7 @@ fn name_less(a: &String, b: &String) -> Bool
   let ab = a.as_bytes();
   let bb = b.as_bytes();
   let mut i = 0;
-  while i < ab.len() && i < bb.len() {
+  while i < ab.byte_len() && i < bb.byte_len() {
     let x = ab.get(i).unwrap_or(0);
     let y = bb.get(i).unwrap_or(0);
     if x != y {
@@ -96,7 +96,7 @@ fn name_less(a: &String, b: &String) -> Bool
     }
     i = i + 1;
   }
-  return ab.len() < bb.len();
+  return ab.byte_len() < bb.byte_len();
 }
 
 fn adv_at(l: &List<AdvRef>, i: Int) -> AdvRef
@@ -152,7 +152,7 @@ fn push_line(out: &mut Bytes, text: &Bytes) -> Result<Bool, GitError>
   effects none
 {
   let pkt = pkt_encode(&text)?;
-  if out.len() + pkt.len() + 4 > max_transfer_response_size() {
+  if out.byte_len() + pkt.byte_len() + 4 > max_transfer_response_size() {
     return Err(GitError.LimitExceeded("advertisement exceeds the 1 MiB response limit"));
   }
   out.extend(&pkt);

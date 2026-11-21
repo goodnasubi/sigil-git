@@ -26,7 +26,7 @@ fn strip_hfs_ignored_chars(bytes: &Bytes) -> Bytes
   ensures none
   effects none
 {
-  let len = bytes.len();
+  let len = bytes.byte_len();
   let mut out = Bytes.new();
   let mut i = 0;
   while i < len {
@@ -78,7 +78,7 @@ pub fn is_git_dir_or_variant(bytes: &Bytes) -> Bool
   effects none
 {
   let stripped = strip_hfs_ignored_chars(&bytes);
-  let len = stripped.len();
+  let len = stripped.byte_len();
   if len < 4 {
     return false;
   }
@@ -152,7 +152,7 @@ pub fn validate_path(path: &String) -> Result<Bool, GitError>
   effects none
 {
   let pb = path.as_bytes();
-  let total_len = pb.len();
+  let total_len = pb.byte_len();
   if total_len == 0 {
     return Err(GitError.InvalidPath("path cannot be empty"));
   }
@@ -230,7 +230,7 @@ pub fn validate_ref_name(ref_name: &String) -> Result<Bool, GitError>
   effects none
 {
   let rb = ref_name.as_bytes();
-  let len = rb.len();
+  let len = rb.byte_len();
   if len == 0 {
     return Err(GitError.InvalidRefName("ref name cannot be empty"));
   }

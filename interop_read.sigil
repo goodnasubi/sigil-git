@@ -33,7 +33,7 @@ fn octal6(mode: Int) -> String
 {
   let plain = int_to_str(mode);
   let mut out = Bytes.new();
-  let mut pad = 6 - plain.len();
+  let mut pad = 6 - plain.char_count();
   while pad > 0 {
     out.push(48);
     pad = pad - 1;
@@ -70,10 +70,10 @@ fn print_objects(repo: &Repo, packs: &List<PackStore>, ids_path: &String) -> Res
     }
   }
   let mut at = 0;
-  while at + 64 <= data.len() {
+  while at + 64 <= data.byte_len() {
     let id = data.slice(at, at + 64).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
     let o = odb_read_in(&repo, &packs, &id)?;
-    let size = int_to_str(o.content.len());
+    let size = int_to_str(o.content.byte_len());
     let sum = bytes_to_hex(&compute_sha256(&o.content));
     console.log(&cat3(&cat3(&"OBJ ", &id, &" "), &cat3(&object_type_name(&o.obj_type), &" ", &size), &cat3(&" ", &sum, &"")));
     at = at + 65;

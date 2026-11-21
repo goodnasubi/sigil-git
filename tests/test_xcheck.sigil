@@ -133,7 +133,7 @@ pub fn compute_trace_digest() -> String
   match inflate_zlib(&compressed, 0, 1048576) {
     Ok(inf) => {
       let mut is_eq = "inflated_neq";
-      if inf.data.len() == payload.len() {
+      if inf.data.byte_len() == payload.byte_len() {
         is_eq = "inflated_eq";
       }
       record_result(&mut h, &"inflate", true, &is_eq);

@@ -234,7 +234,7 @@ pub fn run_tree_tests() -> Bool
     Ok(b) => b,
     Err(_) => Bytes.new(),
   };
-  if raw_encoded.len() == 0 {
+  if raw_encoded.byte_len() == 0 {
     return false;
   }
   match decode_tree(&raw_encoded) {

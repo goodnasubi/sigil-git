@@ -249,7 +249,7 @@ fn test_json_escaping_cases() -> Bool
 {
   let raw_str = "hello \"world\" \n \r \t \\ end";
   let escaped = escape_json_string(&raw_str);
-  if !expect(escaped.len() > raw_str.len(), &"escaped string length check") {
+  if !expect(escaped.byte_len() > raw_str.byte_len(), &"escaped string length check") {
     return false;
   }
   let quoted = json_quote(&raw_str);

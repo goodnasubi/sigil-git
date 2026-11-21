@@ -86,7 +86,7 @@ fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefi
       return Err(GitError.TypeMismatch("expected a tree"));
     }
   }
-  let cost = o.content.len() * 8;
+  let cost = o.content.byte_len() * 8;
   if cost > budget {
     return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
   }
@@ -117,7 +117,7 @@ fn flatten_checked(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefi
           if out.len() >= max_index_entries() {
             return Err(GitError.LimitExceeded("too many tree entries"));
           }
-          let entry_cost = path.as_bytes().len() + 256;
+          let entry_cost = path.as_bytes().byte_len() + 256;
           if entry_cost > remaining {
             return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
           }

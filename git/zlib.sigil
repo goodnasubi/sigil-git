@@ -26,7 +26,7 @@ pub fn adler32(data: &Bytes) -> Int
 {
   let mut a = 1;
   let mut b = 0;
-  let n = data.len();
+  let n = data.byte_len();
   let mut i = 0;
   while i < n {
     a = (a + data.get(i).unwrap_or(0)) % 65521;
@@ -51,13 +51,13 @@ fn push_be32(out: &mut Bytes, v: Int)
 pub fn zlib_stored(data: &Bytes) -> Bytes
   intent "data を stored ブロックだけの zlib ストリーム（ヘッダ 78 01、Adler-32 付き）にする。圧縮率は問わない"
   requires none
-  ensures result.len() >= data.len() + 7
+  ensures result.byte_len() >= data.byte_len() + 7
   effects none
 {
   let mut out = Bytes.new();
   out.push(120);
   out.push(1);
-  let n = data.len();
+  let n = data.byte_len();
   let mut pos = 0;
   let mut done = false;
   while !done {
@@ -94,7 +94,7 @@ pub fn zlib_decode_stored(z: &Bytes, limit: Int, verify_tail: Bool) -> Result<By
   ensures none
   effects none
 {
-  let n = z.len();
+  let n = z.byte_len();
   if n < 2 {
     return Err(GitError.Corrupt("zlib stream too short"));
   }
@@ -141,11 +141,11 @@ pub fn zlib_decode_stored(z: &Bytes, limit: Int, verify_tail: Bool) -> Result<By
       return Err(GitError.Corrupt("truncated stored block data"));
     }
     let mut take = len;
-    if out.len() + take > limit {
+    if out.byte_len() + take > limit {
       if verify_tail {
         return Err(GitError.LimitExceeded("decompressed data exceeds the limit"));
       }
-      take = limit - out.len();
+      take = limit - out.byte_len();
       cut = true;
     }
     if take > 0 {

@@ -306,7 +306,7 @@ fn body_of(data: &Bytes) -> Bytes
   ensures none
   effects none
 {
-  return data.slice(0, data.len() - 32).unwrap_or(Bytes.new());
+  return data.slice(0, data.byte_len() - 32).unwrap_or(Bytes.new());
 }
 
 fn sample_entries() -> List<IndexEntry>
@@ -486,7 +486,7 @@ fn test_add_commit(repo: &Repo) -> Bool
   // 最初の commit
   let c1 = commit(&repo, &ident(1700000000), &ident(1700000000), &"first\n".as_bytes());
   let id1 = str_or(&c1, &"");
-  ok = expect(id1.len() == 64, &"first commit id") && ok;
+  ok = expect(id1.byte_len() == 64, &"first commit id") && ok;
   ok = expect(head_commit(&repo) == id1, &"branch points to the first commit") && ok;
   match odb_read(&repo, &id1) {
     Err(_) => {
@@ -511,7 +511,7 @@ fn test_add_commit(repo: &Repo) -> Bool
   let msg = "second あ".as_bytes();
   let c2 = commit(&repo, &ident(1700000100), &ident(1700000100), &msg);
   let id2 = str_or(&c2, &"");
-  ok = expect(id2.len() == 64 && id2 != id1, &"second commit id") && ok;
+  ok = expect(id2.byte_len() == 64 && id2 != id1, &"second commit id") && ok;
   match odb_read(&repo, &id2) {
     Err(_) => {
       ok = expect(false, &"read second commit") && ok;
@@ -708,7 +708,7 @@ fn test_checkout(repo: &Repo) -> Bool
   topic_entries.push(new_index_entry("dir/sub/run.sh", 100644, run_id.clone()));
   topic_entries.push(new_index_entry("n/new.txt", 100644, blob(&repo, &"new\n")));
   let topic_id = commit_with_index(&repo, &"refs/heads/topic", &topic_entries, 1700000200);
-  ok = expect(topic_id.len() == 64, &"topic commit") && ok;
+  ok = expect(topic_id.byte_len() == 64, &"topic commit") && ok;
   ok = expect(match set_head_symbolic(&repo, &main_ref) {
     Ok(_) => true,
     Err(_) => false,
@@ -843,7 +843,7 @@ fn test_malicious(repo: &Repo, base: &String) -> Bool
         let t = tree_with(&repo, 100644, &name, &b);
         let c = commit_of_tree(&repo, &t);
         let br = cat3(&"evil", &int_to_str(i), &"");
-        ok = expect(c.len() == 64, &"evil commit") && ok;
+        ok = expect(c.byte_len() == 64, &"evil commit") && ok;
         ok = expect(kind_b(&create_branch(&repo, &br, &c)) == "ok", &"evil branch") && ok;
         ok = expect(expect_refused(&repo, &br, &"InvalidPath", &cat3(&"bad name ", &int_to_str(i), &"")), &"bad name is InvalidPath") && ok;
       }
@@ -896,13 +896,13 @@ fn test_review_fixes(repo: &Repo) -> Bool
   ok = expect(wf(&work, &"a.txt", &"alpha\n", false), &"write a.txt") && ok;
   ok = expect(kind_b(&add_paths(&repo, &one(&"a.txt"))) == "ok", &"add a.txt") && ok;
   let c1 = str_or(&commit(&repo, &ident(1700000300), &ident(1700000300), &"one\n".as_bytes()), &"");
-  ok = expect(c1.len() == 64, &"first commit") && ok;
+  ok = expect(c1.byte_len() == 64, &"first commit") && ok;
   // 日本語（マルチバイト）のパスが add・commit・checkout で往復する
   ok = expect(wf(&work, &"日本語/ファイル.txt", &"こんにちは\n", false), &"write a multibyte path") && ok;
   ok = expect(kind_b(&add_paths(&repo, &one(&"日本語"))) == "ok", &"add a multibyte path") && ok;
   ok = expect(kind_i(&read_index(&repo)) == "ok", &"the index with a multibyte path is readable") && ok;
   let c2 = str_or(&commit(&repo, &ident(1700000301), &ident(1700000301), &"two\n".as_bytes()), &"");
-  ok = expect(c2.len() == 64, &"second commit") && ok;
+  ok = expect(c2.byte_len() == 64, &"second commit") && ok;
   ok = expect(kind_b(&create_branch(&repo, &"back", &c1)) == "ok", &"branch back") && ok;
   ok = expect(kind_s(&checkout(&repo, &"back")) == "ok", &"checkout back (multibyte path removed)") && ok;
   ok = expect(text_of(&work, &"日本語/ファイル.txt") == "<missing>", &"multibyte file removed") && ok;
@@ -916,7 +916,7 @@ fn test_review_fixes(repo: &Repo) -> Bool
   let missing = "abababababababababababababababababababababababababababababababab";
   let t = tree_with(&repo, 100644, &"new.txt".as_bytes(), &missing);
   let mc = commit_of_tree(&repo, &t);
-  ok = expect(mc.len() == 64, &"commit with a missing blob") && ok;
+  ok = expect(mc.byte_len() == 64, &"commit with a missing blob") && ok;
   ok = expect(kind_b(&create_branch(&repo, &"missingblob", &mc)) == "ok", &"branch missingblob") && ok;
   let before = state_line(&repo);
   let k = kind_s(&checkout(&repo, &"missingblob"));

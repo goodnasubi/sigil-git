@@ -150,7 +150,7 @@ pub fn run_object_tests() -> Bool
   // 7. hex 変換の往復テスト
   let hex_str = "8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60";
   let dec_bytes = hex_to_bytes(&hex_str).unwrap_or(Bytes.new());
-  if dec_bytes.len() != 32 {
+  if dec_bytes.byte_len() != 32 {
     return false;
   }
   let re_hex = bytes_to_hex(&dec_bytes);

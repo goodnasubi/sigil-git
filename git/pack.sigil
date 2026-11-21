@@ -161,7 +161,7 @@ pub fn open_pack(idx_path: &String) -> Result<PackStore, GitError>
     return Err(GitError.Corrupt("pack index checksum mismatch"));
   }
   let pack_sum_in_idx = read_range(&idx, idx_size - hl * 2, hl)?;
-  let pack_path = cat3(&string_slice(&idx_path, 0, idx_path.as_bytes().len() - 4), &".pack", &"");
+  let pack_path = cat3(&string_slice(&idx_path, 0, idx_path.as_bytes().byte_len() - 4), &".pack", &"");
   let pack = open_read(&pack_path)?;
   let pack_size = file_size(&pack)?;
   if pack_size > max_pack_size() {
@@ -259,7 +259,7 @@ fn compare_id(a: &Bytes, b: &Bytes) -> Int
   effects none
 {
   let mut i = 0;
-  while i < a.len() && i < b.len() {
+  while i < a.byte_len() && i < b.byte_len() {
     let x = a.get(i).unwrap_or(0);
     let y = b.get(i).unwrap_or(0);
     if x < y {
@@ -341,7 +341,7 @@ fn read_entry(pack: &File, ps: &PackStore, off: Int) -> Result<Entry, GitError>
   pos = 1;
   let mut cont = c0 >= 128;
   while cont {
-    if pos >= b.len() || pos > 9 {
+    if pos >= b.byte_len() || pos > 9 {
       return Err(GitError.Corrupt("pack entry header is malformed"));
     }
     let c = b.get(pos).unwrap_or(0);
@@ -362,14 +362,14 @@ fn read_entry(pack: &File, ps: &PackStore, off: Int) -> Result<Entry, GitError>
   let mut base_off = 0;
   let mut base_id = "";
   if kind == 6 {
-    if pos >= b.len() {
+    if pos >= b.byte_len() {
       return Err(GitError.Corrupt("pack OFS_DELTA header is truncated"));
     }
     let mut c = b.get(pos).unwrap_or(0);
     pos = pos + 1;
     let mut rel = c % 128;
     while c >= 128 {
-      if pos >= b.len() || pos > 20 {
+      if pos >= b.byte_len() || pos > 20 {
         return Err(GitError.Corrupt("pack OFS_DELTA offset is malformed"));
       }
       c = b.get(pos).unwrap_or(0);
@@ -384,7 +384,7 @@ fn read_entry(pack: &File, ps: &PackStore, off: Int) -> Result<Entry, GitError>
     }
     base_off = off - rel;
   } else if kind == 7 {
-    if pos + hash_len() > b.len() {
+    if pos + hash_len() > b.byte_len() {
       return Err(GitError.Corrupt("pack REF_DELTA header is truncated"));
     }
     let idbytes = b.slice(pos, pos + hash_len()).unwrap_or(Bytes.new());
@@ -416,7 +416,7 @@ fn inflate_entry(pack: &File, ps: &PackStore, e: &Entry) -> Result<Bytes, GitErr
     let z = read_range(&pack, e.data_off, window)?;
     match inflate_zlib(&z, 0, e.size) {
       Ok(r) => {
-        if r.data.len() != e.size {
+        if r.data.byte_len() != e.size {
           return Err(GitError.Corrupt("pack entry size does not match its data"));
         }
         return Ok(r.data);
@@ -445,7 +445,7 @@ fn read_varint(d: &Bytes, cur: &mut Cur) -> Result<Int, GitError>
   let mut shift = 0;
   let mut cont = true;
   while cont {
-    if cur.pos >= d.len() || shift > 56 {
+    if cur.pos >= d.byte_len() || shift > 56 {
       return Err(GitError.Corrupt("delta size is malformed"));
     }
     let c = d.get(cur.pos).unwrap_or(0);
@@ -467,14 +467,14 @@ pub fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
   let src_size = read_varint(&delta, &mut cur)?;
   let dst_size = read_varint(&delta, &mut cur)?;
   let mut pos = cur.pos;
-  if src_size != base.len() {
+  if src_size != base.byte_len() {
     return Err(GitError.Corrupt("delta base size does not match"));
   }
   if dst_size > max_object_size() {
     return Err(GitError.LimitExceeded("delta result exceeds the 64 MiB limit"));
   }
   let mut out = Bytes.new();
-  while pos < delta.len() {
+  while pos < delta.byte_len() {
     let op = delta.get(pos).unwrap_or(0);
     pos = pos + 1;
     if op >= 128 {
@@ -483,7 +483,7 @@ pub fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
       let mut k = 0;
       while k < 4 {
         if op / (1 << k) % 2 == 1 {
-          if pos >= delta.len() {
+          if pos >= delta.byte_len() {
             return Err(GitError.Corrupt("delta copy is truncated"));
           }
           off = off + delta.get(pos).unwrap_or(0) * (1 << k * 8);
@@ -494,7 +494,7 @@ pub fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
       let mut j = 0;
       while j < 3 {
         if op / (1 << j + 4) % 2 == 1 {
-          if pos >= delta.len() {
+          if pos >= delta.byte_len() {
             return Err(GitError.Corrupt("delta copy is truncated"));
           }
           size = size + delta.get(pos).unwrap_or(0) * (1 << j * 8);
@@ -505,18 +505,18 @@ pub fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
       if size == 0 {
         size = 65536;
       }
-      if off + size > base.len() {
+      if off + size > base.byte_len() {
         return Err(GitError.Corrupt("delta copy is outside the base"));
       }
-      if out.len() + size > dst_size {
+      if out.byte_len() + size > dst_size {
         return Err(GitError.Corrupt("delta produces more data than declared"));
       }
       out.extend(&base.slice(off, off + size).unwrap_or(Bytes.new()));
     } else if op > 0 {
-      if pos + op > delta.len() {
+      if pos + op > delta.byte_len() {
         return Err(GitError.Corrupt("delta insert is truncated"));
       }
-      if out.len() + op > dst_size {
+      if out.byte_len() + op > dst_size {
         return Err(GitError.Corrupt("delta produces more data than declared"));
       }
       out.extend(&delta.slice(pos, pos + op).unwrap_or(Bytes.new()));
@@ -525,7 +525,7 @@ pub fn apply_delta(base: &Bytes, delta: &Bytes) -> Result<Bytes, GitError>
       return Err(GitError.Corrupt("delta contains a reserved opcode"));
     }
   }
-  if out.len() != dst_size {
+  if out.byte_len() != dst_size {
     return Err(GitError.Corrupt("delta produces less data than declared"));
   }
   return Ok(out);

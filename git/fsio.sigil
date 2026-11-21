@@ -38,7 +38,7 @@ pub fn join_path(dir: &String, name: &String) -> String
   effects none
 {
   let mut x = dir.as_bytes();
-  if x.len() > 0 && x.get(x.len() - 1).unwrap_or(0) != 47 {
+  if x.byte_len() > 0 && x.get(x.byte_len() - 1).unwrap_or(0) != 47 {
     x.push(47);
   }
   x.extend(&name.as_bytes());
@@ -51,11 +51,11 @@ pub fn bytes_starts_with(b: &Bytes, prefix: &Bytes) -> Bool
   ensures none
   effects none
 {
-  if b.len() < prefix.len() {
+  if b.byte_len() < prefix.byte_len() {
     return false;
   }
   let mut i = 0;
-  while i < prefix.len() {
+  while i < prefix.byte_len() {
     if b.get(i).unwrap_or(0) != prefix.get(i).unwrap_or(0) {
       return false;
     }
@@ -81,10 +81,10 @@ pub fn string_ends_with(s: &String, suffix: &String) -> Bool
 {
   let sb = s.as_bytes();
   let xb = suffix.as_bytes();
-  if sb.len() < xb.len() {
+  if sb.byte_len() < xb.byte_len() {
     return false;
   }
-  return bytes_starts_with(&sb.slice(sb.len() - xb.len(), sb.len()).unwrap_or(Bytes.new()), &xb);
+  return bytes_starts_with(&sb.slice(sb.byte_len() - xb.byte_len(), sb.byte_len()).unwrap_or(Bytes.new()), &xb);
 }
 
 pub fn string_slice(s: &String, from: Int, to: Int) -> String
@@ -263,7 +263,7 @@ pub fn make_dir(path: &String) -> Result<Bool, GitError>
         None => {}
         Some(par) => {
           let ps = par.as_bytes().to_string_utf8().unwrap_or("");
-          if ps.len() > 0 {
+          if ps.byte_len() > 0 {
             sync_dir(&ps)?;
           } else {
             sync_dir(&".")?;
@@ -294,7 +294,7 @@ pub fn make_dirs(path: &String) -> Result<Bool, GitError>
     None => {}
     Some(par) => {
       let ps = par.as_bytes().to_string_utf8().unwrap_or("");
-      if ps.len() > 0 {
+      if ps.byte_len() > 0 {
         make_dirs(&ps)?;
       }
     }
@@ -316,7 +316,7 @@ pub fn create_synced_file(path: &String, data: &Bytes) -> Result<Bool, GitError>
     }
     Ok(f) => {
       let mut file = f;
-      if data.len() > 0 {
+      if data.byte_len() > 0 {
         match file.write_all(&data) {
           Err(_) => {
             let _ = file.close();
@@ -505,7 +505,7 @@ pub fn lock_publish(f: File, data: &Bytes, lock_path: &String, final_path: &Stri
   effects fs
 {
   let mut file = f;
-  if data.len() > 0 {
+  if data.byte_len() > 0 {
     match file.write_all(&data) {
       Err(_) => {
         let _ = file.close();
@@ -544,7 +544,7 @@ pub fn parent_of(path: &String) -> String
     }
     Some(par) => {
       let ps = par.as_bytes().to_string_utf8().unwrap_or("");
-      if ps.len() == 0 {
+      if ps.byte_len() == 0 {
         return ".";
       }
       return ps;
@@ -633,7 +633,7 @@ pub fn read_range(f: &File, offset: Int, len: Int) -> Result<Bytes, GitError>
   }
   while done < len {
     let want = len - done;
-    if want >= chunk.len() {
+    if want >= chunk.byte_len() {
       match f.read_exact_at(&mut chunk, offset + done) {
         Ok(_) => {}
         Err(_) => {
@@ -641,7 +641,7 @@ pub fn read_range(f: &File, offset: Int, len: Int) -> Result<Bytes, GitError>
         }
       }
       out.extend(&chunk);
-      done = done + chunk.len();
+      done = done + chunk.byte_len();
     } else {
       let mut tail = Bytes.new();
       let mut ti = 0;

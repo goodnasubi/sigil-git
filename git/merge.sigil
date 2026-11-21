@@ -182,12 +182,12 @@ fn merge_path(repo: &Repo, packs: &List<PackStore>, base: &IndexEntry, left: &In
         match merge_lines(&a, &b, &c)? {
           None => {}
           Some(content) => {
-            if content.len() > max_object_size() || content.len() + retained > max_work_memory() / 8 {
+            if content.byte_len() > max_object_size() || content.byte_len() + retained > max_work_memory() / 8 {
               return Err(GitError.LimitExceeded("merged blobs exceed working memory limit"));
             }
             let id = bytes_to_hex(&compute_object_id(&"blob", &content));
             plan.entries.push(new_index_entry(left.path.clone(), left.mode, id));
-            let size = content.len();
+            let size = content.byte_len();
             plan.blobs.push(PendingBlob { content: content });
             return Ok(retained + size);
           }
@@ -211,7 +211,7 @@ fn append_paths(out: &mut List<IndexEntry>, entries: &List<IndexEntry>, used: In
     match entries.get(i) {
       None => {}
       Some(item) => {
-        bytes = bytes + item.path.as_bytes().len() + 256;
+        bytes = bytes + item.path.as_bytes().byte_len() + 256;
         if bytes > max_work_memory() / 16 {
           return Err(GitError.LimitExceeded("merge paths exceed working memory limit"));
         }

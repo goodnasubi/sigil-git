@@ -282,7 +282,7 @@ fn run_parse(f: &Fixture) -> Bool
   let good = push_body(&zero(), &c2, &"refs/heads/main", &caps_ok(), &empty_pack());
   match parse_receive_request(&good) {
     Ok(r) => {
-      ok = expect(r.cmd.old_id == zero() && r.cmd.new_id == c2 && r.cmd.ref_name == "refs/heads/main" && !r.multiple && r.pack.len() == 44, &"parse: a single command with a pack") && ok;
+      ok = expect(r.cmd.old_id == zero() && r.cmd.new_id == c2 && r.cmd.ref_name == "refs/heads/main" && !r.multiple && r.pack.byte_len() == 44, &"parse: a single command with a pack") && ok;
     }
     Err(_) => {
       ok = fail(&"parse: a valid request is accepted") && ok;
@@ -364,12 +364,12 @@ fn has_text(b: &Bytes, needle: &String) -> Bool
   effects none
 {
   let n = needle.as_bytes();
-  if n.len() == 0 {
+  if n.byte_len() == 0 {
     return true;
   }
   let mut i = 0;
-  while i + n.len() <= b.len() {
-    if b.slice(i, i + n.len()).unwrap_or(Bytes.new()) == n.clone() {
+  while i + n.byte_len() <= b.byte_len() {
+    if b.slice(i, i + n.byte_len()).unwrap_or(Bytes.new()) == n.clone() {
       return true;
     }
     i = i + 1;
@@ -384,10 +384,10 @@ fn starts_with_text(b: &Bytes, prefix: &String) -> Bool
   effects none
 {
   let p = prefix.as_bytes();
-  if b.len() < p.len() {
+  if b.byte_len() < p.byte_len() {
     return false;
   }
-  return b.slice(0, p.len()).unwrap_or(Bytes.new()) == p;
+  return b.slice(0, p.byte_len()).unwrap_or(Bytes.new()) == p;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +424,7 @@ fn plain_entry(code: Int, content: &Bytes) -> Bytes
   ensures none
   effects none
 {
-  let mut b = entry_header(code, content.len());
+  let mut b = entry_header(code, content.byte_len());
   b.extend(&zlib_stored(&content));
   return b;
 }
@@ -453,15 +453,15 @@ fn varint(n: Int) -> Bytes
 
 fn delta_append(base_len: Int, tail: &Bytes) -> Bytes
   intent "基底全体をコピーして tail を足す差分（基底は 255 byte 以下、tail は 127 byte 以下）"
-  requires base_len >= 1 && base_len < 256 && tail.len() >= 1 && tail.len() < 128
+  requires base_len >= 1 && base_len < 256 && tail.byte_len() >= 1 && tail.byte_len() < 128
   ensures none
   effects none
 {
   let mut d = varint(base_len);
-  d.extend(&varint(base_len + tail.len()));
+  d.extend(&varint(base_len + tail.byte_len()));
   d.push(144);
   d.push(base_len);
-  d.push(tail.len());
+  d.push(tail.byte_len());
   d.extend(&tail);
   return d;
 }
@@ -472,7 +472,7 @@ fn ofs_entry(rel: Int, delta: &Bytes) -> Bytes
   ensures none
   effects none
 {
-  let mut b = entry_header(6, delta.len());
+  let mut b = entry_header(6, delta.byte_len());
   b.push(rel);
   b.extend(&zlib_stored(&delta));
   return b;
@@ -484,7 +484,7 @@ fn ref_entry(base_hex: &String, delta: &Bytes) -> Bytes
   ensures none
   effects none
 {
-  let mut b = entry_header(7, delta.len());
+  let mut b = entry_header(7, delta.byte_len());
   b.extend(&hex_bytes(&base_hex));
   b.extend(&zlib_stored(&delta));
   return b;
@@ -576,13 +576,13 @@ fn chain_pack(n_deltas: Int) -> Bytes
 {
   let mut entries = List.new();
   let first = plain_entry(3, &"0123456789".as_bytes());
-  let mut prev_len = first.len();
+  let mut prev_len = first.byte_len();
   entries.push(first);
   let mut content_len = 10;
   let mut i = 0;
   while i < n_deltas {
     let e = ofs_entry(prev_len, &delta_append(content_len, &"x".as_bytes()));
-    prev_len = e.len();
+    prev_len = e.byte_len();
     entries.push(e);
     content_len = content_len + 1;
     i = i + 1;
@@ -625,9 +625,9 @@ fn run_packs(f: &Fixture) -> Bool
   // 見出し・trailer・長さ
   let short = good.slice(0, 20).unwrap_or(Bytes.new());
   ok = expect(parse_kind(&short, 4096, 16777216, 8388608) == "corrupt", &"pack: truncated pack is corrupt") && ok;
-  let cut = good.slice(0, good.len() - 1).unwrap_or(Bytes.new());
+  let cut = good.slice(0, good.byte_len() - 1).unwrap_or(Bytes.new());
   ok = expect(parse_kind(&cut, 4096, 16777216, 8388608) == "corrupt", &"pack: pack without a full trailer is corrupt") && ok;
-  ok = expect(parse_kind(&flip(&good, good.len() - 1), 4096, 16777216, 8388608) == "corrupt", &"pack: a wrong trailer byte is corrupt") && ok;
+  ok = expect(parse_kind(&flip(&good, good.byte_len() - 1), 4096, 16777216, 8388608) == "corrupt", &"pack: a wrong trailer byte is corrupt") && ok;
   ok = expect(parse_kind(&flip(&good, 40), 4096, 16777216, 8388608) == "corrupt", &"pack: a flipped data byte breaks the trailer") && ok;
   ok = expect(parse_kind(&flip(&good, 0), 4096, 16777216, 8388608) == "corrupt", &"pack: a bad signature is corrupt") && ok;
   ok = expect(parse_kind(&flip(&good, 7), 4096, 16777216, 8388608) == "unsupported", &"pack: only version 2 is supported") && ok;
@@ -643,7 +643,7 @@ fn run_packs(f: &Fixture) -> Bool
   ok = expect(parse_kind(&assemble_n(1, &padded), 4096, 16777216, 8388608) == "corrupt", &"pack: a stray byte before the trailer is corrupt") && ok;
   // 不正な zlib（Adler-32 の不一致）
   let mut bad_z = blob_a.clone();
-  let last = bad_z.len() - 1;
+  let last = bad_z.byte_len() - 1;
   let mut bad_list = List.new();
   bad_list.push(flip(&bad_z, last));
   ok = expect(parse_kind(&assemble(&bad_list), 4096, 16777216, 8388608) == "corrupt", &"pack: a bad zlib checksum is corrupt") && ok;
@@ -670,7 +670,7 @@ fn run_packs(f: &Fixture) -> Bool
   let base_entry = plain_entry(3, &base);
   let mut ofs = List.new();
   ofs.push(base_entry.clone());
-  ofs.push(ofs_entry(base_entry.len(), &delta_append(base.len(), &"!!\n".as_bytes())));
+  ofs.push(ofs_entry(base_entry.byte_len(), &delta_append(base.byte_len(), &"!!\n".as_bytes())));
   ok = expect(parse_count(&assemble(&ofs)) == 2, &"delta: an OFS_DELTA resolves against an earlier entry") && ok;
   let mut ofs_content = base.clone();
   ofs_content.extend(&"!!\n".as_bytes());
@@ -684,10 +684,10 @@ fn run_packs(f: &Fixture) -> Bool
   }
   let mut refd = List.new();
   refd.push(base_entry.clone());
-  refd.push(ref_entry(&blob_id(&base), &delta_append(base.len(), &"?\n".as_bytes())));
+  refd.push(ref_entry(&blob_id(&base), &delta_append(base.byte_len(), &"?\n".as_bytes())));
   ok = expect(parse_count(&assemble(&refd)) == 2, &"delta: a REF_DELTA resolves against an object in the same pack") && ok;
   let mut refd_first = List.new();
-  refd_first.push(ref_entry(&blob_id(&base), &delta_append(base.len(), &"?\n".as_bytes())));
+  refd_first.push(ref_entry(&blob_id(&base), &delta_append(base.byte_len(), &"?\n".as_bytes())));
   refd_first.push(base_entry.clone());
   ok = expect(parse_count(&assemble(&refd_first)) == 2, &"delta: a REF_DELTA whose base comes later in the pack resolves") && ok;
   let mut thin = List.new();
@@ -698,7 +698,7 @@ fn run_packs(f: &Fixture) -> Bool
   ok = expect(parse_kind(&assemble(&missing), 4096, 16777216, 8388608) == "unsupported", &"delta: an unknown REF_DELTA base is a thin pack") && ok;
   let mut bad_delta = List.new();
   bad_delta.push(base_entry.clone());
-  bad_delta.push(ofs_entry(base_entry.len(), &delta_append(5, &"!!\n".as_bytes())));
+  bad_delta.push(ofs_entry(base_entry.byte_len(), &delta_append(5, &"!!\n".as_bytes())));
   ok = expect(parse_kind(&assemble(&bad_delta), 4096, 16777216, 8388608) == "corrupt", &"delta: a delta built for a different base size is corrupt") && ok;
   ok = expect(parse_kind(&chain_pack(64), 4096, 16777216, 8388608) == "ok", &"delta: a chain of depth 64 is accepted") && ok;
   ok = expect(parse_kind(&chain_pack(65), 4096, 16777216, 8388608) == "limit", &"delta: a chain of depth 65 exceeds the 0047 limit") && ok;
@@ -707,13 +707,13 @@ fn run_packs(f: &Fixture) -> Bool
 
 fn flip(b: &Bytes, at: Int) -> Bytes
   intent "at 番目の byte のビットを反転した複製"
-  requires at >= 0 && at < b.len()
+  requires at >= 0 && at < b.byte_len()
   ensures none
   effects none
 {
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if i == at {
       out.push(255 - c);
@@ -886,7 +886,7 @@ fn run_pushes(f: &Fixture, dir: &String) -> Bool
   ok = expect(atomic.status == 200 && has_text(&atomic.body, &"ERR ") && ref_is(&r, &"refs/heads/at", &""), &"unsupported: an unknown capability gets an ERR line and nothing changes") && ok;
   // 壊れた pack・欠落・thin pack は参照を変えない
   let ids_c1_pack = pack_of(&f, &ids_of(&f, &c1));
-  let broken = flip(&ids_c1_pack, ids_c1_pack.len() - 1);
+  let broken = flip(&ids_c1_pack, ids_c1_pack.byte_len() - 1);
   let bp = post(&r, &push_body(&zero(), &c1, &"refs/heads/broken", &caps, &broken));
   ok = expect(bp.body == report_ng(&"bad_pack", &"refs/heads/broken", &"unpack_failed") && ref_is(&r, &"refs/heads/broken", &""), &"verify: a corrupt pack reports an unpack failure") && ok;
   let only_commit = post(&r, &push_body(&zero(), &c3, &"refs/heads/partial", &caps, &pack_of(&f, &one(&c3))));
@@ -934,7 +934,7 @@ fn run_http_layer(f: &Fixture, dir: &String) -> Bool
   let wrong = Some("application/x-git-upload-pack-request".as_bytes());
   ok = expect(receive_pack_post(&r2, &List.new(), &wrong, &body, &wc_ok()).status == 415, &"media: the upload-pack Content-Type is 415") && ok;
   let mut huge = body.clone();
-  while huge.len() <= 1048576 {
+  while huge.byte_len() <= 1048576 {
     huge.push(0);
   }
   ok = expect(receive_pack_post(&r2, &List.new(), &ct, &huge, &wc_ok()).status == 413, &"limit: a request body over 1 MiB is 413") && ok;

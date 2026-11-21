@@ -82,7 +82,7 @@ fn cur_offset(b: &Builder) -> Int
   ensures none
   effects none
 {
-  return 12 + b.body.len();
+  return 12 + b.body.byte_len();
 }
 
 fn entry_header(kind: Int, size: Int) -> Bytes
@@ -125,7 +125,7 @@ fn ofs_encoding(rel: Int) -> Bytes
     v = v / 128;
   }
   let mut out = Bytes.new();
-  let mut i = rev.len();
+  let mut i = rev.byte_len();
   while i > 0 {
     i = i - 1;
     out.push(rev.get(i).unwrap_or(0));
@@ -139,7 +139,7 @@ fn add_entry(b: &mut Builder, id_hex: &String, head: &Bytes, payload: &Bytes) ->
   ensures none
   effects none
 {
-  let off = 12 + b.body.len();
+  let off = 12 + b.body.byte_len();
   b.body.extend(&head);
   b.body.extend(&zlib_stored(&payload));
   b.ids.push(id_hex.clone());
@@ -154,7 +154,7 @@ fn add_base(b: &mut Builder, obj_type: &ObjectType, kind: Int, content: &Bytes) 
   effects none
 {
   let id = bytes_to_hex(&compute_object_id(&object_type_name(&obj_type), &content));
-  return add_entry(&mut b, &id, &entry_header(kind, content.len()), &content);
+  return add_entry(&mut b, &id, &entry_header(kind, content.byte_len()), &content);
 }
 
 fn add_ofs_delta(b: &mut Builder, base_off: Int, delta: &Bytes, result_id: &String) -> Int
@@ -164,7 +164,7 @@ fn add_ofs_delta(b: &mut Builder, base_off: Int, delta: &Bytes, result_id: &Stri
   effects none
 {
   let rel = cur_offset(&b) - base_off;
-  let mut head = entry_header(6, delta.len());
+  let mut head = entry_header(6, delta.byte_len());
   head.extend(&ofs_encoding(rel));
   return add_entry(&mut b, &result_id, &head, &delta);
 }
@@ -175,7 +175,7 @@ fn add_ref_delta(b: &mut Builder, base_id: &String, delta: &Bytes, result_id: &S
   ensures none
   effects none
 {
-  let mut head = entry_header(7, delta.len());
+  let mut head = entry_header(7, delta.byte_len());
   head.extend(&hex_to_bytes(&base_id).unwrap_or(Bytes.new()));
   return add_entry(&mut b, &result_id, &head, &delta);
 }
@@ -211,10 +211,10 @@ fn delta_keep_then_insert(base_len: Int, keep: Int, tail: &Bytes) -> Bytes
 {
   let mut d = Bytes.new();
   d.extend(&varint(base_len));
-  d.extend(&varint(keep + tail.len()));
+  d.extend(&varint(keep + tail.byte_len()));
   d.push(128 + 16);
   d.push(keep);
-  d.push(tail.len());
+  d.push(tail.byte_len());
   d.extend(&tail);
   return d;
 }
@@ -343,7 +343,7 @@ fn flip(b: &Bytes, at: Int) -> Bytes
 {
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let v = b.get(i).unwrap_or(0);
     if i == at {
       out.push((v + 1) % 256);
@@ -439,13 +439,13 @@ fn test_deltas(dir: &String) -> Bool
   let base_off = add_base(&mut b, &ObjectType.Blob, 3, &base);
   let base_id = blob_id(&base);
   // OFS_DELTA: 基の先頭 30 byte + "-one"
-  let d1 = delta_keep_then_insert(base.len(), 30, &tail1);
+  let d1 = delta_keep_then_insert(base.byte_len(), 30, &tail1);
   let off1 = add_ofs_delta(&mut b, base_off, &d1, &blob_id(&res1));
   // 差分の差分（OFS_DELTA の基が OFS_DELTA）
-  let d2 = delta_keep_then_insert(res1.len(), 34, &tail2);
+  let d2 = delta_keep_then_insert(res1.byte_len(), 34, &tail2);
   let _ = add_ofs_delta(&mut b, off1, &d2, &blob_id(&res2));
   // REF_DELTA: 基を識別子で指す
-  let d3 = delta_keep_then_insert(base.len(), 25, &tail3);
+  let d3 = delta_keep_then_insert(base.byte_len(), 25, &tail3);
   let _ = add_ref_delta(&mut b, &base_id, &d3, &blob_id(&res3));
   // commit も基にできる
   let commit = "tree 0000000000000000000000000000000000000000000000000000000000000000\n\nmsg\n".as_bytes();
@@ -491,7 +491,7 @@ fn test_deltas(dir: &String) -> Bool
           return fail(&"pack_id_at");
         }
         Ok(id) => {
-          if id.len() != 64 {
+          if id.byte_len() != 64 {
             return fail(&"pack_id_at length");
           }
         }
@@ -651,7 +651,7 @@ fn test_rejections(dir: &String) -> Bool
   // 5. 識別子が内容と合わない（.idx の識別子を別のものにする）
   let mut lie = new_builder();
   let wrong_id = "2222222222222222222222222222222222222222222222222222222222222222";
-  let _ = add_entry(&mut lie, &wrong_id, &entry_header(3, content.len()), &content);
+  let _ = add_entry(&mut lie, &wrong_id, &entry_header(3, content.byte_len()), &content);
   match install(&join_path(&dir, &"bad"), &"lie", &finish(&lie)) {
     Err(_) => {
       return fail(&"install lie");
@@ -683,7 +683,7 @@ fn test_rejections(dir: &String) -> Bool
   let seed = "abcdefghijklmnopqrstuvwxyz0123456789".as_bytes();
   let mut deep = new_builder();
   let mut prev = add_base(&mut deep, &ObjectType.Blob, 3, &seed);
-  let mut len = seed.len();
+  let mut len = seed.byte_len();
   let mut step = 0;
   let mut last_id = "";
   while step < 70 {
@@ -706,7 +706,7 @@ fn test_rejections(dir: &String) -> Bool
   // 8. 基の大きさが合わない差分
   let mut mismatch = new_builder();
   let base_off = add_base(&mut mismatch, &ObjectType.Blob, 3, &content);
-  let wrong_len = delta_keep_then_insert(content.len() + 5, 10, &"y".as_bytes());
+  let wrong_len = delta_keep_then_insert(content.byte_len() + 5, 10, &"y".as_bytes());
   let mm_id = "6666666666666666666666666666666666666666666666666666666666666666";
   let _ = add_ofs_delta(&mut mismatch, base_off, &wrong_len, &mm_id);
   match install(&join_path(&dir, &"bad"), &"mismatch", &finish(&mismatch)) {
@@ -736,7 +736,7 @@ fn test_rejections(dir: &String) -> Bool
   // 10. 宣言された大きさと実際の大きさが違う
   let mut lenlie = new_builder();
   let ll_id = "8888888888888888888888888888888888888888888888888888888888888888";
-  let _ = add_entry(&mut lenlie, &ll_id, &entry_header(3, content.len() + 1), &content);
+  let _ = add_entry(&mut lenlie, &ll_id, &entry_header(3, content.byte_len() + 1), &content);
   match install(&join_path(&dir, &"bad"), &"lenlie", &finish(&lenlie)) {
     Err(_) => {
       return fail(&"install lenlie");
@@ -806,7 +806,7 @@ fn odb_checks(repo: &Repo, repo_path: &String) -> Bool
       return fail(&"odb_info from pack");
     }
     Ok(info) => {
-      if info.size != packed.len() {
+      if info.size != packed.byte_len() {
         return fail(&"odb_info pack size");
       }
     }

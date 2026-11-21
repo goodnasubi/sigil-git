@@ -112,7 +112,7 @@ fn le32(out: &mut Bytes, v: Int)
 
 fn stored_block(data: &Bytes, final: Bool) -> Bytes
   intent "stored ブロック 1 つの deflate 表現（65535 byte 以下）を作る"
-  requires data.len() <= 65535
+  requires data.byte_len() <= 65535
   ensures none
   effects none
 {
@@ -122,7 +122,7 @@ fn stored_block(data: &Bytes, final: Bool) -> Bytes
   } else {
     out.push(0);
   }
-  let n = data.len();
+  let n = data.byte_len();
   out.push(n % 256);
   out.push(n / 256);
   out.push((65535 - n) % 256);
@@ -140,7 +140,7 @@ fn gzip_of(deflate: &Bytes, plain: &Bytes) -> Bytes
   let mut out = bytes_of(&"1f8b0800000000000003");
   out.extend(&deflate);
   le32(&mut out, crc32(&plain));
-  le32(&mut out, plain.len());
+  le32(&mut out, plain.byte_len());
   return out;
 }
 
@@ -163,7 +163,7 @@ fn expected_with_match(payload: &Bytes, dist: Int) -> Bytes
 {
   let mut e = Bytes.new();
   e.extend(&payload);
-  let start = payload.len() - dist;
+  let start = payload.byte_len() - dist;
   let mut i = 0;
   while i < 3 {
     let b = e.get(start + i).unwrap_or(0);
@@ -203,7 +203,7 @@ fn run_window_tests() -> Bool
   z_ok.push(a_ok % 256);
   match inflate_zlib(&z_ok, 0, 1000000) {
     Ok(r) => {
-      if r.data != e_ok || r.consumed != z_ok.len() {
+      if r.data != e_ok || r.consumed != z_ok.byte_len() {
         return fail(&"zlib window 256: distance 256 output");
       }
     }
@@ -262,10 +262,10 @@ fn run_limit_tests() -> Bool
   if reason_of(&t1, 23, 1000) != "compression_limit_exceeded" {
     return fail(&"limit: output one byte over");
   }
-  if reason_of(&t1, 1000, t1.len()) != "ok" {
+  if reason_of(&t1, 1000, t1.byte_len()) != "ok" {
     return fail(&"limit: encoded exactly at the limit");
   }
-  if reason_of(&t1, 1000, t1.len() - 1) != "compression_limit_exceeded" {
+  if reason_of(&t1, 1000, t1.byte_len() - 1) != "compression_limit_exceeded" {
     return fail(&"limit: encoded one byte over");
   }
   // 出力が上限ちょうどで次の符号が破損 → invalid、有効な単位が先に上限を超え後続が破損 → limit
@@ -438,7 +438,7 @@ fn words(s: &String) -> List<String>
   let mut out = List.new();
   let mut cur = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c == 124 {
       out.push(cur.to_string_utf8().unwrap_or(""));
@@ -460,7 +460,7 @@ fn run_prefix_tests() -> Bool
 {
   let g = bytes_of(&"1f8b0800000000000003cb48cdc9c957c84027b9000088590b18000000");
   let mut n = 0;
-  while n < g.len() {
+  while n < g.byte_len() {
     let p = g.slice(0, n).unwrap_or(Bytes.new());
     if reason_of(&p, 1000, 1000) != "truncated_compressed_data" {
       console.log(&"prefix length");
@@ -470,7 +470,7 @@ fn run_prefix_tests() -> Bool
   }
   let h = bytes_of(&"1f8b081e000000000003060058590200616266696c652e7478740063003cedcb48cdc9c957c84027b9000088590b18000000");
   let mut m = 0;
-  while m < h.len() {
+  while m < h.byte_len() {
     let p = h.slice(0, m).unwrap_or(Bytes.new());
     if reason_of(&p, 1000, 1000) != "truncated_compressed_data" {
       return fail(&"prefix (optional fields): not truncated");

@@ -79,7 +79,7 @@ fn has_forbidden(s: &String) -> Bool
 {
   let b = s.as_bytes();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c == 60 || c == 62 || c == 10 || c == 13 || c == 0 {
       return true;
@@ -102,7 +102,7 @@ pub fn format_ident(who: &Ident) -> Result<Bytes, GitError>
     return Err(GitError.Corrupt("commit time cannot be negative"));
   }
   let tz = who.tz.as_bytes();
-  if tz.len() != 5 {
+  if tz.byte_len() != 5 {
     return Err(GitError.Corrupt("time zone must look like +0900"));
   }
   let sign = tz.get(0).unwrap_or(0);
@@ -232,7 +232,7 @@ fn conflicts_with_index(entries: &List<IndexEntry>, path: &String) -> Bool
 {
   let b = path.as_bytes();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     if b.get(i).unwrap_or(0) == 47 {
       let upper = b.slice(0, i).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
       if find_entry(&entries, &upper) >= 0 {
@@ -533,14 +533,14 @@ pub fn build_tree(repo: &Repo, entries: &List<IndexEntry>, lo: Int, hi: Int, ple
         let pb = e.path.as_bytes();
         let mut slash = -1;
         let mut k = plen;
-        while k < pb.len() && slash < 0 {
+        while k < pb.byte_len() && slash < 0 {
           if pb.get(k).unwrap_or(0) == 47 {
             slash = k;
           }
           k = k + 1;
         }
         if slash < 0 {
-          let name = pb.slice(plen, pb.len()).unwrap_or(Bytes.new());
+          let name = pb.slice(plen, pb.byte_len()).unwrap_or(Bytes.new());
           items.push(new_tree_entry(e.mode, name, hex_to_bytes(&e.id)?));
           i = i + 1;
         } else {
@@ -592,7 +592,7 @@ fn commit_locked(repo: &Repo, author: &Ident, committer: &Ident, message: &Bytes
 {
   let author_bytes = format_ident(&author)?;
   let committer_bytes = format_ident(&committer)?;
-  if message.len() > max_commit_message_size() {
+  if message.byte_len() > max_commit_message_size() {
     return Err(GitError.LimitExceeded("commit message is too large"));
   }
   let head = read_head(&repo)?;

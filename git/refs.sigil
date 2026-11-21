@@ -176,13 +176,13 @@ fn header_traits_ok(line: &String) -> Bool
     return false;
   }
   let lb = line.as_bytes();
-  let mut i = prefix.len();
-  while i < lb.len() {
-    while i < lb.len() && lb.get(i).unwrap_or(0) == 32 {
+  let mut i = prefix.byte_len();
+  while i < lb.byte_len() {
+    while i < lb.byte_len() && lb.get(i).unwrap_or(0) == 32 {
       i = i + 1;
     }
     let mut j = i;
-    while j < lb.len() && lb.get(j).unwrap_or(0) != 32 {
+    while j < lb.byte_len() && lb.get(j).unwrap_or(0) != 32 {
       j = j + 1;
     }
     if j > i {
@@ -202,7 +202,7 @@ pub fn parse_packed_refs(data: &Bytes) -> Result<PackedRefs, GitError>
   ensures none
   effects none
 {
-  let n = data.len();
+  let n = data.byte_len();
   let mut header = "";
   let mut refs = List.new();
   let mut have = false;
@@ -229,7 +229,7 @@ pub fn parse_packed_refs(data: &Bytes) -> Result<PackedRefs, GitError>
         return Err(GitError.Corrupt("packed-refs line is not valid UTF-8"));
       }
     }
-    let line_n = line_b.len();
+    let line_n = line_b.byte_len();
     pos = end + 1;
     if line_n > 0 && line_b.get(0).unwrap_or(0) == 35 {
       if !first {
@@ -260,7 +260,7 @@ pub fn parse_packed_refs(data: &Bytes) -> Result<PackedRefs, GitError>
       if !is_valid_hex_id(&id) {
         return Err(GitError.Corrupt("invalid object id in packed-refs"));
       }
-      if name.as_bytes().len() > max_ref_name_len() {
+      if name.as_bytes().byte_len() > max_ref_name_len() {
         return Err(GitError.LimitExceeded("ref name length exceeds 1024 limit"));
       }
       validate_ref_name(&name)?;
@@ -378,11 +378,19 @@ fn parse_id_line(b: &Bytes) -> Result<String, GitError>
   effects none
 {
   let mut body = b.clone();
-  if body.len() > 0 && body.get(body.len() - 1).unwrap_or(0) == 10 {
-    body = body.slice(0, body.len() - 1).unwrap_or(Bytes.new());
+  if body.byte_len() > 0 && body.get(body.byte_len() - 1).unwrap_or(0) == 10 {
+    body = body.slice(0, body.byte_len() - 1).unwrap_or(Bytes.new());
   }
-  let s = body.to_string_utf8().unwrap_or("");
-  if s.len() != body.len() || !is_valid_hex_id(&s) {
+  let mut s = "";
+  match body.to_string_utf8() {
+    Ok(v) => {
+      s = v;
+    }
+    Err(_) => {
+      return Err(GitError.Corrupt("reference file does not contain a SHA-256 object id"));
+    }
+  }
+  if !is_valid_hex_id(&s) {
     return Err(GitError.Corrupt("reference file does not contain a SHA-256 object id"));
   }
   return Ok(s);
@@ -452,8 +460,8 @@ pub fn read_head(repo: &Repo) -> Result<HeadState, GitError>
     }
     Some(b) => {
       let mut body = b.clone();
-      if body.len() > 0 && body.get(body.len() - 1).unwrap_or(0) == 10 {
-        body = body.slice(0, body.len() - 1).unwrap_or(Bytes.new());
+      if body.byte_len() > 0 && body.get(body.byte_len() - 1).unwrap_or(0) == 10 {
+        body = body.slice(0, body.byte_len() - 1).unwrap_or(Bytes.new());
       }
       let mut s = "";
       match body.to_string_utf8() {
@@ -465,7 +473,7 @@ pub fn read_head(repo: &Repo) -> Result<HeadState, GitError>
         }
       }
       if string_starts_with(&s, &"ref: ") {
-        let target = string_slice(&s, 5, body.len());
+        let target = string_slice(&s, 5, body.byte_len());
         validate_ref_name(&target)?;
         if !string_starts_with(&target, &"refs/heads/") {
           return Err(GitError.UnsupportedFormat("HEAD must point to refs/heads/*"));
@@ -569,7 +577,7 @@ fn conflicts_with_loose(repo: &Repo, name: &String) -> Result<Bool, GitError>
   }
   let nb = name.as_bytes();
   let mut i = 0;
-  while i < nb.len() {
+  while i < nb.byte_len() {
     if nb.get(i).unwrap_or(0) == 47 && i > 11 {
       let upper = string_slice(&name, 0, i);
       if file_exists(&ref_path(&repo, &upper))? {
@@ -821,7 +829,7 @@ fn less_than(a: &String, b: &String) -> Bool
   let ab = a.as_bytes();
   let bb = b.as_bytes();
   let mut i = 0;
-  while i < ab.len() && i < bb.len() {
+  while i < ab.byte_len() && i < bb.byte_len() {
     let x = ab.get(i).unwrap_or(0);
     let y = bb.get(i).unwrap_or(0);
     if x != y {
@@ -829,7 +837,7 @@ fn less_than(a: &String, b: &String) -> Bool
     }
     i = i + 1;
   }
-  return ab.len() < bb.len();
+  return ab.byte_len() < bb.byte_len();
 }
 
 fn copy_entries(items: &List<RefEntry>) -> List<RefEntry>

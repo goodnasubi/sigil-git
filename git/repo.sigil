@@ -74,7 +74,7 @@ fn trim_bytes(b: &Bytes) -> Bytes
   effects none
 {
   let mut start = 0;
-  let mut end = b.len();
+  let mut end = b.byte_len();
   while start < end && is_space(b.get(start).unwrap_or(0)) {
     start = start + 1;
   }
@@ -92,7 +92,7 @@ fn lower_string(b: &Bytes) -> String
 {
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     out.push(lower_byte(b.get(i).unwrap_or(0)));
     i = i + 1;
   }
@@ -123,7 +123,7 @@ pub fn parse_config(data: &Bytes) -> ConfigInfo
 {
   let mut info = ConfigInfo { version: "", object_format: "", ref_storage: "", unsupported: "" };
   let mut section = "";
-  let n = data.len();
+  let n = data.byte_len();
   let mut pos = 0;
   while pos <= n {
     let mut end = pos;
@@ -132,31 +132,31 @@ pub fn parse_config(data: &Bytes) -> ConfigInfo
     }
     let line = trim_bytes(&data.slice(pos, end).unwrap_or(Bytes.new()));
     pos = end + 1;
-    let comment = line.len() == 0 || line.get(0).unwrap_or(0) == 35 || line.get(0).unwrap_or(0) == 59;
+    let comment = line.byte_len() == 0 || line.get(0).unwrap_or(0) == 35 || line.get(0).unwrap_or(0) == 59;
     if comment {
       // 空行とコメントは読み飛ばす
     } else if line.get(0).unwrap_or(0) == 91 {
       let mut close = 1;
-      while close < line.len() && line.get(close).unwrap_or(0) != 93 {
+      while close < line.byte_len() && line.get(close).unwrap_or(0) != 93 {
         close = close + 1;
       }
       let head = trim_bytes(&line.slice(1, close).unwrap_or(Bytes.new()));
       let mut name_end = 0;
-      while name_end < head.len() && !is_space(head.get(name_end).unwrap_or(0)) && head.get(name_end).unwrap_or(0) != 34 && head.get(name_end).unwrap_or(0) != 46 {
+      while name_end < head.byte_len() && !is_space(head.get(name_end).unwrap_or(0)) && head.get(name_end).unwrap_or(0) != 34 && head.get(name_end).unwrap_or(0) != 46 {
         name_end = name_end + 1;
       }
       section = lower_string(&head.slice(0, name_end).unwrap_or(Bytes.new()));
     } else {
       let mut eq = 0;
-      while eq < line.len() && line.get(eq).unwrap_or(0) != 61 {
+      while eq < line.byte_len() && line.get(eq).unwrap_or(0) != 61 {
         eq = eq + 1;
       }
       let key = lower_string(&trim_bytes(&line.slice(0, eq).unwrap_or(Bytes.new())));
       let mut value = "";
-      if eq < line.len() {
-        let mut vb = trim_bytes(&line.slice(eq + 1, line.len()).unwrap_or(Bytes.new()));
-        if vb.len() >= 2 && vb.get(0).unwrap_or(0) == 34 && vb.get(vb.len() - 1).unwrap_or(0) == 34 {
-          vb = vb.slice(1, vb.len() - 1).unwrap_or(Bytes.new());
+      if eq < line.byte_len() {
+        let mut vb = trim_bytes(&line.slice(eq + 1, line.byte_len()).unwrap_or(Bytes.new()));
+        if vb.byte_len() >= 2 && vb.get(0).unwrap_or(0) == 34 && vb.get(vb.byte_len() - 1).unwrap_or(0) == 34 {
+          vb = vb.slice(1, vb.byte_len() - 1).unwrap_or(Bytes.new());
         }
         value = lower_string(&vb);
       }

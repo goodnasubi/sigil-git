@@ -75,7 +75,7 @@ fn ints(csv: &String) -> List<Int>
   let mut out = List.new();
   let mut cur = 0;
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c == 44 {
       out.push(cur);
@@ -164,7 +164,7 @@ fn push_out(out: &mut Bytes, b: Int, limit: Int) -> Result<Bool, GitError>
   ensures none
   effects none
 {
-  if out.len() >= limit {
+  if out.byte_len() >= limit {
     return Err(GitError.LimitExceeded("inflated data exceeds the limit"));
   }
   out.push(b);
@@ -199,12 +199,12 @@ fn inflate_codes(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int, lit: 
         return Err(GitError.Corrupt("invalid distance symbol"));
       }
       let d = at(&dbase, ds) + take_bits(&data, &mut st, at(&dext, ds))?;
-      if d > out.len() || d > st.maxd {
+      if d > out.byte_len() || d > st.maxd {
         return Err(GitError.Corrupt("distance is too far back"));
       }
       let mut k = 0;
       while k < len {
-        let b = out.get(out.len() - d).unwrap_or(0);
+        let b = out.get(out.byte_len() - d).unwrap_or(0);
         push_out(&mut out, b, limit)?;
         k = k + 1;
       }
@@ -337,7 +337,7 @@ fn inflate_stored(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> R
   st.buf = 0;
   st.cnt = 0;
   let p = st.pos;
-  if p + 4 > data.len() {
+  if p + 4 > data.byte_len() {
     return Err(GitError.Corrupt("truncated stored block header"));
   }
   let len = data.get(p).unwrap_or(0) + data.get(p + 1).unwrap_or(0) * 256;
@@ -345,10 +345,10 @@ fn inflate_stored(data: &Bytes, st: &mut Bits, out: &mut Bytes, limit: Int) -> R
   if len + nlen != 65535 {
     return Err(GitError.Corrupt("stored block length check failed"));
   }
-  if p + 4 + len > data.len() {
+  if p + 4 + len > data.byte_len() {
     return Err(GitError.Corrupt("truncated stored block"));
   }
-  if out.len() + len > limit {
+  if out.byte_len() + len > limit {
     return Err(GitError.LimitExceeded("inflated data exceeds the limit"));
   }
   let mut i = 0;
@@ -366,7 +366,7 @@ pub fn inflate_deflate(z: &Bytes, start: Int, limit: Int, max_dist: Int) -> Resu
   ensures none
   effects none
 {
-  if start < 0 || start > z.len() {
+  if start < 0 || start > z.byte_len() {
     return Err(GitError.Corrupt("truncated deflate stream"));
   }
   let mut st = Bits { pos: start, buf: 0, cnt: 0, maxd: max_dist };
@@ -397,7 +397,7 @@ pub fn inflate_zlib(z: &Bytes, start: Int, limit: Int) -> Result<InflateResult, 
   ensures none
   effects none
 {
-  if start < 0 || start + 2 > z.len() {
+  if start < 0 || start + 2 > z.byte_len() {
     return Err(GitError.Corrupt("truncated zlib header"));
   }
   let cmf = z.get(start).unwrap_or(0);
@@ -414,7 +414,7 @@ pub fn inflate_zlib(z: &Bytes, start: Int, limit: Int) -> Result<InflateResult, 
   let window = 1 << cmf / 16 + 8;
   let body = inflate_deflate(&z, start + 2, limit, window)?;
   let p = start + 2 + body.consumed;
-  if p + 4 > z.len() {
+  if p + 4 > z.byte_len() {
     return Err(GitError.Corrupt("truncated zlib trailer"));
   }
   let want = z.get(p).unwrap_or(0) * 16777216 + z.get(p + 1).unwrap_or(0) * 65536 + z.get(p + 2).unwrap_or(0) * 256 + z.get(p + 3).unwrap_or(0);

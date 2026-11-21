@@ -72,7 +72,7 @@ fn pad4(n: Int) -> String
   effects none
 {
   let s = int_to_str(n);
-  return cat3(&rep(&"0", 4 - s.len()), &s, &"");
+  return cat3(&rep(&"0", 4 - s.char_count()), &s, &"");
 }
 
 fn kind_of_bytes(r: Result<Bytes, GitError>) -> String
@@ -182,14 +182,14 @@ fn contains(hay: &String, needle: &String) -> Bool
 {
   let h = hay.as_bytes();
   let n = needle.as_bytes();
-  if n.len() == 0 {
+  if n.byte_len() == 0 {
     return true;
   }
   let mut i = 0;
-  while i + n.len() <= h.len() {
+  while i + n.byte_len() <= h.byte_len() {
     let mut j = 0;
     let mut same = true;
-    while j < n.len() && same {
+    while j < n.byte_len() && same {
       if h.get(i + j).unwrap_or(0) != n.get(j).unwrap_or(1) {
         same = false;
       }
@@ -213,10 +213,10 @@ fn words(s: &String) -> List<String>
   let mut out = List.new();
   let mut cur = Bytes.new();
   let mut i = 0;
-  while i <= b.len() {
+  while i <= b.byte_len() {
     let c = b.get(i).unwrap_or(32);
     if c == 32 {
-      if cur.len() > 0 {
+      if cur.byte_len() > 0 {
         out.push(cur.to_string_utf8().unwrap_or(""));
         cur = Bytes.new();
       }
@@ -254,7 +254,7 @@ fn test_pkt() -> Bool
   // 長さの境界: 4 桁を含めて 65520 まで
   let max_payload = max_pkt_line_len() - 4;
   ok = expect(match pkt_encode(&rep(&"x", max_payload).as_bytes()) {
-    Ok(b) => b.len() == 65520 && text_of(&b.slice(0, 4).unwrap_or(Bytes.new())) == "fff0",
+    Ok(b) => b.byte_len() == 65520 && text_of(&b.slice(0, 4).unwrap_or(Bytes.new())) == "fff0",
     Err(_) => false,
   }, &"pkt: 65520 bytes is accepted") && ok;
   ok = expect(kind_of_bytes(pkt_encode(&rep(&"x", max_payload + 1).as_bytes())) == "LimitExceeded", &"pkt: 65521 bytes is rejected") && ok;
@@ -443,11 +443,11 @@ fn test_advertise_limits() -> Bool
   let limit = max_transfer_response_size();
   let name_len = 1000;
   let len1 = match advertise_receive_pack(&numbered_refs(1, name_len)) {
-    Ok(b) => b.len(),
+    Ok(b) => b.byte_len(),
     Err(_) => 0,
   };
   let len2 = match advertise_receive_pack(&numbered_refs(2, name_len)) {
-    Ok(b) => b.len(),
+    Ok(b) => b.byte_len(),
     Err(_) => 0,
   };
   let line = len2 - len1;
@@ -455,13 +455,13 @@ fn test_advertise_limits() -> Bool
   // k 個で収まる最大の個数
   let mut k = (limit - len1) / line + 1;
   let mut fits = match advertise_receive_pack(&numbered_refs(k, name_len)) {
-    Ok(b) => b.len(),
+    Ok(b) => b.byte_len(),
     Err(_) => 0,
   };
   while fits == 0 && k > 1 {
     k = k - 1;
     fits = match advertise_receive_pack(&numbered_refs(k, name_len)) {
-      Ok(b) => b.len(),
+      Ok(b) => b.byte_len(),
       Err(_) => 0,
     };
   }
@@ -475,7 +475,7 @@ fn test_advertise_limits() -> Bool
   if tail_name_len >= 12 && tail_name_len <= 1024 {
     tuned.push(new_adv_ref(cat3(&"refs/heads/z", &rep(&"z", tail_name_len - 12), &""), a.clone(), None));
     ok = expect(match advertise_receive_pack(&tuned) {
-      Ok(b) => b.len() == limit,
+      Ok(b) => b.byte_len() == limit,
       Err(_) => false,
     }, &"limit: exactly 1048576 bytes is accepted") && ok;
     let mut over = numbered_refs(k, name_len);
