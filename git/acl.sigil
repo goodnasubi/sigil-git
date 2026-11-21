@@ -22,11 +22,11 @@ pub fn repo_id_ok(id: &String) -> Bool
   effects none
 {
   let b = id.as_bytes();
-  if b.len() < 1 || b.len() > 64 {
+  if b.byte_len() < 1 || b.byte_len() > 64 {
     return false;
   }
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     let ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 45;
     if !ok {
@@ -47,10 +47,10 @@ fn split_on(s: &String, sep: Int) -> List<String>
   let mut out = List.new();
   let mut cur = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c == sep {
-      if cur.len() > 0 {
+      if cur.byte_len() > 0 {
         out.push(cur.to_string_utf8().unwrap_or(""));
       }
       cur = Bytes.new();
@@ -59,7 +59,7 @@ fn split_on(s: &String, sep: Int) -> List<String>
     }
     i = i + 1;
   }
-  if cur.len() > 0 {
+  if cur.byte_len() > 0 {
     out.push(cur.to_string_utf8().unwrap_or(""));
   }
   return out;
@@ -84,11 +84,11 @@ pub fn subject_name_ok(name: &String) -> Bool
   effects none
 {
   let b = name.as_bytes();
-  if b.len() < 1 || b.len() > 64 {
+  if b.byte_len() < 1 || b.byte_len() > 64 {
     return false;
   }
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 45;
     if !ok {
@@ -115,7 +115,7 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
     let eb = e.as_bytes();
     let mut colon_count = 0;
     let mut c_idx = 0;
-    while c_idx < eb.len() {
+    while c_idx < eb.byte_len() {
       if eb.get(c_idx).unwrap_or(0) == 58 {
         colon_count = colon_count + 1;
       }
@@ -134,12 +134,12 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
     }
     let sub_text = str_at(&parts, 1);
     let sb = sub_text.as_bytes();
-    if sb.len() == 0 || sb.get(0).unwrap_or(0) == 44 || sb.get(sb.len() - 1).unwrap_or(0) == 44 {
+    if sb.byte_len() == 0 || sb.get(0).unwrap_or(0) == 44 || sb.get(sb.byte_len() - 1).unwrap_or(0) == 44 {
       return Err("invalid_acl");
     }
     let mut prev_comma = false;
     let mut j = 0;
-    while j < sb.len() {
+    while j < sb.byte_len() {
       let sc = sb.get(j).unwrap_or(0);
       if sc == 44 {
         if prev_comma {
@@ -161,12 +161,12 @@ pub fn parse_fixed_acl(text: &String) -> Result<FixedAcl, String>
     while k < subs.len() {
       let item = str_at(&subs, k);
       let ib = item.as_bytes();
-      if ib.len() == 0 || ib.get(0).unwrap_or(0) == 61 || ib.get(ib.len() - 1).unwrap_or(0) == 61 {
+      if ib.byte_len() == 0 || ib.get(0).unwrap_or(0) == 61 || ib.get(ib.byte_len() - 1).unwrap_or(0) == 61 {
         return Err("invalid_acl");
       }
       let mut eq_count = 0;
       let mut eq_idx = 0;
-      while eq_idx < ib.len() {
+      while eq_idx < ib.byte_len() {
         if ib.get(eq_idx).unwrap_or(0) == 61 {
           eq_count = eq_count + 1;
         }

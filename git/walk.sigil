@@ -229,11 +229,11 @@ fn flatten_into(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: 
       return Err(GitError.TypeMismatch("expected a tree"));
     }
   }
-  if o.content.len() * 8 > budget {
+  if o.content.byte_len() * 8 > budget {
     return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
   }
   let entries = decode_tree(&o.content)?;
-  let mut remaining = budget - o.content.len() * 8;
+  let mut remaining = budget - o.content.byte_len() * 8;
   let mut i = 0;
   while i < entries.len() {
     match entries.get(i) {
@@ -255,7 +255,7 @@ fn flatten_into(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: 
         if mode == 40000 {
           remaining = flatten_into(&repo, &packs, &id, &path, &mut out, depth + 1, remaining)?;
         } else {
-          let cost = path.as_bytes().len() + 256;
+          let cost = path.as_bytes().byte_len() + 256;
           if cost > remaining {
             return Err(GitError.LimitExceeded("tree traversal exceeds working memory limit"));
           }
@@ -266,7 +266,7 @@ fn flatten_into(repo: &Repo, packs: &List<PackStore>, tree_id: &String, prefix: 
     }
     i = i + 1;
   }
-  return Ok(remaining + o.content.len() * 8);
+  return Ok(remaining + o.content.byte_len() * 8);
 }
 
 pub fn flatten_tree(repo: &Repo, packs: &List<PackStore>, tree_id: &String) -> Result<List<FlatEntry>, GitError>
@@ -336,7 +336,7 @@ fn path_less(a: &String, b: &String) -> Bool
   let ab = a.as_bytes();
   let bb = b.as_bytes();
   let mut i = 0;
-  while i < ab.len() && i < bb.len() {
+  while i < ab.byte_len() && i < bb.byte_len() {
     let x = ab.get(i).unwrap_or(0);
     let y = bb.get(i).unwrap_or(0);
     if x != y {
@@ -344,7 +344,7 @@ fn path_less(a: &String, b: &String) -> Bool
     }
     i = i + 1;
   }
-  return ab.len() < bb.len();
+  return ab.byte_len() < bb.byte_len();
 }
 
 fn flat_at(l: &List<FlatEntry>, i: Int) -> FlatEntry

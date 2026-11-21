@@ -193,10 +193,10 @@ fn starts_with_bytes(b: &Bytes, prefix: &Bytes) -> Bool
   ensures none
   effects none
 {
-  if b.len() < prefix.len() {
+  if b.byte_len() < prefix.byte_len() {
     return false;
   }
-  return b.slice(0, prefix.len()).unwrap_or(Bytes.new()) == prefix.clone();
+  return b.slice(0, prefix.byte_len()).unwrap_or(Bytes.new()) == prefix.clone();
 }
 
 fn tail_from(b: &Bytes, pos: Int) -> Bytes
@@ -205,7 +205,7 @@ fn tail_from(b: &Bytes, pos: Int) -> Bytes
   ensures none
   effects none
 {
-  return b.slice(pos, b.len()).unwrap_or(Bytes.new());
+  return b.slice(pos, b.byte_len()).unwrap_or(Bytes.new());
 }
 
 pub struct Unframed {
@@ -225,7 +225,7 @@ fn unframe(body: &Bytes, start: Int) -> Unframed
   let mut error = "";
   let mut pos = start;
   let mut ended = false;
-  while pos < body.len() && !ended {
+  while pos < body.byte_len() && !ended {
     match pkt_read(&body, pos) {
       Err(_) => {
         return Unframed { pack: pack, error: error, ended: false, valid: false };
@@ -251,7 +251,7 @@ fn unframe(body: &Bytes, start: Int) -> Unframed
       }
     }
   }
-  return Unframed { pack: pack, error: error, ended: ended && pos == body.len(), valid: true };
+  return Unframed { pack: pack, error: error, ended: ended && pos == body.byte_len(), valid: true };
 }
 
 fn pack_count(pack: &Bytes) -> Int
@@ -260,7 +260,7 @@ fn pack_count(pack: &Bytes) -> Int
   ensures none
   effects none
 {
-  if pack.len() < 12 || tail_from(&pack, 0).slice(0, 8).unwrap_or(Bytes.new()) != bytes_hex8() {
+  if pack.byte_len() < 12 || tail_from(&pack, 0).slice(0, 8).unwrap_or(Bytes.new()) != bytes_hex8() {
     return 0 - 1;
   }
   return pack.read_u32_be(8).unwrap_or(0 - 1);
@@ -291,7 +291,7 @@ fn contains_pack_magic(b: &Bytes) -> Bool
   effects none
 {
   let mut i = 0;
-  while i + 4 <= b.len() {
+  while i + 4 <= b.byte_len() {
     if b.get(i).unwrap_or(0) == 80 && b.get(i + 1).unwrap_or(0) == 65 && b.get(i + 2).unwrap_or(0) == 67 && b.get(i + 3).unwrap_or(0) == 75 {
       return true;
     }
@@ -392,7 +392,7 @@ fn run_advertisement(f: &Fixture) -> Bool
   prefix.extend(&pkt_flush());
   ok = expect(starts_with_bytes(&r.body, &prefix), &"adv: service header and flush") && ok;
   let head_line = cat3(&f.commit2, &" HEAD\u{0}object-format=sha256 symref=HEAD:refs/heads/main side-band-64k\n", &"");
-  ok = expect(starts_with_bytes(&tail_from(&r.body, prefix.len()), &pkt(&head_line)), &"adv: HEAD line carries the capabilities") && ok;
+  ok = expect(starts_with_bytes(&tail_from(&r.body, prefix.byte_len()), &pkt(&head_line)), &"adv: HEAD line carries the capabilities") && ok;
   let bad = words(&"|service=git-receive-pack|service=git-upload-pack&x=1|service=git-upload-pack&service=git-upload-pack|x=1|service=git-upload-pack&|service=|Service=git-upload-pack|service=git-upload-pack%20");
   let mut i = 0;
   while i < bad.len() {
@@ -407,7 +407,7 @@ fn run_advertisement(f: &Fixture) -> Bool
     body.push(97);
     k = k + 1;
   }
-  let total = 34 + body.len();
+  let total = 34 + body.byte_len();
   ok = expect(frame_advertisement(&body, total).is_ok(), &"adv: framed advertisement exactly at the limit") && ok;
   ok = expect(frame_advertisement(&body, total - 1).is_err(), &"adv: framed advertisement one byte over") && ok;
   return ok;
@@ -423,7 +423,7 @@ fn words(s: &String) -> List<String>
   let mut out = List.new();
   let mut cur = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c == 124 {
       out.push(cur.to_string_utf8().unwrap_or(""));
@@ -450,25 +450,25 @@ fn run_clone(f: &Fixture) -> Bool
   let sb = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"side-band-64k object-format=sha256", &List.new(), true));
   ok = expect(sb.status == 200 && sb.content_type == "application/x-git-upload-pack-result", &"clone: side-band status and content type") && ok;
   ok = expect(starts_with_bytes(&sb.body, &nak), &"clone: NAK comes first") && ok;
-  let u = unframe(&sb.body, nak.len());
+  let u = unframe(&sb.body, nak.byte_len());
   ok = expect(u.valid && u.ended && u.error == "" && u.pack == pack, &"clone: side-band pack equals the closure pack and ends with flush") && ok;
   let plain_resp = upload_pack_respond(&f.repo, &request(&one(&f.commit2), &"object-format=sha256", &List.new(), true));
   ok = expect(plain_resp.body == cat_bytes(&nak, &pack), &"clone: without side-band the raw pack follows NAK") && ok;
   // 注釈付きタグの先端: tag オブジェクト → commit → ... の到達集合（tag 1 + 6）
   let tag_resp = upload_pack_respond(&f.repo, &request(&one(&f.tag1), &"object-format=sha256", &List.new(), true));
-  let tag_pack = tail_from(&tag_resp.body, nak.len());
+  let tag_pack = tail_from(&tag_resp.body, nak.byte_len());
   ok = expect(pack_count(&tag_pack) == 7, &"clone: annotated tag tip adds the tag object") && ok;
   // 複数 want（main と feature）と重複した want は 1 度だけ数える
   let mut wants = two(&f.commit2, &f.commit1);
   wants.push(f.commit2.clone());
   let multi = upload_pack_respond(&f.repo, &request(&wants, &"object-format=sha256", &List.new(), true));
-  ok = expect(pack_count(&tail_from(&multi.body, nak.len())) == 6, &"clone: several wants share one closure") && ok;
+  ok = expect(pack_count(&tail_from(&multi.body, nak.byte_len())) == 6, &"clone: several wants share one closure") && ok;
   // 軽量タグ・HEAD の先端
   let lw = upload_pack_respond(&f.repo, &request(&one(&f.commit1), &"object-format=sha256", &List.new(), true));
-  ok = expect(pack_count(&tail_from(&lw.body, nak.len())) == 3, &"clone: commit1 closure has 3 objects") && ok;
+  ok = expect(pack_count(&tail_from(&lw.body, nak.byte_len())) == 3, &"clone: commit1 closure has 3 objects") && ok;
   // 要求なし（want なし）の flush だけ
   let empty = upload_pack_respond(&f.repo, &pkt_flush());
-  ok = expect(empty.status == 200 && empty.body.len() == 0, &"clone: an empty request gets an empty result") && ok;
+  ok = expect(empty.status == 200 && empty.body.byte_len() == 0, &"clone: an empty request gets an empty result") && ok;
   return ok;
 }
 
@@ -544,8 +544,8 @@ fn contains_text(b: &Bytes, text: &String) -> Bool
 {
   let t = text.as_bytes();
   let mut i = 0;
-  while i + t.len() <= b.len() {
-    if b.slice(i, i + t.len()).unwrap_or(Bytes.new()) == t {
+  while i + t.byte_len() <= b.byte_len() {
+    if b.slice(i, i + t.byte_len()).unwrap_or(Bytes.new()) == t {
       return true;
     }
     i = i + 1;
@@ -562,7 +562,7 @@ fn upper_hex(s: &String) -> String
   let b = s.as_bytes();
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c >= 97 && c <= 102 {
       out.push(c - 32);
@@ -608,7 +608,7 @@ fn run_unsupported(f: &Fixture) -> Bool
   let mut bad = List.new();
   bad.push(cat_bytes(&pkt(&cat3(&"want ", &w, &"\n")), &pkt_flush()));
   let mut trunc = request(&one(&w), &"object-format=sha256", &List.new(), true);
-  trunc = trunc.slice(0, trunc.len() - 3).unwrap_or(Bytes.new());
+  trunc = trunc.slice(0, trunc.byte_len() - 3).unwrap_or(Bytes.new());
   bad.push(trunc);
   let mut trailing = request(&one(&w), &"object-format=sha256", &List.new(), true);
   trailing.push(48);
@@ -657,7 +657,7 @@ fn run_limits(f: &Fixture) -> Bool
   let b = upload_pack_respond_limited(&f.repo, &req_sb, 5, 100000, 1048576);
   ok = expect(contains_text(&b.body, &"upload-pack: limit exceeded") && !contains_pack_magic(&b.body) && starts_with_bytes(&b.body, &pkt(&"NAK\n")), &"limit: 7th object is refused on channel 3 with no pack") && ok;
   let ub = unframe(&b.body, 8);
-  ok = expect(ub.valid && ub.ended && ub.error == "upload-pack: limit exceeded\n" && ub.pack.len() == 0, &"limit: the side-band failure is a channel-3 message followed by flush") && ok;
+  ok = expect(ub.valid && ub.ended && ub.error == "upload-pack: limit exceeded\n" && ub.pack.byte_len() == 0, &"limit: the side-band failure is a channel-3 message followed by flush") && ok;
   let c = upload_pack_respond_limited(&f.repo, &req_raw, 5, 100000, 1048576);
   ok = expect(c.body == pkt(&"ERR upload-pack: limit exceeded"), &"limit: without side-band the failure is an ERR line alone (no ACK/NAK before it)") && ok;
   // 走査件数: 成功する最小の予算を探し、その直下は失敗する。
@@ -677,7 +677,7 @@ fn run_limits(f: &Fixture) -> Bool
   }
   // 応答全体（ACK／NAK・side-band・flush を含む）が上限ちょうどなら成功し、1 byte 超えれば pack を送らない。
   let full = upload_pack_respond_limited(&f.repo, &req_sb, 4096, 100000, 1048576);
-  let total = full.body.len();
+  let total = full.body.byte_len();
   let at = upload_pack_respond_limited(&f.repo, &req_sb, 4096, 100000, total);
   ok = expect(at.body == full.body, &"limit: a response exactly at the response limit succeeds") && ok;
   let over = upload_pack_respond_limited(&f.repo, &req_sb, 4096, 100000, total - 1);
@@ -691,7 +691,7 @@ fn run_limits(f: &Fixture) -> Bool
   }
   match sideband_frames(&big) {
     Ok(s) => {
-      ok = expect(s.len() == 4 + 1 + 65515 + 4, &"sideband: 65515 bytes fit one pkt-line") && ok;
+      ok = expect(s.byte_len() == 4 + 1 + 65515 + 4, &"sideband: 65515 bytes fit one pkt-line") && ok;
     }
     Err(_) => {
       ok = fail(&"sideband: 65515 bytes");
@@ -700,7 +700,7 @@ fn run_limits(f: &Fixture) -> Bool
   big.push(1);
   match sideband_frames(&big) {
     Ok(s) => {
-      ok = expect(s.len() == 4 + 1 + 65515 + (4 + 1 + 1) + 4, &"sideband: one more byte needs a second pkt-line") && ok;
+      ok = expect(s.byte_len() == 4 + 1 + 65515 + (4 + 1 + 1) + 4, &"sideband: one more byte needs a second pkt-line") && ok;
     }
     Err(_) => {
       ok = fail(&"sideband: 65516 bytes");
@@ -711,7 +711,7 @@ fn run_limits(f: &Fixture) -> Bool
 
 fn stored_block(data: &Bytes, final: Bool) -> Bytes
   intent "stored ブロック 1 つの deflate 表現を作る"
-  requires data.len() <= 65535
+  requires data.byte_len() <= 65535
   ensures none
   effects none
 {
@@ -721,7 +721,7 @@ fn stored_block(data: &Bytes, final: Bool) -> Bytes
   } else {
     out.push(0);
   }
-  let n = data.len();
+  let n = data.byte_len();
   out.push(n % 256);
   out.push(n / 256);
   out.push((65535 - n) % 256);
@@ -744,7 +744,7 @@ fn le32(out: &mut Bytes, v: Int)
 
 fn gzip_stored(plain: &Bytes) -> Bytes
   intent "plain を stored ブロック 1 つの gzip member にする（65535 byte 以下）"
-  requires plain.len() <= 65535
+  requires plain.byte_len() <= 65535
   ensures none
   effects none
 {
@@ -761,7 +761,7 @@ fn gzip_stored(plain: &Bytes) -> Bytes
   out.push(3);
   out.extend(&stored_block(&plain, true));
   le32(&mut out, crc32(&plain));
-  le32(&mut out, plain.len());
+  le32(&mut out, plain.byte_len());
   return out;
 }
 
@@ -813,7 +813,7 @@ fn run_http_post(f: &Fixture) -> Bool
   ok = expect(multi.status == 415, &"post: multiple codings are unsupported (415)") && ok;
   // gzip の破損は 400、拒否時は pkt-line の要求処理が始まらない（応答は固定理由だけ）。
   let mut broken = gzip_stored(&plain);
-  let last = broken.len() - 9;
+  let last = broken.byte_len() - 9;
   let flipped = (broken.get(last).unwrap_or(0) + 1) % 256;
   let mut b2 = broken.slice(0, last).unwrap_or(Bytes.new());
   b2.push(flipped);

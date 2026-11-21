@@ -33,7 +33,7 @@ fn int_to_str(val: Int) -> String
     v = v / 10;
   }
   let mut rev = Bytes.new();
-  let mut i = digits.len();
+  let mut i = digits.byte_len();
   while i > 0 {
     rev.push(digits.get(i - 1).unwrap_or(0));
     i = i - 1;

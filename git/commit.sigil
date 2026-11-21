@@ -173,7 +173,7 @@ fn validate_no_newline_or_null(b: &Bytes, field_name: &String) -> Result<Bool, G
   ensures none
   effects none
 {
-  let len = b.len();
+  let len = b.byte_len();
   let mut i = 0;
   while i < len {
     let c = b.get(i).unwrap_or(0);
@@ -192,7 +192,7 @@ fn validate_header_key(k: &String) -> Result<Bool, GitError>
   effects none
 {
   let kb = k.as_bytes();
-  let len = kb.len();
+  let len = kb.byte_len();
   if len == 0 {
     return Err(GitError.Corrupt("commit header key cannot be empty"));
   }
@@ -213,7 +213,7 @@ fn validate_header_value(v: &Bytes) -> Result<Bool, GitError>
   ensures none
   effects none
 {
-  let len = v.len();
+  let len = v.byte_len();
   let mut i = 0;
   while i < len {
     let c = v.get(i).unwrap_or(0);
@@ -240,7 +240,7 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
   ensures none
   effects none
 {
-  let total_len = content.len();
+  let total_len = content.byte_len();
   let mut tree_id = "";
   let mut parents = List.new();
   let mut author = Bytes.new();
@@ -331,7 +331,7 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
             if phase != 1 {
               return Err(GitError.Corrupt("commit author header out of order or duplicate"));
             }
-            if cur_val.len() == 0 {
+            if cur_val.byte_len() == 0 {
               return Err(GitError.Corrupt("commit author header cannot be empty"));
             }
             author = cur_val;
@@ -340,7 +340,7 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
             if phase != 2 {
               return Err(GitError.Corrupt("commit committer header out of order or duplicate"));
             }
-            if cur_val.len() == 0 {
+            if cur_val.byte_len() == 0 {
               return Err(GitError.Corrupt("commit committer header cannot be empty"));
             }
             committer = cur_val;
@@ -416,7 +416,7 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
       if phase != 1 {
         return Err(GitError.Corrupt("commit author header out of order or duplicate"));
       }
-      if cur_val.len() == 0 {
+      if cur_val.byte_len() == 0 {
         return Err(GitError.Corrupt("commit author header cannot be empty"));
       }
       author = cur_val;
@@ -425,7 +425,7 @@ pub fn decode_commit(content: &Bytes) -> Result<CommitObject, GitError>
       if phase != 2 {
         return Err(GitError.Corrupt("commit committer header out of order or duplicate"));
       }
-      if cur_val.len() == 0 {
+      if cur_val.byte_len() == 0 {
         return Err(GitError.Corrupt("commit committer header cannot be empty"));
       }
       committer = cur_val;
@@ -494,7 +494,7 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
 
   // 3. author
   let author = commit_author(&commit);
-  if author.len() == 0 {
+  if author.byte_len() == 0 {
     return Err(GitError.Corrupt("commit author cannot be empty"));
   }
   validate_no_newline_or_null(&author, &"author")?;
@@ -504,7 +504,7 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
 
   // 4. committer
   let committer = commit_committer(&commit);
-  if committer.len() == 0 {
+  if committer.byte_len() == 0 {
     return Err(GitError.Corrupt("commit committer cannot be empty"));
   }
   validate_no_newline_or_null(&committer, &"committer")?;
@@ -536,7 +536,7 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
   }
 
   // ヘッダ合計サイズ検査
-  if buf.len() > max_commit_header_total_size() {
+  if buf.byte_len() > max_commit_header_total_size() {
     return Err(GitError.LimitExceeded("commit header total size exceeds 64 KiB limit"));
   }
 
@@ -545,7 +545,7 @@ pub fn encode_commit(commit: &CommitObject) -> Result<Bytes, GitError>
 
   // 6. message
   let msg = commit_message(&commit);
-  if msg.len() > max_commit_message_size() {
+  if msg.byte_len() > max_commit_message_size() {
     return Err(GitError.LimitExceeded("commit message size exceeds 1 MiB limit"));
   }
   buf.extend(&msg);

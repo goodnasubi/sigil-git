@@ -148,7 +148,7 @@ fn test_zlib() -> Bool
   }
   // 末尾の検査値を壊す
   let mut bad = zlib_stored(&data);
-  let n = bad.len();
+  let n = bad.byte_len();
   let mut broken = Bytes.new();
   let mut i = 0;
   while i < n {
@@ -256,7 +256,7 @@ fn test_odb(repo: &Repo) -> Bool
   let content = "hello world\n".as_bytes();
   let r = odb_write(&repo, &ObjectType.Blob, &content);
   let id = id_or_empty(&r);
-  ok = expect(id.len() == 64, &"blob id length") && ok;
+  ok = expect(id.byte_len() == 64, &"blob id length") && ok;
   ok = expect(match odb_has(&repo, &id) {
     Ok(b) => b,
     Err(_) => false,
@@ -365,7 +365,7 @@ fn test_refs(repo: &Repo) -> Bool
   let c1 = id_or_empty(&odb_write(&repo, &ObjectType.Commit, &commit_bytes(&tree, &"one\n")));
   let c2 = id_or_empty(&odb_write(&repo, &ObjectType.Commit, &commit_bytes(&tree, &"two\n")));
   let blob = id_or_empty(&odb_write(&repo, &ObjectType.Blob, &"x".as_bytes()));
-  ok = expect(c1.len() == 64 && c2.len() == 64 && c1 != c2, &"commits written") && ok;
+  ok = expect(c1.byte_len() == 64 && c2.byte_len() == 64 && c1 != c2, &"commits written") && ok;
   ok = expect(kind_of(&create_branch(&repo, &"main", &c1)) == "ok", &"create branch") && ok;
   ok = expect(opt_str(&read_ref(&repo, &"refs/heads/main")) == c1, &"read branch") && ok;
   ok = expect(kind_of(&create_branch(&repo, &"main", &c2)) == "RefMismatch", &"create existing branch") && ok;

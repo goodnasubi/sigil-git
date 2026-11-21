@@ -49,8 +49,8 @@ pub fn cmp_bytes(a: &Bytes, b: &Bytes) -> Int
   ensures result >= -1 && result <= 1
   effects none
 {
-  let la = a.len();
-  let lb = b.len();
+  let la = a.byte_len();
+  let lb = b.byte_len();
   let mut i = 0;
   while i < la && i < lb {
     let x = a.get(i).unwrap_or(0);
@@ -301,7 +301,7 @@ pub fn parse_index(data: &Bytes) -> Result<List<IndexEntry>, GitError>
   ensures none
   effects none
 {
-  let len = data.len();
+  let len = data.byte_len();
   if len > max_index_size() {
     return Err(GitError.LimitExceeded("index file is too large"));
   }
@@ -430,7 +430,7 @@ pub fn serialize_index(entries: &List<IndexEntry>) -> Result<Bytes, GitError>
         }
         let m = tree_mode_to_index_mode(e.mode)?;
         let id = hex_to_bytes(&e.id)?;
-        if id.len() != 32 {
+        if id.byte_len() != 32 {
           return Err(GitError.Corrupt("index entry id must be 32 bytes"));
         }
         let mut k = 0;
@@ -444,14 +444,14 @@ pub fn serialize_index(entries: &List<IndexEntry>) -> Result<Bytes, GitError>
         out.push_u32_be(0);
         out.extend(&id);
         let name = e.path.as_bytes();
-        let mut nl = name.len();
+        let mut nl = name.byte_len();
         if nl > 4095 {
           nl = 4095;
         }
         out.push_u16_be(nl);
         out.extend(&name);
-        let total = entry_total_len(name.len());
-        let mut pad = 74 + name.len();
+        let total = entry_total_len(name.byte_len());
+        let mut pad = 74 + name.byte_len();
         while pad < total {
           out.push(0);
           pad = pad + 1;

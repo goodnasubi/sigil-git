@@ -167,7 +167,7 @@ fn load_verified_raw(repo: &Repo, id_hex: &String) -> Result<Option<Bytes>, GitE
     }
     Some(z) => {
       let inflated = inflate_zlib(&z, 0, raw_limit())?;
-      if inflated.consumed != z.len() {
+      if inflated.consumed != z.byte_len() {
         return Err(GitError.Corrupt("loose object has trailing data after the zlib stream"));
       }
       let rawobj = inflated.data;
@@ -194,7 +194,7 @@ pub fn odb_read_in(repo: &Repo, packs: &List<PackStore>, id_hex: &String) -> Res
       let want = hex_to_bytes(&id_hex)?;
       let hdr = verify_object_bytes(&rawobj, &want)?;
       let hl = header_len(&hdr);
-      let content = rawobj.slice(hl, rawobj.len()).unwrap_or(Bytes.new());
+      let content = rawobj.slice(hl, rawobj.byte_len()).unwrap_or(Bytes.new());
       return Ok(ObjectData { obj_type: header_obj_type(&hdr), content: content });
     }
     None => {}
@@ -234,7 +234,7 @@ pub fn odb_info(repo: &Repo, id_hex: &String) -> Result<ObjectInfo, GitError>
   effects fs
 {
   let o = odb_read(&repo, &id_hex)?;
-  return Ok(ObjectInfo { obj_type: o.obj_type, size: o.content.len() });
+  return Ok(ObjectInfo { obj_type: o.obj_type, size: o.content.byte_len() });
 }
 
 pub fn odb_write(repo: &Repo, obj_type: &ObjectType, content: &Bytes) -> Result<String, GitError>
@@ -243,7 +243,7 @@ pub fn odb_write(repo: &Repo, obj_type: &ObjectType, content: &Bytes) -> Result<
   ensures none
   effects fs, random
 {
-  if content.len() > max_object_size() {
+  if content.byte_len() > max_object_size() {
     return Err(GitError.LimitExceeded("object exceeds the 64 MiB limit"));
   }
   let rawobj = encode_raw_object(&obj_type, &content);

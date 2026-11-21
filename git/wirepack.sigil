@@ -78,7 +78,7 @@ fn push_be32(out: &mut Bytes, v: Int)
 pub fn pack_object_header(code: Int, size: Int) -> Bytes
   intent "pack のオブジェクトの先頭（種別と展開後の長さの可変長整数）を返す"
   requires code >= 1 && code <= 4 && size >= 0
-  ensures result.len() >= 1
+  ensures result.byte_len() >= 1
   effects none
 {
   let mut out = Bytes.new();
@@ -239,8 +239,8 @@ pub fn wire_pack_build_limited(repo: &Repo, ids: &List<String>, walk_budget: Int
       Some(id) => {
         let o = odb_read_in(&repo, &packs, &id)?;
         budget = verify_object(&repo, &packs, &o.obj_type, &o.content, budget)?;
-        let hdr = pack_object_header(type_code(&o.obj_type), o.content.len());
-        predicted = predicted + hdr.len() + stored_zlib_len(o.content.len());
+        let hdr = pack_object_header(type_code(&o.obj_type), o.content.byte_len());
+        predicted = predicted + hdr.byte_len() + stored_zlib_len(o.content.byte_len());
         if predicted > max_transfer_response_size() {
           return Err(GitError.LimitExceeded("pack would exceed the 1 MiB response limit"));
         }
@@ -260,7 +260,7 @@ pub fn wire_pack_build_limited(repo: &Repo, ids: &List<String>, walk_budget: Int
   out.extend(&body);
   let trailer = compute_sha256(&out);
   out.extend(&trailer);
-  if out.len() != predicted {
+  if out.byte_len() != predicted {
     return Err(GitError.Corrupt("internal error: pack size differs from the estimate"));
   }
   return Ok(out);

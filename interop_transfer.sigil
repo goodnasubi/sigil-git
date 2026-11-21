@@ -56,15 +56,15 @@ fn step(dir: &String, line: &String) -> Result<String, GitError>
     return Ok("written");
   }
   if string_starts_with(&line, &"pack:") {
-    let name = string_slice(&line, 5, line.as_bytes().len());
+    let name = string_slice(&line, 5, line.as_bytes().byte_len());
     let ids_text = read_input(&cat3(&dir, &"/", &cat2(&name, &".ids")))?.to_string_utf8().unwrap_or("");
     let ids = ids_text.lines();
     let pack = wire_pack_build(&repo, &ids)?;
     create_synced_file(&cat3(&dir, &"/", &cat2(&name, &".pack")), &pack)?;
-    return Ok(int_to_str(pack.len()));
+    return Ok(int_to_str(pack.byte_len()));
   }
   if string_starts_with(&line, &"decode:") {
-    let name = string_slice(&line, 7, line.as_bytes().len());
+    let name = string_slice(&line, 7, line.as_bytes().byte_len());
     let data = read_input(&cat3(&dir, &"/", &cat2(&name, &".bin")))?;
     let ls = pkt_decode_section(&data)?;
     return Ok(int_to_str(ls.len()));

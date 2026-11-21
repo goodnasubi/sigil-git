@@ -36,7 +36,7 @@ fn starts(data: &Bytes, pos: Int, text: &String) -> Bool
   effects none
 {
   let prefix = text.as_bytes();
-  return bytes_match(&data, pos, &prefix, 0, prefix.len());
+  return bytes_match(&data, pos, &prefix, 0, prefix.byte_len());
 }
 
 fn next_line(data: &Bytes, pos: Int) -> Int
@@ -46,7 +46,7 @@ fn next_line(data: &Bytes, pos: Int) -> Int
   effects none
 {
   let mut end = pos;
-  while end < data.len() {
+  while end < data.byte_len() {
     end = end + 1;
     if data.get(end - 1).unwrap_or(0) == 10 {
       return end;
@@ -63,7 +63,7 @@ fn number(data: &Bytes, pos: Int) -> Result<Number, GitError>
 {
   let mut i = pos;
   let mut value = 0;
-  while i < data.len() {
+  while i < data.byte_len() {
     let digit = data.get(i).unwrap_or(0) - 48;
     if digit < 0 || digit > 9 {
       if i > pos {
@@ -126,7 +126,7 @@ fn append_range(out: &mut Bytes, data: &Bytes, start: Int, end: Int) -> Result<B
   ensures none
   effects none
 {
-  if end - start > max_object_size() - out.len() {
+  if end - start > max_object_size() - out.byte_len() {
     return Err(GitError.LimitExceeded("patched file exceeds object size limit"));
   }
   out.extend(&data.slice(start, end).unwrap_or(Bytes.new()));
@@ -139,7 +139,7 @@ pub fn apply_file_patch(prior: &Bytes, prior_mode: Int, patch: &Bytes) -> Result
   ensures none
   effects none
 {
-  if prior.len() > max_object_size() || patch.len() > max_object_size() {
+  if prior.byte_len() > max_object_size() || patch.byte_len() > max_object_size() {
     return Err(GitError.LimitExceeded("patch input exceeds size limit"));
   }
   let mut out = Bytes.new();
@@ -151,7 +151,7 @@ pub fn apply_file_patch(prior: &Bytes, prior_mode: Int, patch: &Bytes) -> Result
   let mut section = false;
   let mut saw_hunk = false;
   let mut saw_header = false;
-  while pos < patch.len() {
+  while pos < patch.byte_len() {
     let end = next_line(&patch, pos);
     if patch.get(end - 1).unwrap_or(0) != 10 {
       return Err(GitError.Corrupt("unterminated patch line"));
@@ -168,7 +168,7 @@ pub fn apply_file_patch(prior: &Bytes, prior_mode: Int, patch: &Bytes) -> Result
       saw_hunk = true;
       let skipped = cursor;
       while old_line < a.start {
-        if cursor >= prior.len() {
+        if cursor >= prior.byte_len() {
           return Err(GitError.Conflict("patch starts past end of input"));
         }
         cursor = next_line(&prior, cursor);
@@ -180,7 +180,7 @@ pub fn apply_file_patch(prior: &Bytes, prior_mode: Int, patch: &Bytes) -> Result
       let mut left = a.count;
       let mut right = b.count;
       while left > 0 || right > 0 {
-        if pos >= patch.len() {
+        if pos >= patch.byte_len() {
           return Err(GitError.Corrupt("truncated hunk"));
         }
         let kind = patch.get(pos).unwrap_or(0);
@@ -196,7 +196,7 @@ pub fn apply_file_patch(prior: &Bytes, prior_mode: Int, patch: &Bytes) -> Result
         }
         if kind != 43 {
           let length = content_end - pos - 1;
-          if left == 0 || cursor >= prior.len() || next_line(&prior, cursor) - cursor != length || !bytes_match(&prior, cursor, &patch, pos + 1, length) {
+          if left == 0 || cursor >= prior.byte_len() || next_line(&prior, cursor) - cursor != length || !bytes_match(&prior, cursor, &patch, pos + 1, length) {
             return Err(GitError.Conflict("patch context does not match input"));
           }
           cursor = cursor + length;
@@ -256,8 +256,8 @@ pub fn apply_file_patch(prior: &Bytes, prior_mode: Int, patch: &Bytes) -> Result
       pos = end;
     }
   }
-  append_range(&mut out, &prior, cursor, prior.len())?;
-  if mode == 0 && out.len() != 0 {
+  append_range(&mut out, &prior, cursor, prior.byte_len())?;
+  if mode == 0 && out.byte_len() != 0 {
     return Err(GitError.Conflict("deleted patch file has remaining content"));
   }
   return Ok(AppliedFile { mode: mode, content: out });
@@ -364,7 +364,7 @@ pub fn apply_patch(repo: &Repo, commit_id: &String, patch: &Bytes) -> Result<Lis
   ensures none
   effects fs
 {
-  if patch.len() > max_object_size() {
+  if patch.byte_len() > max_object_size() {
     return Err(GitError.LimitExceeded("patch exceeds size limit"));
   }
   let packs = open_packs(&repo)?;
@@ -372,7 +372,7 @@ pub fn apply_patch(repo: &Repo, commit_id: &String, patch: &Bytes) -> Result<Lis
   let mut out: List<PatchedPath> = List.new();
   let mut retained = 0;
   let mut pos = 0;
-  while pos < patch.len() {
+  while pos < patch.byte_len() {
     if !starts(&patch, pos, &"diff --git ") {
       return Err(GitError.Corrupt("expected diff --git header"));
     }
@@ -395,7 +395,7 @@ pub fn apply_patch(repo: &Repo, commit_id: &String, patch: &Bytes) -> Result<Lis
       i = i + 1;
     }
     let mut end = line;
-    while end < patch.len() && !starts(&patch, end, &"diff --git ") {
+    while end < patch.byte_len() && !starts(&patch, end, &"diff --git ") {
       end = next_line(&patch, end);
     }
     let mut mode = 0;
@@ -409,7 +409,7 @@ pub fn apply_patch(repo: &Repo, commit_id: &String, patch: &Bytes) -> Result<Lis
         }
       }
     }
-    if end - pos + prior.len() + retained > max_work_memory() / 4 {
+    if end - pos + prior.byte_len() + retained > max_work_memory() / 4 {
       return Err(GitError.LimitExceeded("patch working memory limit exceeded"));
     }
     let section = patch.slice(pos, end).unwrap_or(Bytes.new());
@@ -417,7 +417,7 @@ pub fn apply_patch(repo: &Repo, commit_id: &String, patch: &Bytes) -> Result<Lis
     if follows_delete && file.mode == 0 {
       return Err(GitError.Corrupt("file type change is missing an addition"));
     }
-    retained = retained + file.content.len() + path.as_bytes().len() + 128;
+    retained = retained + file.content.byte_len() + path.as_bytes().byte_len() + 128;
     if retained > max_work_memory() / 4 {
       return Err(GitError.LimitExceeded("patch output exceeds working memory limit"));
     }

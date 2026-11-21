@@ -14,7 +14,7 @@ pub struct TreeEntry {
 
 pub fn new_tree_entry(mode: Int, name: Bytes, id: Bytes) -> TreeEntry
   intent "TreeEntry を構築する"
-  requires id.len() == 32
+  requires id.byte_len() == 32
   ensures none
   effects none
 {
@@ -23,7 +23,7 @@ pub fn new_tree_entry(mode: Int, name: Bytes, id: Bytes) -> TreeEntry
 
 pub fn new_tree_entry_str(mode: Int, name: String, id: Bytes) -> TreeEntry
   intent "文字列の名前から TreeEntry を構築する"
-  requires id.len() == 32
+  requires id.byte_len() == 32
   ensures none
   effects none
 {
@@ -60,7 +60,7 @@ pub fn entry_name_str(e: &TreeEntry) -> String
 pub fn entry_id(e: &TreeEntry) -> Bytes
   intent "TreeEntry の識別子 (32 バイト) を返す"
   requires none
-  ensures result.len() == 32
+  ensures result.byte_len() == 32
   effects none
 {
   return e.id.clone();
@@ -90,7 +90,7 @@ pub fn validate_tree_name(name_bytes: &Bytes) -> Result<Bool, GitError>
   ensures none
   effects none
 {
-  let len = name_bytes.len();
+  let len = name_bytes.byte_len();
   if len == 0 {
     return Err(GitError.Corrupt("tree entry name cannot be empty"));
   }
@@ -123,8 +123,8 @@ pub fn compare_tree_entries(name_a: &Bytes, mode_a: Int, name_b: &Bytes, mode_b:
     bb.push(47);  // '/'
   }
 
-  let len_a = ba.len();
-  let len_b = bb.len();
+  let len_a = ba.byte_len();
+  let len_b = bb.byte_len();
   let mut min_len = len_a;
   if len_b < min_len {
     min_len = len_b;
@@ -158,7 +158,7 @@ pub fn decode_tree(content: &Bytes) -> Result<List<TreeEntry>, GitError>
   ensures none
   effects none
 {
-  let total_len = content.len();
+  let total_len = content.byte_len();
   if total_len > max_tree_size() {
     return Err(GitError.LimitExceeded("tree object size exceeds 16 MiB limit"));
   }
@@ -278,7 +278,7 @@ fn mode_to_octal_bytes(mode: Int) -> Bytes
     m = m / 10;
   }
   let mut res = Bytes.new();
-  let mut i = digits.len() - 1;
+  let mut i = digits.byte_len() - 1;
   while i >= 0 {
     res.push(digits.get(i).unwrap_or(48));
     i = i - 1;
@@ -314,7 +314,7 @@ pub fn encode_tree(entries: &List<TreeEntry>) -> Result<Bytes, GitError>
           return Err(GitError.Corrupt("invalid mode in tree entry"));
         }
         validate_tree_name(&name)?;
-        if id.len() != 32 {
+        if id.byte_len() != 32 {
           return Err(GitError.Corrupt("tree entry id must be 32 bytes"));
         }
 
@@ -339,7 +339,7 @@ pub fn encode_tree(entries: &List<TreeEntry>) -> Result<Bytes, GitError>
         buf.push(0);  // '\0'
         buf.extend(&id);
 
-        if buf.len() > max_tree_size() {
+        if buf.byte_len() > max_tree_size() {
           return Err(GitError.LimitExceeded("tree encoded size exceeds 16 MiB limit"));
         }
       }

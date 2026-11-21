@@ -56,7 +56,7 @@ fn skip_zero_terminated(data: &Bytes, pos: Int) -> Result<Int, GitError>
   effects none
 {
   let mut i = pos;
-  while i < data.len() {
+  while i < data.byte_len() {
     if data.get(i).unwrap_or(0) == 0 {
       return Ok(i + 1);
     }
@@ -71,7 +71,7 @@ pub fn gzip_decode_limited(data: &Bytes, out_limit: Int, enc_limit: Int) -> Resu
   ensures none
   effects none
 {
-  if data.len() > enc_limit {
+  if data.byte_len() > enc_limit {
     return Err(GitError.LimitExceeded("encoded body exceeds the limit"));
   }
   if byte_at(&data, 0)? != 31 {
@@ -94,7 +94,7 @@ pub fn gzip_decode_limited(data: &Bytes, out_limit: Int, enc_limit: Int) -> Resu
     let hi = byte_at(&data, pos + 1)?;
     let xlen = lo + hi * 256;
     pos = pos + 2;
-    if pos + xlen > data.len() {
+    if pos + xlen > data.byte_len() {
       return Err(GitError.Corrupt("truncated gzip header"));
     }
     pos = pos + xlen;
@@ -118,20 +118,20 @@ pub fn gzip_decode_limited(data: &Bytes, out_limit: Int, enc_limit: Int) -> Resu
   }
   let body = inflate_deflate(&data, pos, out_limit, gzip_window())?;
   let p = pos + body.consumed;
-  if p + 4 > data.len() {
+  if p + 4 > data.byte_len() {
     return Err(GitError.Corrupt("truncated gzip trailer"));
   }
-  let out_crc = crc32_update(&table, 4294967295, &body.data, 0, body.data.len()) ^ 4294967295;
+  let out_crc = crc32_update(&table, 4294967295, &body.data, 0, body.data.byte_len()) ^ 4294967295;
   if out_crc != le32_at(&data, p) {
     return Err(GitError.Corrupt("invalid gzip CRC-32"));
   }
-  if p + 8 > data.len() {
+  if p + 8 > data.byte_len() {
     return Err(GitError.Corrupt("truncated gzip trailer"));
   }
-  if body.data.len() % 4294967296 != le32_at(&data, p + 4) {
+  if body.data.byte_len() % 4294967296 != le32_at(&data, p + 4) {
     return Err(GitError.Corrupt("invalid gzip ISIZE"));
   }
-  if p + 8 != data.len() {
+  if p + 8 != data.byte_len() {
     return Err(GitError.Corrupt("trailing data after the gzip member"));
   }
   return Ok(body.data);
@@ -232,7 +232,7 @@ pub fn trimmed_lower(v: &Bytes) -> Bytes
   effects none
 {
   let mut s = 0;
-  let mut e = v.len();
+  let mut e = v.byte_len();
   while s < e && (v.get(s).unwrap_or(0) == 32 || v.get(s).unwrap_or(0) == 9) {
     s = s + 1;
   }

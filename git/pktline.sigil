@@ -50,7 +50,7 @@ fn hex_value(c: Int) -> Int
 pub fn pkt_flush() -> Bytes
   intent "flush-pkt (0000) を返す"
   requires none
-  ensures result.len() == 4
+  ensures result.byte_len() == 4
   effects none
 {
   let mut out = Bytes.new();
@@ -67,10 +67,10 @@ pub fn pkt_encode(payload: &Bytes) -> Result<Bytes, GitError>
   ensures none
   effects none
 {
-  if payload.len() == 0 {
+  if payload.byte_len() == 0 {
     return Err(GitError.Corrupt("pkt-line payload is empty"));
   }
-  let total = payload.len() + 4;
+  let total = payload.byte_len() + 4;
   if total > max_pkt_line_len() {
     return Err(GitError.LimitExceeded("pkt-line exceeds 65520 bytes"));
   }
@@ -98,7 +98,7 @@ pub fn pkt_read(data: &Bytes, pos: Int) -> Result<PktRead, GitError>
   ensures none
   effects none
 {
-  if pos + 4 > data.len() {
+  if pos + 4 > data.byte_len() {
     return Err(GitError.Corrupt("truncated pkt-line length"));
   }
   let mut len = 0;
@@ -129,7 +129,7 @@ pub fn pkt_read(data: &Bytes, pos: Int) -> Result<PktRead, GitError>
   if len > max_pkt_line_len() {
     return Err(GitError.LimitExceeded("pkt-line exceeds 65520 bytes"));
   }
-  if pos + len > data.len() {
+  if pos + len > data.byte_len() {
     return Err(GitError.Corrupt("truncated pkt-line payload"));
   }
   let payload = data.slice(pos + 4, pos + len).unwrap_or(Bytes.new());
@@ -146,7 +146,7 @@ pub fn pkt_decode_section(data: &Bytes) -> Result<List<Bytes>, GitError>
   let mut pos = 0;
   let mut done = false;
   while !done {
-    if pos >= data.len() {
+    if pos >= data.byte_len() {
       return Err(GitError.Corrupt("missing flush-pkt"));
     }
     let r = pkt_read(&data, pos)?;
@@ -160,7 +160,7 @@ pub fn pkt_decode_section(data: &Bytes) -> Result<List<Bytes>, GitError>
       }
     }
   }
-  if pos != data.len() {
+  if pos != data.byte_len() {
     return Err(GitError.Corrupt("trailing data after flush-pkt"));
   }
   return Ok(out);

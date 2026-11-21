@@ -171,10 +171,10 @@ fn split_ws(b: &Bytes) -> Result<List<String>, GitError>
   let mut out = List.new();
   let mut cur = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if c == 32 {
-      if cur.len() == 0 {
+      if cur.byte_len() == 0 {
         return Err(GitError.Corrupt("empty token in a command line"));
       }
       out.push(cur.to_string_utf8().map_err(|e| GitError.Corrupt("command line is not UTF-8"))?);
@@ -184,8 +184,8 @@ fn split_ws(b: &Bytes) -> Result<List<String>, GitError>
     }
     i = i + 1;
   }
-  if cur.len() == 0 {
-    if b.len() > 0 {
+  if cur.byte_len() == 0 {
+    if b.byte_len() > 0 {
       return Err(GitError.Corrupt("empty token in a command line"));
     }
     return Ok(out);
@@ -201,11 +201,11 @@ fn is_hex40(s: &String) -> Bool
   effects none
 {
   let b = s.as_bytes();
-  if b.len() != 40 {
+  if b.byte_len() != 40 {
     return false;
   }
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     let c = b.get(i).unwrap_or(0);
     if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) {
       return false;
@@ -236,7 +236,7 @@ pub fn parse_receive_request(body: &Bytes) -> Result<ReceiveRequest, GitError>
   ensures none
   effects none
 {
-  if body.len() == 0 {
+  if body.byte_len() == 0 {
     return Err(GitError.Corrupt("request is empty"));
   }
   let first = pkt_read(&body, 0)?;
@@ -249,12 +249,12 @@ pub fn parse_receive_request(body: &Bytes) -> Result<ReceiveRequest, GitError>
       payload = p;
     }
   }
-  if payload.len() > 0 && payload.get(payload.len() - 1).unwrap_or(0) == 10 {
-    payload = payload.slice(0, payload.len() - 1).unwrap_or(Bytes.new());
+  if payload.byte_len() > 0 && payload.get(payload.byte_len() - 1).unwrap_or(0) == 10 {
+    payload = payload.slice(0, payload.byte_len() - 1).unwrap_or(Bytes.new());
   }
   let mut nul = 0 - 1;
   let mut k = 0;
-  while k < payload.len() && nul < 0 {
+  while k < payload.byte_len() && nul < 0 {
     if payload.get(k).unwrap_or(1) == 0 {
       nul = k;
     }
@@ -282,10 +282,10 @@ pub fn parse_receive_request(body: &Bytes) -> Result<ReceiveRequest, GitError>
   check_id(&new_id)?;
   // 実 Git は能力の列の先頭に空白を 1 つ置く（`\0 report-status ...`）。その 1 つだけは許す
   let mut caps_from = nul + 1;
-  if caps_from < payload.len() && payload.get(caps_from).unwrap_or(0) == 32 {
+  if caps_from < payload.byte_len() && payload.get(caps_from).unwrap_or(0) == 32 {
     caps_from = caps_from + 1;
   }
-  let caps_bytes = payload.slice(caps_from, payload.len()).unwrap_or(Bytes.new());
+  let caps_bytes = payload.slice(caps_from, payload.byte_len()).unwrap_or(Bytes.new());
   let caps = split_ws(&caps_bytes)?;
   check_requested_capabilities(false, &caps)?;
   if index_of(&caps, &"report-status") < 0 {
@@ -299,9 +299,9 @@ pub fn parse_receive_request(body: &Bytes) -> Result<ReceiveRequest, GitError>
     }
     PktLine.Flush => {}
   }
-  let pack = body.slice(second.next, body.len()).unwrap_or(Bytes.new());
+  let pack = body.slice(second.next, body.byte_len()).unwrap_or(Bytes.new());
   // 削除（new がゼロ）は pack を伴わない（実 Git の要求は flush で終わる）。方針の検査で delete_not_allowed に至らせる
-  if pack.len() == 0 && cmd.new_id != zeros64() {
+  if pack.byte_len() == 0 && cmd.new_id != zeros64() {
     return Err(GitError.Corrupt("pack is missing"));
   }
   return Ok(ReceiveRequest { cmd: cmd, multiple: false, pack: pack });
@@ -354,10 +354,10 @@ fn string_prefix(s: &String, prefix: &String) -> Bool
 {
   let sb = s.as_bytes();
   let pb = prefix.as_bytes();
-  if sb.len() < pb.len() {
+  if sb.byte_len() < pb.byte_len() {
     return false;
   }
-  return sb.slice(0, pb.len()).unwrap_or(Bytes.new()) == pb;
+  return sb.slice(0, pb.byte_len()).unwrap_or(Bytes.new()) == pb;
 }
 
 fn type_kind(t: &ObjectType) -> Int
@@ -725,7 +725,7 @@ fn write_status(wc: &WriteCheck) -> Int
         return 404;
       }
       Ok(meta) => {
-        let opt_sub = match wc.subject.len() > 0 {
+        let opt_sub = match wc.subject.byte_len() > 0 {
           true => Some(wc.subject.clone()),
           false => None,
         };
@@ -893,7 +893,7 @@ pub fn receive_pack_post_limited(repo: &Repo, encodings: &List<Bytes>, content_t
   if !ct_ok {
     return text_reply(415, &"unsupported_media_type");
   }
-  if body.len() > 1048576 {
+  if body.byte_len() > 1048576 {
     return text_reply(413, &"request_too_large");
   }
   return match parse_receive_request(&body) {
@@ -966,7 +966,7 @@ pub fn receive_advertisement(repo: &Repo) -> Result<Bytes, GitError>
   let mut out = pkt_encode_str(&"# service=git-receive-pack\n")?;
   out.extend(&pkt_flush());
   out.extend(&adv);
-  if out.len() > max_transfer_response_size() {
+  if out.byte_len() > max_transfer_response_size() {
     return Err(GitError.LimitExceeded("advertisement exceeds the response limit"));
   }
   return Ok(out);

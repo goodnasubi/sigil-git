@@ -105,7 +105,7 @@ pub fn rel_parent(rel: &String) -> String
   effects none
 {
   let b = rel.as_bytes();
-  let mut i = b.len();
+  let mut i = b.byte_len();
   while i > 0 {
     if b.get(i - 1).unwrap_or(0) == 47 {
       return b.slice(0, i - 1).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
@@ -122,10 +122,10 @@ pub fn rel_name(rel: &String) -> String
   effects none
 {
   let b = rel.as_bytes();
-  let mut i = b.len();
+  let mut i = b.byte_len();
   while i > 0 {
     if b.get(i - 1).unwrap_or(0) == 47 {
-      return b.slice(i, b.len()).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
+      return b.slice(i, b.byte_len()).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
     }
     i = i - 1;
   }
@@ -373,15 +373,15 @@ pub fn probe_path(c: &mut DirCache, work: &String, rel: &String) -> Result<Probe
   let mut prefix = "";
   let mut start = 0;
   let mut i = 0;
-  while i <= b.len() {
-    if i == b.len() || b.get(i).unwrap_or(0) == 47 {
+  while i <= b.byte_len() {
+    if i == b.byte_len() || b.get(i).unwrap_or(0) == 47 {
       let comp = b.slice(start, i).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
       prefix = rel_join(&prefix, &comp);
       let k = cache_kind(&mut c, &work, &prefix)?;
       if k == 0 {
         return Ok(Probe { kind: 0, blocker: "" });
       }
-      if i == b.len() {
+      if i == b.byte_len() {
         return Ok(Probe { kind: k, blocker: "" });
       }
       if k != 2 {
@@ -494,8 +494,8 @@ fn ensure_dirs(work: &String, rel_dir: &String) -> Result<Bool, GitError>
   let mut prefix = "";
   let mut start = 0;
   let mut i = 0;
-  while i <= b.len() {
-    if i == b.len() || b.get(i).unwrap_or(0) == 47 {
+  while i <= b.byte_len() {
+    if i == b.byte_len() || b.get(i).unwrap_or(0) == 47 {
       let comp = b.slice(start, i).unwrap_or(Bytes.new()).to_string_utf8().unwrap_or("");
       prefix = rel_join(&prefix, &comp);
       let abs = abs_of(&work, &prefix);
@@ -535,7 +535,7 @@ fn write_tmp(d: &Dir, tmp_rel: &String, content: &Bytes, exec: Bool) -> Result<B
     }
     Ok(f) => {
       let mut file = f;
-      if content.len() > 0 {
+      if content.byte_len() > 0 {
         match file.write_all(&content) {
           Err(_) => {
             let _ = file.close();
